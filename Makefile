@@ -1,8 +1,11 @@
 BUILDROOT_DIR := $(CURDIR)/buildroot
 OUTPUT_DIR := $(CURDIR)/output
-BUILDROOT_DEFCONFIG := qemu_x86_64_defconfig
+BUILDROOT_DEFCONFIG := pc_x86_64_efi_defconfig
 
 JOBS ?= $(shell nproc)
+
+# WSL PATH fix for Buildroot
+override export PATH := /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 .PHONY: all
 all: build
