@@ -81,15 +81,31 @@ savedefconfig:
 		BR2_DEFCONFIG="$(CURDIR)/configs/mboot_x86_64_defconfig" \
 		savedefconfig
 
+.PHONY: linux-menuconfig
+linux-menuconfig: check-config
+	$(MAKE) -C "$(BUILDROOT_DIR)" \
+		O="$(OUTPUT_DIR)" \
+		BR2_EXTERNAL="$(CURDIR)" \
+		linux-menuconfig
+
+.PHONY: linux-update
+linux-update: check-config
+	$(MAKE) -C "$(BUILDROOT_DIR)" \
+		O="$(OUTPUT_DIR)" \
+		BR2_EXTERNAL="$(CURDIR)" \
+		linux-update-defconfig
+		
 .PHONY: help
 help:
 	@echo "mBoot Buildroot targets:"
-	@echo "  make setup       Initialize Git submodules"
-	@echo "  make defconfig   Generate the default x86_64 configuration"
-	@echo "  make savedefconfig Save the current configuration to configs/mboot_x86_64_defconfig"
-	@echo "  make menuconfig  Open Buildroot menuconfig"
-	@echo "  make build       Build mBoot"
-	@echo "  make run         Build and launch with QEMU"
-	@echo "  make clean       Clean Buildroot outputs"
-	@echo "  make distclean   Remove the entire output directory"
-	@echo "  make rebuild     Clean and rebuild"
+	@echo "  make setup             Initialize Git submodules"
+	@echo "  make defconfig         Generate the default x86_64 configuration"
+	@echo "  make savedefconfig     Save the current configuration to configs/mboot_x86_64_defconfig"
+	@echo "  make menuconfig        Open Buildroot menuconfig"
+	@echo "  make linux-menuconfig  Open Linux kernel menuconfig"
+	@echo "  make linux-update      Update the Linux kernel defconfig"
+	@echo "  make build             Build mBoot"
+	@echo "  make run               Build and launch with QEMU"
+	@echo "  make clean             Clean Buildroot outputs"
+	@echo "  make distclean         Remove the entire output directory"
+	@echo "  make rebuild           Clean and rebuild"
