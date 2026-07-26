@@ -35,7 +35,18 @@ build: check-config
 
 .PHONY: run
 run: build
-	"$(OUTPUT_DIR)/images/start-qemu.sh"
+	qemu-system-x86_64 \
+	-enable-kvm \
+	-machine q35 \
+	-cpu host \
+	-smp 4 \
+	-m 4G \
+	-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+	-drive if=pflash,format=raw,file=output/images/OVMF_VARS.fd \
+	-drive file=output/images/disk.img,format=raw,if=virtio \
+	-device virtio-vga \
+	-display gtk \
+	-serial mon:stdio
 
 .PHONY: clean
 clean:
