@@ -1,0 +1,112 @@
+#!/bin/sh
+
+QEMU="/usr/bin/qemu-system-x86_64"
+MOCHIOS_DISK="/dev/vdb"
+
+OVMF_CODE="/usr/share/mboot/OVMF_CODE_4M.fd"
+OVMF_VARS_TEMPLATE="/usr/share/mboot/OVMF_VARS_4M.fd"
+OVMF_VARS="/var/lib/mboot/OVMF_VARS.fd"
+
+LOG_DIRECTORY="/var/log/mboot"
+SERIAL_LOG="${LOG_DIRECTORY}/mochios.log"
+
+wait_for_device() {
+	device="$1"
+	count=0
+
+	while [ ! -e "$device" ]; do
+		count=$((count + 1))
+
+		if [ "$count" -ge 100 ]; then
+			echo "mBoot: device not found: $device" >&2
+			return 1
+		fi
+
+		sleep 0.1
+	done
+}
+
+wait_for_xorg() {
+	count=0
+
+	while [ ! -S /tmp/.X11-unix/X0 ]; do
+		count=$((count + 1))
+
+		if [ "$count" -ge 200 ]; then
+			echo "mBoot: Xorg did not become ready" >&2
+			return 1
+		fi
+
+		sleep 0.1
+	done
+}
+
+start_mochios() {
+	mkdir -p /var/lib/mboot "$LOG_DIRECTORY"
+
+	wait_for_device "$MOCHIOS_DISK" || return 1
+	wait_for_xorg || return 1
+
+	if [ ! -f "$OVMF_VARS" ]; then
+		cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS" || return 1
+	fi
+
+	if [ -c /dev/kvm ]; then
+		ACCELERATOR="-accel kvm -cpu host"
+	else
+		echo "mBoot: KVM is unavailable, using TCG" >&2
+		ACCELERATOR="-accel tcg -cpu max"
+	fi
+
+	export DISPLAY=:0
+	export SDL_VIDEODRIVER=x11
+
+	"$QEMU" \
+		$ACCELERATOR \
+		-machine q35 \
+		-smp 4 \
+		-m 4G \
+		-drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+		-drive if=pflash,format=raw,file="$OVMF_VARS" \
+		-drive file="$MOCHIOS_DISK",format=raw,if=virtio,cache=none \
+		-device virtio-vga \
+		-device virtio-keyboard-pci \
+		-device virtio-mouse-pci \
+		-display sdl,gl=off,show-cursor=on,window-close=off \
+		-full-screen \
+		-monitor none \
+		-serial file:"$SERIAL_LOG"
+
+	status=$?
+
+	sync
+
+	if [ "$status" -eq 0 ]; then
+		poweroff
+	fi
+
+	echo "mBoot: mochiOS exited with status $status" >&2
+	return "$status"
+}
+
+stop_mochios() {
+	killall qemu-system-x86_64 2>/dev/null
+}
+
+case "$1" in
+	start)
+		start_mochios
+		;;
+	stop)
+		stop_mochios
+		;;
+	restart)
+		stop_mochios
+		sleep 1
+		start_mochios
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}" >&2
+		exit 1
+		;;
+esac
