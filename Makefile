@@ -41,7 +41,7 @@ run: build
 	-machine q35 \
 	-cpu host \
 	-smp 4 \
-	-m 4G \
+	-m 8G \
 	-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
 	-drive if=pflash,format=raw,file=output/images/OVMF_VARS.fd \
 	-drive file=output/images/disk.img,format=raw,if=virtio \

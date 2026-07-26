@@ -95,18 +95,27 @@ stop_mochios() {
 
 case "$1" in
 	start)
-		start_mochios
+		mkdir -p /run /var/log/mboot
+		start_mochios > /var/log/mboot/launcher.log 2>&1 &
+		echo "$!" > /run/mboot.pid
 		;;
 	stop)
-		stop_mochios
+		killall qemu-system-x86_64 2>/dev/null || true
+
+		if [ -f /run/mboot.pid ]; then
+			kill "$(cat /run/mboot.pid)" 2>/dev/null || true
+			rm -f /run/mboot.pid
+		fi
 		;;
 	restart)
-		stop_mochios
+		"$0" stop
 		sleep 1
-		start_mochios
+		"$0" start
 		;;
 	*)
 		echo "Usage: $0 {start|stop|restart}" >&2
 		exit 1
 		;;
 esac
+
+exit 0

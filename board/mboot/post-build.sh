@@ -13,7 +13,3 @@ else
     # Copy grub 1st stage to binaries, required for genimage
     cp -f "$TARGET_DIR/lib/grub/i386-pc/boot.img" "$BINARIES_DIR"
 fi
-
-if ! grep -q '^tty2::' "$TARGET_DIR/etc/inittab"; then
-	echo 'tty2::askfirst:/sbin/getty -L tty2 0 vt100' >> "$TARGET_DIR/etc/inittab"
-fi
