@@ -1,6 +1,7 @@
 BUILDROOT_DIR := $(CURDIR)/buildroot
 OUTPUT_DIR := $(CURDIR)/output
 BUILDROOT_DEFCONFIG := pc_x86_64_efi_defconfig
+MOCHIOS ?= $(CURDIR)/mochiOS.img
 
 JOBS ?= $(shell nproc)
 
@@ -44,6 +45,7 @@ run: build
 	-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
 	-drive if=pflash,format=raw,file=output/images/OVMF_VARS.fd \
 	-drive file=output/images/disk.img,format=raw,if=virtio \
+	-drive file=$(MOCHIOS),format=raw,if=virtio \
 	-device virtio-vga \
 	-display gtk \
 	-serial mon:stdio
