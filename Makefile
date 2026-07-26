@@ -73,11 +73,20 @@ check-config:
 		exit 1; \
 	fi
 
+.PHONY: savedefconfig
+savedefconfig:
+	$(MAKE) -C "$(BUILDROOT_DIR)" \
+		O="$(OUTPUT_DIR)" \
+		BR2_EXTERNAL="$(CURDIR)" \
+		BR2_DEFCONFIG="$(CURDIR)/configs/mboot_x86_64_defconfig" \
+		savedefconfig
+
 .PHONY: help
 help:
 	@echo "mBoot Buildroot targets:"
 	@echo "  make setup       Initialize Git submodules"
 	@echo "  make defconfig   Generate the default x86_64 configuration"
+	@echo "  make savedefconfig Save the current configuration to configs/mboot_x86_64_defconfig"
 	@echo "  make menuconfig  Open Buildroot menuconfig"
 	@echo "  make build       Build mBoot"
 	@echo "  make run         Build and launch with QEMU"
