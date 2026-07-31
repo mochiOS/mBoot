@@ -10,9 +10,11 @@ ROOT_PARTUUID=6d426f6f-7400-4b00-8a00-000000000001
 
 fail() { echo "check-image: $*" >&2; exit 1; }
 
-for image in disk.img efi-part.vfat rootfs.ext2 bzImage boot.img grub.img; do
+for image in disk.img mboot.iso efi-part.vfat rootfs.ext2 bzImage boot.img grub.img; do
 	test -s "$IMAGES/$image" || fail "missing image: $image"
 done
+cmp -s "$IMAGES/disk.img" "$IMAGES/mboot.iso" ||
+	fail 'mboot.iso is not identical to the completed raw GPT disk image'
 sfdisk --dump "$IMAGES/disk.img" | grep -qi "uuid=$ROOT_PARTUUID" ||
 	fail 'root GPT partition UUID is missing'
 sfdisk --dump "$IMAGES/disk.img" | grep -qi 'label-id: 6D426F6F-7400-4B00-8A00-000000000000' ||
@@ -34,10 +36,21 @@ printf '%s\n' "$bios_cfg" | grep -Fq "root=PARTUUID=$ROOT_PARTUUID" ||
 	fail 'BIOS GRUB configuration is incomplete'
 
 for path in etc/init.d/S40xorg etc/init.d/S90mboot \
-	usr/libexec/mboot-detect-disk usr/libexec/mboot-launcher \
+	usr/libexec/mboot-launcher \
 	usr/bin/qemu-system-x86_64 usr/bin/Xorg; do
 	test -x "$TARGET/$path" || fail "missing target executable: /$path"
 done
+test ! -e "$TARGET/usr/libexec/mboot-detect-disk" ||
+	fail 'obsolete external mochiOS disk detector remains in target'
+test -n "${MBOOT_MOCHIOS_IMAGE:-}" || fail 'source mochiOS image was not specified'
+test -s "$MBOOT_MOCHIOS_IMAGE" || fail 'source mochiOS image is missing'
+test -s "$TARGET/var/lib/mboot/mochiOS.img" || fail 'embedded mochiOS image is missing from target'
+source_hash=$(sha256sum "$MBOOT_MOCHIOS_IMAGE" | awk '{print $1}')
+target_hash=$(sha256sum "$TARGET/var/lib/mboot/mochiOS.img" | awk '{print $1}')
+[ "$source_hash" = "$target_hash" ] || fail 'embedded mochiOS image differs from its source'
+rootfs_hash=$(debugfs -R 'cat /var/lib/mboot/mochiOS.img' "$IMAGES/rootfs.ext2" 2>/dev/null |
+	sha256sum | awk '{print $1}')
+[ "$source_hash" = "$rootfs_hash" ] || fail 'root filesystem does not contain the mochiOS image'
 for path in usr/share/mboot/OVMF_CODE_4M.fd usr/share/mboot/OVMF_VARS_4M.fd; do
 	test -s "$TARGET/$path" || fail "missing firmware: /$path"
 done

@@ -23,7 +23,26 @@ check:
 
 .PHONY: check-image
 check-image: build
-	scripts/check-image.sh
+	MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))" scripts/check-image.sh
+
+.PHONY: check-mochios
+check-mochios:
+	@set -eu; \
+	image="$(abspath $(MOCHIOS))"; \
+	if [ ! -f "$$image" ]; then \
+		echo "mochiOS image not found: $$image" >&2; exit 1; \
+	fi; \
+	if [ ! -r "$$image" ]; then \
+		echo "mochiOS image is not readable: $$image" >&2; exit 1; \
+	fi; \
+	size=$$(wc -c < "$$image"); \
+	if [ "$$size" -lt 67108864 ]; then \
+		echo "mochiOS image is too small: $$size bytes" >&2; exit 1; \
+	fi; \
+	signature=$$(dd if="$$image" bs=1 skip=512 count=8 2>/dev/null); \
+	if [ "$$signature" != "EFI PART" ]; then \
+		echo "mochiOS image is not a raw GPT disk: $$image" >&2; exit 1; \
+	fi
 
 .PHONY: setup
 setup:
@@ -51,7 +70,8 @@ menuconfig: check-config
 		menuconfig
 
 .PHONY: build
-build: check-config
+build: check-config check-mochios
+	MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))" \
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
 		-j"$(JOBS)"
@@ -67,9 +87,6 @@ run: build
 	fi; \
 	case "$$accel" in kvm|tcg) :;; *) echo "invalid QEMU_ACCELERATOR: $$accel" >&2; exit 1;; esac; \
 	if [ "$$accel" = kvm ]; then accel_args='-accel kvm -cpu host'; else accel_args='-accel tcg -cpu max'; fi; \
-	if [ ! -f "$(MOCHIOS)" ]; then \
-		echo "mochiOS image not found: $(MOCHIOS)" >&2; exit 1; \
-	fi; \
 	if [ ! -f output/images/OVMF_VARS.fd ] || \
 	   [ "$$(wc -c < output/images/OVMF_VARS.fd)" -ne "$$(wc -c < "$(RUN_OVMF_VARS_TEMPLATE)")" ]; then \
 		cp "$(RUN_OVMF_VARS_TEMPLATE)" output/images/OVMF_VARS.fd; \
@@ -83,8 +100,6 @@ run: build
 	-drive if=pflash,format=raw,file=output/images/OVMF_VARS.fd \
 	-drive file=output/images/disk.img,format=raw,if=none,id=mboot \
 	-device virtio-blk-pci,drive=mboot,serial=MBOOT \
-	-drive file="$(MOCHIOS)",format=raw,if=none,id=mochios \
-	-device virtio-blk-pci,drive=mochios,serial=MOCHIOS \
 	-device virtio-vga \
 	-display "$(QEMU_DISPLAY)" \
 	-serial mon:stdio
@@ -143,7 +158,7 @@ help:
 	@echo "  make menuconfig        Open Buildroot menuconfig"
 	@echo "  make linux-menuconfig  Open Linux kernel menuconfig"
 	@echo "  make linux-update      Update the Linux kernel defconfig"
-	@echo "  make build             Build mBoot"
+	@echo "  make build             Build disk.img and USB-writable mboot.iso with embedded mochiOS"
 	@echo "  make check             Run repository regression checks"
 	@echo "  make check-image       Validate the completed image and target"
 	@echo "  make run               Build and launch with QEMU"

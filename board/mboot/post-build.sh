@@ -17,6 +17,13 @@ install -m 0644 "$1" "$BINARIES_DIR/boot.img"
 # Keep appliance state private even though the launcher currently runs as root
 # to obtain raw block-device access.
 install -d -m 0700 "$TARGET_DIR/var/lib/mboot"
+rm -f "$TARGET_DIR/usr/libexec/mboot-detect-disk" \
+	"$TARGET_DIR/etc/udev/rules.d/60-mboot-mochios.rules"
+if [ -z "${MBOOT_MOCHIOS_IMAGE:-}" ] || [ ! -r "$MBOOT_MOCHIOS_IMAGE" ]; then
+	echo 'mBoot: MBOOT_MOCHIOS_IMAGE must name a readable raw GPT image' >&2
+	exit 1
+fi
+install -m 0600 "$MBOOT_MOCHIOS_IMAGE" "$TARGET_DIR/var/lib/mboot/mochiOS.img"
 # Buildroot normally points /var/log at /tmp. Appliance diagnostics must
 # survive a reboot and be inspectable after an early display failure.
 if [ -L "$TARGET_DIR/var/log" ]; then rm "$TARGET_DIR/var/log"; fi

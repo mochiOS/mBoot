@@ -5,13 +5,13 @@ set -u
 
 CONFIG=/etc/mboot.conf
 QEMU=/usr/bin/qemu-system-x86_64
-DETECTOR=/usr/libexec/mboot-detect-disk
 XORG_SERVICE=/etc/init.d/S40xorg
 QEMU_PIDFILE=/run/mboot/qemu.pid
 QEMU_LOG=$MBOOT_LOG_DIR/qemu.log
 SERIAL_LOG=$MBOOT_LOG_DIR/mochios.log
 OVMF_CODE=/usr/share/mboot/OVMF_CODE_4M.fd
 OVMF_TEMPLATE=/usr/share/mboot/OVMF_VARS_4M.fd
+MOCHIOS_IMAGE=/var/lib/mboot/mochiOS.img
 qemu_pid=
 stopping=0
 
@@ -64,7 +64,7 @@ fi
 
 exec 9>/run/mboot/mochios.lock
 if ! flock -n 9; then
-	fail DISK_BUSY "Another mBoot launcher owns the mochiOS disk lock."
+	fail IMAGE_BUSY "Another mBoot launcher owns the embedded mochiOS image lock."
 	exit 1
 fi
 
@@ -99,25 +99,28 @@ if ! DISPLAY="$display" xset q >/dev/null 2>&1; then fail XORG_FAILED "Xorg did 
 mboot_log INFO "Xorg drivers: $(grep -Ei '\(II\) (modeset|intel|amdgpu|nouveau|vmware|fbdev)\(' "$MBOOT_LOG_DIR/xorg.log" 2>/dev/null | head -n 4 | tr '\n' ';' || true)"
 mboot_log INFO "displays: $(DISPLAY="$display" xrandr --query 2>/dev/null | grep ' connected' | tr '\n' ';' || echo unavailable)"
 
-detect_error=/run/mboot/detect-error
-if ! disk=$("$DETECTOR" 2>"$detect_error"); then
-	detail=$(cat "$detect_error")
-	case "$detail" in
-		*multiple*) code=DISK_MULTIPLE ;;
-		*readable*) code=DISK_PERMISSION ;;
-		*too\ small*) code=DISK_SIZE ;;
-		*not\ a\ raw\ GPT*) code=DISK_FORMAT ;;
-		*root\ disk*) code=DISK_ROOT_ONLY ;;
-		*mounted*|*held*|*swap*) code=DISK_BUSY ;;
-		*) code=DISK_NOT_FOUND ;;
-	esac
-	fail "$code" "$detail"
+if [ ! -f "$MOCHIOS_IMAGE" ]; then
+	fail IMAGE_MISSING "The embedded mochiOS image is missing. Rebuild mBoot with MOCHIOS=<disk.img>."
 	exit 1
 fi
-mboot_log INFO "selected mochiOS disk: $disk"
+if [ ! -r "$MOCHIOS_IMAGE" ] || [ ! -w "$MOCHIOS_IMAGE" ]; then
+	fail IMAGE_PERMISSION "The embedded mochiOS image is not readable and writable."
+	exit 1
+fi
+image_size=$(wc -c < "$MOCHIOS_IMAGE")
+if [ "$image_size" -lt 67108864 ]; then
+	fail IMAGE_SIZE "The embedded mochiOS image is too small: $image_size bytes."
+	exit 1
+fi
+image_signature=$(dd if="$MOCHIOS_IMAGE" bs=1 skip=512 count=8 2>/dev/null)
+if [ "$image_signature" != "EFI PART" ]; then
+	fail IMAGE_FORMAT "The embedded mochiOS image is not a raw GPT disk."
+	exit 1
+fi
+mboot_log INFO "selected embedded mochiOS image: $MOCHIOS_IMAGE ($image_size bytes)"
 
-disk_id=$(blkid -s PTUUID -o value "$disk" 2>/dev/null | tr -cd 'A-Za-z0-9._-' || true)
-[ -n "$disk_id" ] || { fail DISK_FORMAT "The selected disk has no stable GPT identifier."; exit 1; }
+disk_id=$(blkid -s PTUUID -o value "$MOCHIOS_IMAGE" 2>/dev/null | tr -cd 'A-Za-z0-9._-' || true)
+[ -n "$disk_id" ] || { fail IMAGE_FORMAT "The embedded mochiOS image has no stable GPT identifier."; exit 1; }
 OVMF_VARS=/var/lib/mboot/OVMF_VARS-${disk_id}.fd
 template_size=$(wc -c < "$OVMF_TEMPLATE")
 firmware_valid() {
@@ -214,7 +217,7 @@ set -- "$QEMU" -name mochiOS,process=mboot-qemu -nodefaults -no-reboot \
 	-accel "$accel" -cpu "$cpu" -machine "$machine" -smp "$vcpus" -m "$memory" \
 	-drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
 	-drive "if=pflash,format=raw,file=$OVMF_VARS" \
-	-drive "file=$disk,format=raw,if=none,id=mochios,cache=$cache,aio=threads" \
+	-drive "file=$MOCHIOS_IMAGE,format=raw,if=none,id=mochios,cache=$cache,aio=threads" \
 	-device virtio-blk-pci,drive=mochios,serial=MOCHIOS -device "$gpu" \
 	-device virtio-keyboard-pci -device virtio-mouse-pci \
 	-object rng-random,id=rng0,filename=/dev/urandom -device virtio-rng-pci,rng=rng0 \

@@ -11,6 +11,7 @@ require_line Makefile 'BUILDROOT_DEFCONFIG := mboot_x86_64_defconfig'
 require_line configs/mboot_x86_64_defconfig 'BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_MBOOT_PATH)/board/mboot/post-build.sh"'
 require_line configs/mboot_x86_64_defconfig 'BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_MBOOT_PATH)/board/mboot/post-image.sh"'
 require_line configs/mboot_x86_64_defconfig '# BR2_TARGET_GENERIC_GETTY is not set'
+require_line board/mboot/rootfs-overlay/etc/mboot.conf 'MBOOT_VCPUS=1'
 grep -Fq -- '--enable-alsa' board/mboot/qemu-configure-wrapper || fail 'target QEMU ALSA override is missing'
 
 for symbol in CONFIG_EFI CONFIG_ACPI CONFIG_PCI CONFIG_SATA_AHCI \
@@ -26,10 +27,14 @@ done
 for script in board/mboot/post-build.sh board/mboot/post-image.sh board/mboot/qemu-configure-wrapper \
 	board/mboot/rootfs-overlay/etc/init.d/S40xorg \
 	board/mboot/rootfs-overlay/etc/init.d/S90mboot \
-	board/mboot/rootfs-overlay/usr/libexec/mboot-detect-disk \
 	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher; do
 	sh -n "$script" || fail "shell syntax: $script"
 done
+grep -Fq 'MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))"' Makefile ||
+	fail 'Makefile does not pass the mochiOS image into Buildroot'
+grep -Fq 'MOCHIOS_IMAGE=/var/lib/mboot/mochiOS.img' \
+	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'launcher does not use the embedded mochiOS image'
 
 if grep -R -nE '/dev/vdb|vt0?7|killall[[:space:]]+qemu-system' \
 	Makefile configs board; then

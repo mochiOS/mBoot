@@ -22,3 +22,12 @@ dd if="$BINARIES_DIR/boot.img" of="$BINARIES_DIR/disk.img" \
 	bs=1 count=446 conv=notrunc 2>/dev/null
 dd if="$BINARIES_DIR/grub.img" of="$BINARIES_DIR/disk.img" \
 	bs=512 seek=2048 conv=notrunc 2>/dev/null
+
+# USB imaging tools commonly expose .iso files more prominently than .img
+# files. This remains a writable BIOS/UEFI raw GPT image (not ISO9660), so an
+# installed mBoot system can persist both mochiOS and its OVMF state.
+usb_image="$BINARIES_DIR/mboot.iso"
+usb_image_new=${usb_image}.new
+rm -f "$usb_image_new"
+cp --sparse=always "$BINARIES_DIR/disk.img" "$usb_image_new"
+mv "$usb_image_new" "$usb_image"

@@ -18,38 +18,51 @@ mBoot に必要なのは `kernel.elf` や `initfs` の単体ファイルでは�
 mochiOS/out/artifacts/disk.img
 ```
 
-このファイルは次のどちらかの方法で mBoot に渡します。
+このファイルはビルド時に mBoot の root filesystem へ
+`/var/lib/mboot/mochiOS.img` として格納されます。実機では mBoot と mochiOS を
+別々のディスクへ書き込む必要はありません。
 
 ```sh
 # mBoot リポジトリ直下へ、既定名で配置する
 cp ../mochiOS/out/artifacts/disk.img ./mochiOS.img
-make run
+make defconfig
+make build
 
 # または元の場所を明示する
-make run MOCHIOS=../mochiOS/out/artifacts/disk.img
+make build MOCHIOS=../mochiOS/out/artifacts/disk.img
 ```
 
 必要条件は以下のとおりです。
 
-- QEMU の raw block device として渡せる通常ファイルまたは物理ディスク
+- QEMU の raw block device として渡せる通常ファイル
 - GPT パーティションテーブルを持つこと
-- 64 MiB 以上で、mBoot から読み書きできること
+- 64 MiB 以上で、ビルド時に読み取れること
 - OVMF/UEFI で単独起動できる完全な mochiOS ディスクであること
 
-`make run` はこのイメージを `MOCHIOS` という virtio disk serial 付きで
-接続します。そのため、開発用 QEMU テストではパーティション名を変更する
-必要はありません。物理ディスクを接続する場合の識別方法は
-「mochiOS ディスクの識別」を参照してください。
+`make build` はファイルの存在、最小サイズ、GPT header を検査します。完成後の
+mBoot は内包したファイルを `MOCHIOS` という virtio disk serial 付きで mochiOS
+へ渡します。GPTパーティション名やfilesystem labelの変更は不要です。
 
 ## ビルドと起動
 
 ```sh
-make defconfig   # configs/mboot_x86_64_defconfig を適用
-make build       # output/images/disk.img を生成
-make check       # 設定とシェルスクリプトの回帰検査
-make check-image # 完成したイメージ、GRUB、カーネル設定を検査
-make run         # mBoot と ./mochiOS.img をホスト QEMU で起動
+make defconfig                                  # 初回だけ設定を生成
+make build MOCHIOS=../mochiOS/out/artifacts/disk.img
+make check
+make check-image MOCHIOS=../mochiOS/out/artifacts/disk.img
+make run MOCHIOS=../mochiOS/out/artifacts/disk.img
 ```
+
+`make build` は次の2つを生成します。内容は同一です。
+
+```text
+output/images/disk.img   通常のraw GPTディスクイメージ
+output/images/mboot.iso  USB書き込みツール向けの配布名
+```
+
+`mboot.iso` は、CD/DVD用の読み取り専用ISO9660ではありません。mochiOSのディスク
+内容やOVMF状態を実機で永続化するため、BIOS/UEFI両対応の書き込み可能なraw GPT
+イメージを`.iso`という名前でも出力しています。
 
 GUI を使わずシリアルログだけを確認する場合は、次のように実行します。
 
@@ -57,49 +70,26 @@ GUI を使わずシリアルログだけを確認する場合は、次のよう�
 make run QEMU_DISPLAY=none
 ```
 
-`make run` は利用可能なら KVM、利用できなければ TCG を選択します。
-生成された `output/images/disk.img` を専用の USB メモリまたは SSD に
-書き込むと、物理マシンで起動できます。Secure Boot には対応していないため、
-ファームウェア設定で無効にしてください。
+`make run` は完成した1台のmBootディスクだけを外側のQEMUへ接続します。内側の
+mochiOSが自動起動するため、単一ディスク構成をそのまま仮想環境で確認できます。
+利用可能ならKVM、利用できなければTCGを選択します。
 
-## mochiOS ディスクの識別
+## USBまたはSSDから実機起動
 
-mBoot は候補を Linux の `/dev/vdb` のような不安定な名前では識別しません。
-次のいずれかのメタデータを持つ、ちょうど1台の raw GPT ディスクを選択します。
+`output/images/mboot.iso`または`disk.img`を、ファイルとしてコピーするのではなく、
+USBメモリやSSDの**デバイス全体**へディスクイメージとして書き込みます。4 GiB
+以上の専用媒体を推奨します。書き込み先の既存データは消去されます。
 
-- GPT パーティション名が `MOCHIOS`
-- GPT パーティション type GUID が
-  `4d4f4348-494f-5300-a11e-000000000001`
-- パーティションの filesystem label が `MOCHIOS`
-- ディスク全体の udev short serial が `MOCHIOS`
-- カーネル引数で永続 selector を明示
-
-カーネル引数の例:
-
-```text
-mboot.disk=/dev/disk/by-id/ata-example
-mboot.disk=PARTUUID=01234567-89ab-cdef-0123-456789abcdef
-```
-
-物理 mochiOS ディスクでは、既存パーティションの GPT 名または filesystem
-label を `MOCHIOS` にする方法が簡単です。マーカーがパーティションにあっても、
-QEMU へ渡されるのはその親ディスク全体です。
-
-mBoot は次の候補を拒否します。
-
-- mBoot 自身の root disk
-- 複数の一致候補
-- マウント中、swap 使用中、または holder があるディスク
-- 読み書きできないディスク
-- 64 MiB 未満または GPT でないディスク
-
-ランチャーは QEMU の全実行期間にわたって排他ロックを保持します。
+書き込んだ1台だけを実機へ接続し、BIOSまたはUEFIから起動してください。別の
+mochiOS用ディスクや`MOCHIOS`ラベルは不要です。Secure Bootには対応していない
+ため、ファームウェア設定で無効にしてください。
 
 ## 実行時設定とログ
 
 root 所有の `/etc/mboot.conf` で、vCPU、メモリ上限、Q35/PC、virtio GPU、
 SDL 全画面、user networking、ALSA 音声、disk cache を設定できます。
-CPU とメモリを空欄にすると、Linux 用の予約分を残して自動算出します。
+mochiOSは現在マルチコア未対応のため、既定値は`MBOOT_VCPUS=1`です。メモリを
+空欄にするとLinux用の予約分を残して自動算出します。
 
 ログは次に保存され、再起動後も残ります。
 
