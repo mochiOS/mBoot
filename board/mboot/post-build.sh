@@ -4,8 +4,12 @@ set -e
 
 BOARD_DIR=$(dirname "$0")
 
-test -d "$BINARIES_DIR/efi-part/EFI/BOOT"
-install -m 0644 "$BOARD_DIR/grub-efi.cfg" "$BINARIES_DIR/efi-part/EFI/BOOT/grub.cfg"
+install -d -m 0755 "$BINARIES_DIR/efi-part/EFI/BOOT"
+rm -f "$BINARIES_DIR/efi-part/EFI/BOOT/bootx64.efi" \
+	"$BINARIES_DIR/efi-part/EFI/BOOT/BOOTX64.EFI" \
+	"$BINARIES_DIR/efi-part/EFI/BOOT/grub.cfg"
+install -m 0644 "$BINARIES_DIR/bzImage" \
+	"$BINARIES_DIR/efi-part/EFI/BOOT/BOOTX64.EFI"
 install -D -m 0644 "$BOARD_DIR/grub-bios.cfg" "$TARGET_DIR/boot/grub/grub.cfg"
 set -- "$BUILD_DIR"/grub2-*/build-i386-pc/grub-core/boot.img
 [ "$#" -eq 1 ] && [ -f "$1" ] || {

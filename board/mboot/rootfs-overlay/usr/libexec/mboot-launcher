@@ -167,6 +167,19 @@ unsigned "$memory" && [ "$memory" -ge 1024 ] && [ "$memory" -le $((total_mib - 5
 }
 mboot_log INFO "resources: host_cpus=$host_cpus vcpus=$vcpus host_memory_mib=$total_mib guest_memory_mib=$memory"
 
+# Load only the KVM backend matching the host CPU.  Keeping both vendor
+# backends built into the kernel makes kvm_amd probe every Intel CPU (and vice
+# versa), which produces misleading boot-time errors on physical machines.
+cpu_vendor=$(awk -F: '/^vendor_id[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' /proc/cpuinfo)
+case "$cpu_vendor" in
+	GenuineIntel) kvm_backend=kvm_intel ;;
+	AuthenticAMD|HygonGenuine) kvm_backend=kvm_amd ;;
+	*) kvm_backend='' ;;
+esac
+if [ -n "$kvm_backend" ] && ! modprobe "$kvm_backend" 2>/dev/null; then
+	mboot_log WARNING "Cannot load $kvm_backend; KVM may be unavailable"
+fi
+
 kvm_usable=0
 kvm_probe_pidfile=/run/mboot/kvm-probe.pid
 if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] &&
@@ -190,7 +203,10 @@ if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] &&
 fi
 if [ "$kvm_usable" -eq 1 ]; then
 	accel=kvm
-	cpu=host
+	# Do not expose the physical vendor's complete CPU surface to mochiOS.
+	# qemu64 is deliberately conservative and behaves consistently on Intel
+	# VT-x and AMD-V hosts, while KVM still provides hardware acceleration.
+	cpu=qemu64
 else
 	accel=tcg
 	cpu=max
