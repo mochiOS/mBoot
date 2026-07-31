@@ -1,6 +1,6 @@
 BUILDROOT_DIR := $(CURDIR)/buildroot
 OUTPUT_DIR := $(CURDIR)/output
-BUILDROOT_DEFCONFIG := pc_x86_64_efi_defconfig
+BUILDROOT_DEFCONFIG := mboot_x86_64_defconfig
 MOCHIOS ?= $(CURDIR)/mochiOS.img
 
 JOBS ?= $(shell nproc)
@@ -20,6 +20,7 @@ defconfig: setup
 	mkdir -p "$(OUTPUT_DIR)"
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
+		BR2_EXTERNAL="$(CURDIR)" \
 		"$(BUILDROOT_DEFCONFIG)"
 
 .PHONY: menuconfig
