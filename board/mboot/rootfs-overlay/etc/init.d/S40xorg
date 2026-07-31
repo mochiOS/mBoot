@@ -1,46 +1,88 @@
 #!/bin/sh
-#
-# Starts Xorg
-#
 
 BIN=/usr/bin/Xorg
-PIDFILE=/var/run/xorg.pid
+PIDFILE=/run/mboot/xorg.pid
+LOG=/var/log/mboot/xorg.log
+DISPLAY_NUMBER=:0
+VT=2
 
-# ":0.0 vt07" makes sure Xorg finds the correct terminal.
-# -allowMouseOpenFail allows the server to start up even if the mouse device
-#   can't be opened or initialised.
-# -noreset prevents a server reset when the last client connection is closed.
-XORG_ARGS=":0.0 vt07 -s 0 -noreset -allowMouseOpenFail"
+get_config() {
+	value=$(sed -n "s/^$1=//p" /etc/mboot.conf 2>/dev/null | tail -n 1)
+	[ -z "$value" ] || printf '%s\n' "$value"
+}
+
+configured=$(get_config MBOOT_X_DISPLAY)
+[ -z "$configured" ] || DISPLAY_NUMBER=$configured
+configured=$(get_config MBOOT_X_VT)
+[ -z "$configured" ] || VT=$configured
+
+valid_pid() {
+	[ -f "$PIDFILE" ] || return 1
+	pid=$(cat "$PIDFILE" 2>/dev/null)
+	case "$pid" in ''|*[!0-9]*) return 1;; esac
+	[ -r "/proc/$pid/cmdline" ] && tr '\000' ' ' < "/proc/$pid/cmdline" | grep -Fq "$BIN"
+}
+
+ready() {
+	DISPLAY="$DISPLAY_NUMBER" xset q >/dev/null 2>&1
+}
 
 start() {
-	printf "Starting Xorg: "
-	start-stop-daemon -S -q -b -m -p $PIDFILE --exec $BIN -- $XORG_ARGS
-	[ $? = 0 ] && sleep 3 && echo "OK" || echo "FAIL"
+	printf 'Starting Xorg: '
+	mkdir -p /run/mboot /var/log/mboot
+	if valid_pid && ready; then echo 'already running'; return 0; fi
+	[ ! -f "$PIDFILE" ] || rm -f "$PIDFILE"
+	case "$VT" in ''|*[!0-9]*) echo 'invalid VT'; return 1;; esac
+	[ "$VT" -ge 2 ] && [ "$VT" -le 63 ] && [ -c "/dev/tty$VT" ] || {
+		echo "VT $VT unavailable"; return 1;
+	}
+	[ -x "$BIN" ] || { echo 'Xorg missing'; return 1; }
+	if [ -S /tmp/.X11-unix/X0 ] && ! ready; then rm -f /tmp/.X11-unix/X0; fi
+	openvt -c "$VT" -f -- true >/dev/null 2>&1 || {
+		echo "cannot reserve VT $VT"; return 1;
+	}
+	chvt "$VT" >/dev/null 2>&1 || true
+	"$BIN" "$DISPLAY_NUMBER" "vt$VT" -nolisten tcp -s 0 -dpms -noreset \
+		-allowMouseOpenFail -nocursor -logfile "$LOG" >>"$LOG" 2>&1 &
+	pid=$!
+	printf '%s\n' "$pid" > "$PIDFILE"
+	count=0
+	while [ "$count" -lt 300 ]; do
+		if ! kill -0 "$pid" 2>/dev/null; then
+			wait "$pid" 2>/dev/null || true
+			rm -f "$PIDFILE"
+			echo "FAIL (see $LOG)"
+			return 1
+		fi
+		if ready; then echo 'OK'; return 0; fi
+		count=$((count + 1))
+		sleep 0.1
+	done
+	kill "$pid" 2>/dev/null || true
+	rm -f "$PIDFILE"
+	echo "FAIL (readiness timeout; see $LOG)"
+	return 1
 }
 
 stop() {
-	printf "Stopping Xorg: "
-	start-stop-daemon -K -q -p $PIDFILE
-	[ $? = 0 ] && echo "OK" || echo "FAIL"
-}
-
-restart() {
-	stop
-	sleep 2
-	start
+	printf 'Stopping Xorg: '
+	if ! valid_pid; then rm -f "$PIDFILE"; echo 'not running'; return 0; fi
+	pid=$(cat "$PIDFILE")
+	kill -TERM "$pid" 2>/dev/null || true
+	count=0
+	while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 50 ]; do
+		count=$((count + 1)); sleep 0.1
+	done
+	kill -KILL "$pid" 2>/dev/null || true
+	rm -f "$PIDFILE"
+	chvt 1 >/dev/null 2>&1 || true
+	echo 'OK'
 }
 
 case "$1" in
-	start)
-		start
-	;;
-	stop)
-		stop
-	;;
-	restart|reload)
-		restart
-	;;
-	*)
-		echo "Usage: $0 {start|stop|restart}"
-	exit 1
+	start) start ;;
+	stop) stop ;;
+	restart|reload) stop; start ;;
+	status) valid_pid && ready ;;
+	*) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
 esac

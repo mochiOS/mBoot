@@ -1,0 +1,111 @@
+#!/bin/sh
+set -eu
+
+MARKER_GUID=4d4f4348-494f-5300-a11e-000000000001
+MINIMUM_BYTES=${MBOOT_MINIMUM_DISK_BYTES:-67108864}
+
+die() { echo "mboot-detect-disk: $*" >&2; exit 1; }
+
+resolve_spec() {
+	spec=$1
+	case "$spec" in
+		UUID=*|PARTUUID=*|LABEL=*|PARTLABEL=*)
+			matches=$(blkid -t "$spec" -o device 2>/dev/null || true)
+			[ "$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l)" -eq 1 ] ||
+				die "explicit selector is missing or ambiguous: $spec"
+			set -- $matches
+			path=$1
+			;;
+		/dev/disk/by-id/*|/dev/disk/by-uuid/*|/dev/disk/by-partuuid/*|/dev/disk/by-label/*|/dev/disk/by-partlabel/*) path=$spec ;;
+		/dev/*) die "mboot.disk rejects unstable kernel device names; use /dev/disk/by-*" ;;
+		*) die "mboot.disk must be /dev/disk/by-* or a persistent blkid selector" ;;
+	esac
+	readlink -f "$path" 2>/dev/null || die "cannot resolve $path"
+}
+
+parent_disk() {
+	device=$(readlink -f "$1")
+	type=$(lsblk -ndo TYPE "$device" 2>/dev/null || true)
+	case "$type" in
+		disk) printf '%s\n' "$device" ;;
+		part)
+			parent=$(lsblk -ndo PKNAME "$device" 2>/dev/null || true)
+			[ -n "$parent" ] || die "cannot determine parent disk for $device"
+			printf '/dev/%s\n' "$parent"
+			;;
+		*) die "$device is not a whole disk or partition" ;;
+	esac
+}
+
+root_disk() {
+	source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+	case "$source" in
+		/dev/*) parent_disk "$source" 2>/dev/null || true; return ;;
+	esac
+	for word in $(cat /proc/cmdline 2>/dev/null); do
+		case "$word" in
+			root=*) resolved=$(resolve_spec "${word#root=}" 2>/dev/null || true); [ -z "$resolved" ] || parent_disk "$resolved" 2>/dev/null || true; return ;;
+		esac
+	done
+}
+
+validate_disk() {
+	disk=$(parent_disk "$1")
+	[ -b "$disk" ] || die "candidate is not a block device: $disk"
+	[ -r "$disk" ] && [ -w "$disk" ] || die "candidate is not readable and writable: $disk"
+	root=$(root_disk)
+	[ -z "$root" ] || [ "$disk" != "$root" ] || die "candidate is the mBoot root disk: $disk"
+	size=$(blockdev --getsize64 "$disk" 2>/dev/null || echo 0)
+	[ "$size" -ge "$MINIMUM_BYTES" ] || die "candidate is too small: $disk ($size bytes)"
+	pttype=$(blkid -s PTTYPE -o value "$disk" 2>/dev/null || true)
+	[ "$pttype" = gpt ] || die "candidate is not a raw GPT disk: $disk"
+	if lsblk -nrpo MOUNTPOINT "$disk" 2>/dev/null | grep -q '[^[:space:]]'; then
+		die "candidate or one of its partitions is mounted: $disk"
+	fi
+	for sysnode in /sys/class/block/"${disk#/dev/}" /sys/class/block/"${disk#/dev/}"/*; do
+		[ -e "$sysnode" ] || continue
+		name=${sysnode##*/}
+		if [ -d "/sys/class/block/$name/holders" ] &&
+			find "/sys/class/block/$name/holders" -mindepth 1 -maxdepth 1 | grep -q .; then
+			die "candidate is held by another block device: $disk"
+		fi
+	done
+	grep -q "^$disk" /proc/swaps 2>/dev/null && die "candidate is in use as swap: $disk"
+	printf '%s\n' "$disk"
+}
+
+explicit=
+for word in $(cat /proc/cmdline 2>/dev/null); do
+	case "$word" in mboot.disk=*) explicit=${word#mboot.disk=};; esac
+done
+
+if [ -n "$explicit" ]; then
+	validate_disk "$(resolve_spec "$explicit")"
+	exit
+fi
+
+udevadm settle --timeout=15 2>/dev/null || true
+candidate_file=/run/mboot/disk-candidates
+mkdir -p /run/mboot
+: > "$candidate_file"
+for sysdev in /sys/class/block/*; do
+	dev=/dev/${sysdev##*/}
+	properties=$(udevadm info --query=property --name="$dev" 2>/dev/null || true)
+	name=$(printf '%s\n' "$properties" | sed -n 's/^ID_PART_ENTRY_NAME=//p')
+	type=$(printf '%s\n' "$properties" | sed -n 's/^ID_PART_ENTRY_TYPE=//p' | tr 'A-F' 'a-f')
+	label=$(printf '%s\n' "$properties" | sed -n 's/^ID_FS_LABEL=//p')
+	serial=$(printf '%s\n' "$properties" | sed -n 's/^ID_SERIAL_SHORT=//p')
+	[ -n "$serial" ] || serial=$(printf '%s\n' "$properties" | sed -n 's/^ID_SERIAL=//p')
+	if { [ -f "$sysdev/partition" ] && { [ "$name" = MOCHIOS ] || [ "$type" = "$MARKER_GUID" ] || [ "$label" = MOCHIOS ]; }; } ||
+	   { [ ! -f "$sysdev/partition" ] && [ "$serial" = MOCHIOS ]; }; then
+		parent_disk "$dev" >> "$candidate_file"
+	fi
+done
+
+sort -u "$candidate_file" -o "$candidate_file"
+count=$(wc -l < "$candidate_file")
+case "$count" in
+	0) die "no disk with MOCHIOS metadata was found" ;;
+	1) validate_disk "$(sed -n '1p' "$candidate_file")" ;;
+	*) die "multiple disks with MOCHIOS metadata were found" ;;
+esac

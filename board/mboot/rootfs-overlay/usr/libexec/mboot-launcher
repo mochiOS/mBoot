@@ -1,0 +1,262 @@
+#!/bin/sh
+set -u
+
+. /usr/lib/mboot/common.sh
+
+CONFIG=/etc/mboot.conf
+QEMU=/usr/bin/qemu-system-x86_64
+DETECTOR=/usr/libexec/mboot-detect-disk
+XORG_SERVICE=/etc/init.d/S40xorg
+QEMU_PIDFILE=/run/mboot/qemu.pid
+QEMU_LOG=$MBOOT_LOG_DIR/qemu.log
+SERIAL_LOG=$MBOOT_LOG_DIR/mochios.log
+OVMF_CODE=/usr/share/mboot/OVMF_CODE_4M.fd
+OVMF_TEMPLATE=/usr/share/mboot/OVMF_VARS_4M.fd
+qemu_pid=
+stopping=0
+
+config_get() {
+	key=$1
+	default=$2
+	value=$(sed -n "s/^${key}=//p" "$CONFIG" 2>/dev/null | tail -n 1)
+	[ -n "$value" ] || value=$default
+	printf '%s\n' "$value"
+}
+
+unsigned() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+
+fail() {
+	code=$1
+	shift
+	mboot_show_error "$code" "$*"
+	return 1
+}
+
+on_signal() {
+	stopping=1
+	mboot_log INFO "launcher received a shutdown signal"
+	[ -z "$qemu_pid" ] || kill -TERM "$qemu_pid" 2>/dev/null || true
+}
+
+cleanup() {
+	rm -f "$QEMU_PIDFILE"
+	if [ -n "$qemu_pid" ] && kill -0 "$qemu_pid" 2>/dev/null; then
+		kill -TERM "$qemu_pid" 2>/dev/null || true
+	fi
+}
+
+trap on_signal HUP INT TERM
+trap cleanup EXIT
+
+mkdir -p /run/mboot "$MBOOT_LOG_DIR" /var/lib/mboot
+chmod 0750 "$MBOOT_LOG_DIR"
+chmod 0700 /var/lib/mboot
+exec >>"$MBOOT_LOG_DIR/launcher.log" 2>&1
+
+if [ -f "$QEMU_PIDFILE" ]; then
+	old_pid=$(cat "$QEMU_PIDFILE" 2>/dev/null)
+	if mboot_pid_is "$old_pid" "$QEMU"; then
+		fail ALREADY_RUNNING "A managed mochiOS QEMU process is already running."
+		exit 1
+	fi
+	rm -f "$QEMU_PIDFILE"
+fi
+
+exec 9>/run/mboot/mochios.lock
+if ! flock -n 9; then
+	fail DISK_BUSY "Another mBoot launcher owns the mochiOS disk lock."
+	exit 1
+fi
+
+mboot_log INFO "mBoot launcher starting"
+mboot_log INFO "version: $(sed -n 's/^MBOOT_VERSION=//p' /etc/mboot-release 2>/dev/null)"
+mboot_log INFO "kernel: $(uname -srvm)"
+mboot_log INFO "GPU inventory: $(lspci 2>/dev/null | grep -Ei 'VGA|3D|Display' | tr '\n' ';' || echo unavailable)"
+for card in /sys/class/drm/card[0-9]*; do
+	[ -e "$card" ] || continue
+	driver=$(readlink -f "$card/device/driver" 2>/dev/null || true)
+	mboot_log INFO "DRM ${card##*/}: ${driver##*/}"
+done
+
+if [ ! -x "$QEMU" ]; then fail QEMU_MISSING "qemu-system-x86_64 is not installed."; exit 1; fi
+if [ ! -r "$OVMF_CODE" ]; then fail OVMF_MISSING "OVMF code firmware is missing."; exit 1; fi
+if [ ! -r "$OVMF_TEMPLATE" ]; then fail OVMF_TEMPLATE_MISSING "OVMF variables template is missing."; exit 1; fi
+
+if ! "$XORG_SERVICE" status >/dev/null 2>&1; then
+	mboot_log WARNING "Xorg was not ready; attempting one controlled restart"
+	if ! "$XORG_SERVICE" restart; then
+		if grep -qiE 'no screens found|no devices detected|failed to open.*drm' "$MBOOT_LOG_DIR/xorg.log" 2>/dev/null; then
+			fail GPU_FAILED "No usable GPU or framebuffer could be initialized. See xorg.log."
+		else
+			fail XORG_FAILED "Xorg could not start. See xorg.log."
+		fi
+		exit 1
+	fi
+fi
+
+display=$(config_get MBOOT_X_DISPLAY :0)
+if ! DISPLAY="$display" xset q >/dev/null 2>&1; then fail XORG_FAILED "Xorg did not pass its readiness query."; exit 1; fi
+mboot_log INFO "Xorg drivers: $(grep -Ei '\(II\) (modeset|intel|amdgpu|nouveau|vmware|fbdev)\(' "$MBOOT_LOG_DIR/xorg.log" 2>/dev/null | head -n 4 | tr '\n' ';' || true)"
+mboot_log INFO "displays: $(DISPLAY="$display" xrandr --query 2>/dev/null | grep ' connected' | tr '\n' ';' || echo unavailable)"
+
+detect_error=/run/mboot/detect-error
+if ! disk=$("$DETECTOR" 2>"$detect_error"); then
+	detail=$(cat "$detect_error")
+	case "$detail" in
+		*multiple*) code=DISK_MULTIPLE ;;
+		*readable*) code=DISK_PERMISSION ;;
+		*too\ small*) code=DISK_SIZE ;;
+		*not\ a\ raw\ GPT*) code=DISK_FORMAT ;;
+		*root\ disk*) code=DISK_ROOT_ONLY ;;
+		*mounted*|*held*|*swap*) code=DISK_BUSY ;;
+		*) code=DISK_NOT_FOUND ;;
+	esac
+	fail "$code" "$detail"
+	exit 1
+fi
+mboot_log INFO "selected mochiOS disk: $disk"
+
+disk_id=$(blkid -s PTUUID -o value "$disk" 2>/dev/null | tr -cd 'A-Za-z0-9._-' || true)
+[ -n "$disk_id" ] || { fail DISK_FORMAT "The selected disk has no stable GPT identifier."; exit 1; }
+OVMF_VARS=/var/lib/mboot/OVMF_VARS-${disk_id}.fd
+template_size=$(wc -c < "$OVMF_TEMPLATE")
+firmware_valid() {
+	[ -f "$1" ] && [ "$(dd if="$1" bs=1 skip=40 count=4 2>/dev/null)" = _FVH ]
+}
+if ! firmware_valid "$OVMF_TEMPLATE"; then
+	fail OVMF_TEMPLATE_INVALID "The OVMF variables template has an invalid firmware-volume header."
+	exit 1
+fi
+if [ -e "$OVMF_VARS" ] && { [ "$(wc -c < "$OVMF_VARS")" -ne "$template_size" ] || ! firmware_valid "$OVMF_VARS"; }; then
+	invalid=${OVMF_VARS}.invalid.$(date +%s)
+	mboot_log WARNING "OVMF variables size mismatch; preserving it as $invalid"
+	if ! mv "$OVMF_VARS" "$invalid"; then fail OVMF_VARS_FAILED "Cannot preserve corrupt OVMF variables."; exit 1; fi
+fi
+if [ ! -e "$OVMF_VARS" ]; then
+	temporary=${OVMF_VARS}.new.$$
+	if ! cp "$OVMF_TEMPLATE" "$temporary" || ! chmod 0600 "$temporary" || ! mv "$temporary" "$OVMF_VARS"; then
+		rm -f "$temporary"
+		fail OVMF_VARS_FAILED "Cannot initialize persistent OVMF variables."
+		exit 1
+	fi
+fi
+
+host_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+max_cpus=$(config_get MBOOT_MAX_VCPUS 8)
+vcpus=$(config_get MBOOT_VCPUS '')
+unsigned "$host_cpus" || host_cpus=1
+unsigned "$max_cpus" || { fail CONFIG_INVALID "MBOOT_MAX_VCPUS must be numeric."; exit 1; }
+if [ -z "$vcpus" ]; then vcpus=$host_cpus; [ "$vcpus" -le "$max_cpus" ] || vcpus=$max_cpus; fi
+unsigned "$vcpus" && [ "$vcpus" -ge 1 ] || { fail CONFIG_INVALID "MBOOT_VCPUS must be a positive integer."; exit 1; }
+
+total_mib=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+reserve_mib=$(config_get MBOOT_RESERVE_MEMORY_MIB 1536)
+max_memory=$(config_get MBOOT_MAX_MEMORY_MIB 8192)
+memory=$(config_get MBOOT_MEMORY_MIB '')
+unsigned "$total_mib" && unsigned "$reserve_mib" && unsigned "$max_memory" || { fail CONFIG_INVALID "Memory settings must be numeric."; exit 1; }
+if [ "$total_mib" -lt 2048 ]; then fail MEMORY_LOW "At least 2 GiB host memory is required."; exit 1; fi
+if [ -z "$memory" ]; then
+	memory=$((total_mib - reserve_mib))
+	[ "$memory" -le "$max_memory" ] || memory=$max_memory
+fi
+unsigned "$memory" && [ "$memory" -ge 1024 ] && [ "$memory" -le $((total_mib - 512)) ] || {
+	fail MEMORY_LOW "Guest memory would leave too little memory for mBoot."; exit 1;
+}
+mboot_log INFO "resources: host_cpus=$host_cpus vcpus=$vcpus host_memory_mib=$total_mib guest_memory_mib=$memory"
+
+kvm_usable=0
+kvm_probe_pidfile=/run/mboot/kvm-probe.pid
+if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] &&
+	grep -Eq '^flags[[:space:]]*:.*[[:space:]](vmx|svm)([[:space:]]|$)' /proc/cpuinfo; then
+	rm -f "$kvm_probe_pidfile"
+	if "$QEMU" -name mboot-kvm-probe -nodefaults -machine q35 -accel kvm \
+		-display none -monitor none -serial none -S -daemonize \
+		-pidfile "$kvm_probe_pidfile"; then
+		probe_pid=$(cat "$kvm_probe_pidfile" 2>/dev/null || true)
+		if mboot_pid_is "$probe_pid" "$QEMU"; then
+			kvm_usable=1
+			kill -TERM "$probe_pid" 2>/dev/null || true
+			probe_wait=0
+			while kill -0 "$probe_pid" 2>/dev/null && [ "$probe_wait" -lt 20 ]; do
+				probe_wait=$((probe_wait + 1)); sleep 0.1
+			done
+			kill -KILL "$probe_pid" 2>/dev/null || true
+		fi
+	fi
+	rm -f "$kvm_probe_pidfile"
+fi
+if [ "$kvm_usable" -eq 1 ]; then
+	accel=kvm
+	cpu=host
+else
+	accel=tcg
+	cpu=max
+	mboot_log WARNING "KVM unavailable; falling back to TCG"
+fi
+
+machine=$(config_get MBOOT_MACHINE q35)
+gpu=$(config_get MBOOT_GUEST_GPU virtio-vga)
+display_backend=$(config_get MBOOT_DISPLAY sdl)
+fullscreen=$(config_get MBOOT_FULLSCREEN yes)
+network=$(config_get MBOOT_NETWORK user)
+audio=$(config_get MBOOT_AUDIO auto)
+cache=$(config_get MBOOT_DISK_CACHE auto)
+case "$machine" in q35|pc) ;; *) fail CONFIG_INVALID "Unsupported machine: $machine"; exit 1;; esac
+case "$gpu" in virtio-vga|virtio-gpu-pci) ;; *) fail CONFIG_INVALID "Unsupported guest GPU: $gpu"; exit 1;; esac
+[ "$display_backend" = sdl ] || { fail CONFIG_INVALID "Only the SDL/X11 display module is installed."; exit 1; }
+case "$network" in user|none) ;; *) fail CONFIG_INVALID "Unsupported network mode: $network"; exit 1;; esac
+case "$audio" in auto|on|off) ;; *) fail CONFIG_INVALID "Unsupported audio mode: $audio"; exit 1;; esac
+case "$cache" in auto) cache=none;; none|directsync|writeback) :;; *) fail CONFIG_INVALID "Unsupported disk cache mode: $cache"; exit 1;; esac
+
+export DISPLAY="$display"
+export SDL_VIDEODRIVER=x11
+set -- "$QEMU" -name mochiOS,process=mboot-qemu -nodefaults -no-reboot \
+	-accel "$accel" -cpu "$cpu" -machine "$machine" -smp "$vcpus" -m "$memory" \
+	-drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+	-drive "if=pflash,format=raw,file=$OVMF_VARS" \
+	-drive "file=$disk,format=raw,if=none,id=mochios,cache=$cache,aio=threads" \
+	-device virtio-blk-pci,drive=mochios,serial=MOCHIOS -device "$gpu" \
+	-device virtio-keyboard-pci -device virtio-mouse-pci \
+	-object rng-random,id=rng0,filename=/dev/urandom -device virtio-rng-pci,rng=rng0 \
+	-display sdl,gl=off,show-cursor=off,window-close=off \
+	-monitor none -serial "file:$SERIAL_LOG"
+[ "$fullscreen" != yes ] || set -- "$@" -full-screen
+[ "$network" != user ] || set -- "$@" -netdev user,id=net0 -device virtio-net-pci,netdev=net0
+if [ "$audio" = on ] || { [ "$audio" = auto ] && grep -q '^[[:space:]]*[0-9]' /proc/asound/cards 2>/dev/null; }; then
+	set -- "$@" -audiodev alsa,id=audio0 -device ich9-intel-hda -device hda-duplex,audiodev=audio0
+else
+	mboot_log WARNING "No host ALSA device selected; continuing without guest audio"
+fi
+
+mboot_log INFO "QEMU arguments follow (one argument per field):"
+for argument in "$@"; do mboot_log INFO "qemu-arg: <$argument>"; done
+: > "$QEMU_LOG"
+qemu_started=$(date +%s)
+"$@" >>"$QEMU_LOG" 2>&1 &
+qemu_pid=$!
+printf '%s\n' "$qemu_pid" > "$QEMU_PIDFILE"
+mboot_log INFO "QEMU pid: $qemu_pid"
+wait "$qemu_pid"
+status=$?
+qemu_runtime=$(($(date +%s) - qemu_started))
+qemu_pid=
+rm -f "$QEMU_PIDFILE"
+sync
+mboot_log INFO "QEMU exit status: $status"
+
+[ "$stopping" -eq 0 ] || exit 0
+if [ "$status" -eq 0 ]; then
+	mboot_log INFO "mochiOS shut down normally; powering off mBoot"
+	poweroff
+	exit 0
+fi
+if grep -qiE 'SDL|Could not initialize.*video|No available video' "$QEMU_LOG"; then
+	fail SDL_FAILED "QEMU could not initialize its SDL/X11 display."
+else
+	if [ "$qemu_runtime" -lt 5 ]; then
+		fail QEMU_START_FAILED "QEMU failed during startup with status $status."
+	else
+		fail MOCHIOS_ABNORMAL "mochiOS/QEMU exited abnormally with status $status."
+	fi
+fi
+exit "$status"

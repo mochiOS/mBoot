@@ -1,7 +1,13 @@
 BUILDROOT_DIR := $(CURDIR)/buildroot
+BUILDROOT_VERSION := 2025.02.16
 OUTPUT_DIR := $(CURDIR)/output
 BUILDROOT_DEFCONFIG := mboot_x86_64_defconfig
 MOCHIOS ?= $(CURDIR)/mochiOS.img
+QEMU_ACCELERATOR ?= auto
+QEMU_MEMORY ?= 4096
+QEMU_DISPLAY ?= gtk
+RUN_OVMF_CODE := $(CURDIR)/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_CODE_4M.fd
+RUN_OVMF_VARS_TEMPLATE := $(CURDIR)/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_VARS_4M.fd
 
 JOBS ?= $(shell nproc)
 
@@ -11,9 +17,24 @@ override export PATH := /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 .PHONY: all
 all: build
 
+.PHONY: check
+check:
+	scripts/check-config.sh
+
+.PHONY: check-image
+check-image: build
+	scripts/check-image.sh
+
 .PHONY: setup
 setup:
-	git submodule update --init --recursive
+	@if [ -f "$(BUILDROOT_DIR)/Makefile" ]; then \
+		:; \
+	elif git ls-files --error-unmatch buildroot >/dev/null 2>&1; then \
+		git submodule update --init --recursive; \
+	else \
+		git clone --depth 1 --branch "$(BUILDROOT_VERSION)" \
+			https://gitlab.com/buildroot.org/buildroot.git "$(BUILDROOT_DIR)"; \
+	fi
 
 .PHONY: defconfig
 defconfig: setup
@@ -37,18 +58,35 @@ build: check-config
 
 .PHONY: run
 run: build
+	@set -eu; \
+	accel="$(QEMU_ACCELERATOR)"; \
+	if [ "$$accel" = auto ]; then \
+		if [ -r /dev/kvm ] && [ -w /dev/kvm ] && \
+		   grep -Eq '^flags[[:space:]]*:.*[[:space:]](vmx|svm)([[:space:]]|$$)' /proc/cpuinfo; \
+		then accel=kvm; else accel=tcg; fi; \
+	fi; \
+	case "$$accel" in kvm|tcg) :;; *) echo "invalid QEMU_ACCELERATOR: $$accel" >&2; exit 1;; esac; \
+	if [ "$$accel" = kvm ]; then accel_args='-accel kvm -cpu host'; else accel_args='-accel tcg -cpu max'; fi; \
+	if [ ! -f "$(MOCHIOS)" ]; then \
+		echo "mochiOS image not found: $(MOCHIOS)" >&2; exit 1; \
+	fi; \
+	if [ ! -f output/images/OVMF_VARS.fd ] || \
+	   [ "$$(wc -c < output/images/OVMF_VARS.fd)" -ne "$$(wc -c < "$(RUN_OVMF_VARS_TEMPLATE)")" ]; then \
+		cp "$(RUN_OVMF_VARS_TEMPLATE)" output/images/OVMF_VARS.fd; \
+	fi; \
 	qemu-system-x86_64 \
-	-enable-kvm \
+	$$accel_args \
 	-machine q35 \
-	-cpu host \
 	-smp 4 \
-	-m 8G \
-	-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+	-m "$(QEMU_MEMORY)" \
+	-drive if=pflash,format=raw,readonly=on,file="$(RUN_OVMF_CODE)" \
 	-drive if=pflash,format=raw,file=output/images/OVMF_VARS.fd \
-	-drive file=output/images/disk.img,format=raw,if=virtio \
-	-drive file=$(MOCHIOS),format=raw,if=virtio \
+	-drive file=output/images/disk.img,format=raw,if=none,id=mboot \
+	-device virtio-blk-pci,drive=mboot,serial=MBOOT \
+	-drive file="$(MOCHIOS)",format=raw,if=none,id=mochios \
+	-device virtio-blk-pci,drive=mochios,serial=MOCHIOS \
 	-device virtio-vga \
-	-display gtk \
+	-display "$(QEMU_DISPLAY)" \
 	-serial mon:stdio
 
 .PHONY: clean
@@ -106,6 +144,8 @@ help:
 	@echo "  make linux-menuconfig  Open Linux kernel menuconfig"
 	@echo "  make linux-update      Update the Linux kernel defconfig"
 	@echo "  make build             Build mBoot"
+	@echo "  make check             Run repository regression checks"
+	@echo "  make check-image       Validate the completed image and target"
 	@echo "  make run               Build and launch with QEMU"
 	@echo "  make clean             Clean Buildroot outputs"
 	@echo "  make distclean         Remove the entire output directory"

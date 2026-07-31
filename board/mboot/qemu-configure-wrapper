@@ -1,0 +1,6 @@
+#!/bin/sh
+# Buildroot's disable flags occur in "$@"; QEMU configure uses the last
+# occurrence, so append the appliance-owned backend selection.
+exec "$(dirname "$0")/configure.mboot-real" "$@" \
+	--audio-drv-list=alsa \
+	--enable-alsa
