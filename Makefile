@@ -6,8 +6,13 @@ MOCHIOS ?= $(CURDIR)/mochiOS.img
 QEMU_ACCELERATOR ?= auto
 QEMU_MEMORY ?= 4096
 QEMU_DISPLAY ?= gtk
+QEMU_FULLSCREEN ?= yes
+QEMU ?= qemu-system-x86_64
 RUN_OVMF_CODE := $(CURDIR)/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_CODE_4M.fd
 RUN_OVMF_VARS_TEMPLATE := $(CURDIR)/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_VARS_4M.fd
+RUN_DISK_IMAGE := $(OUTPUT_DIR)/run/mboot.img
+QEMU_FULLSCREEN_PATCH := $(CURDIR)/board/mboot/patches/qemu/0001-sdl-keep-fullscreen-window-size.patch
+QEMU_FULLSCREEN_PATCH_STAMP := $(OUTPUT_DIR)/.mboot-qemu-fullscreen-patch.sha256
 
 JOBS ?= $(shell nproc)
 
@@ -69,16 +74,43 @@ menuconfig: check-config
 		O="$(OUTPUT_DIR)" \
 		menuconfig
 
+.PHONY: prepare-qemu
+prepare-qemu:
+	@set -eu; \
+	digest=$$(sha256sum "$(QEMU_FULLSCREEN_PATCH)" | awk '{print $$1}'); \
+	if [ -f "$(QEMU_FULLSCREEN_PATCH_STAMP)" ] && \
+	   [ "$$(cat "$(QEMU_FULLSCREEN_PATCH_STAMP)")" = "$$digest" ]; then \
+		exit 0; \
+	fi; \
+	qemu_built=0; \
+	for directory in "$(OUTPUT_DIR)"/build/qemu-*; do \
+		[ ! -d "$$directory" ] || qemu_built=1; \
+	done; \
+	if [ "$$qemu_built" -eq 1 ]; then \
+		$(MAKE) -C "$(BUILDROOT_DIR)" O="$(OUTPUT_DIR)" qemu-dirclean; \
+	fi
+
 .PHONY: build
-build: check-config check-mochios
+build: check-config check-mochios prepare-qemu
 	MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))" \
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
 		-j"$(JOBS)"
+	@sha256sum "$(QEMU_FULLSCREEN_PATCH)" | awk '{print $$1}' > \
+		"$(QEMU_FULLSCREEN_PATCH_STAMP).new"
+	@mv "$(QEMU_FULLSCREEN_PATCH_STAMP).new" "$(QEMU_FULLSCREEN_PATCH_STAMP)"
 
-.PHONY: run
+.PHONY: run run-built
 run: build
+	$(MAKE) run-built
+
+run-built:
 	@set -eu; \
+	test -s "$(OUTPUT_DIR)/images/disk.img" || { echo "mBoot image not found: $(OUTPUT_DIR)/images/disk.img" >&2; exit 1; }; \
+	mkdir -p "$(OUTPUT_DIR)/run"; \
+	rm -f "$(RUN_DISK_IMAGE).new"; \
+	cp --reflink=auto --sparse=always "$(OUTPUT_DIR)/images/disk.img" "$(RUN_DISK_IMAGE).new"; \
+	mv "$(RUN_DISK_IMAGE).new" "$(RUN_DISK_IMAGE)"; \
 	accel="$(QEMU_ACCELERATOR)"; \
 	if [ "$$accel" = auto ]; then \
 		if [ -r /dev/kvm ] && [ -w /dev/kvm ] && \
@@ -86,22 +118,25 @@ run: build
 		then accel=kvm; else accel=tcg; fi; \
 	fi; \
 	case "$$accel" in kvm|tcg) :;; *) echo "invalid QEMU_ACCELERATOR: $$accel" >&2; exit 1;; esac; \
-	if [ "$$accel" = kvm ]; then accel_args='-accel kvm -cpu host'; else accel_args='-accel tcg -cpu max'; fi; \
-	if [ ! -f output/images/OVMF_VARS.fd ] || \
-	   [ "$$(wc -c < output/images/OVMF_VARS.fd)" -ne "$$(wc -c < "$(RUN_OVMF_VARS_TEMPLATE)")" ]; then \
-		cp "$(RUN_OVMF_VARS_TEMPLATE)" output/images/OVMF_VARS.fd; \
-	fi; \
-	qemu-system-x86_64 \
+	if [ "$$accel" = kvm ]; then accel_args='-accel kvm -cpu host,-vmx,-svm'; else accel_args='-accel tcg -cpu qemu64,-vmx,-svm'; fi; \
+	case "$(QEMU_FULLSCREEN)" in yes) fullscreen_args='-full-screen';; no) fullscreen_args='';; *) echo "invalid QEMU_FULLSCREEN: $(QEMU_FULLSCREEN)" >&2; exit 1;; esac; \
+	if [ "$(QEMU_DISPLAY)" = none ]; then fullscreen_args=''; fi; \
+	cp "$(RUN_OVMF_VARS_TEMPLATE)" "$(OUTPUT_DIR)/images/OVMF_VARS.fd"; \
+	$(QEMU) \
 	$$accel_args \
-	-machine q35 \
+	-machine q35,i8042=off \
 	-smp 4 \
 	-m "$(QEMU_MEMORY)" \
 	-drive if=pflash,format=raw,readonly=on,file="$(RUN_OVMF_CODE)" \
-	-drive if=pflash,format=raw,file=output/images/OVMF_VARS.fd \
-	-drive file=output/images/disk.img,format=raw,if=none,id=mboot \
+	-drive if=pflash,format=raw,file="$(OUTPUT_DIR)/images/OVMF_VARS.fd" \
+	-drive file="$(RUN_DISK_IMAGE)",format=raw,if=none,id=mboot \
 	-device virtio-blk-pci,drive=mboot,serial=MBOOT \
 	-device virtio-vga \
+	-device qemu-xhci,id=xhci \
+	-device usb-kbd,bus=xhci.0,id=mboot-keyboard \
+	-device usb-mouse,bus=xhci.0,id=mboot-mouse \
 	-display "$(QEMU_DISPLAY)" \
+	$$fullscreen_args \
 	-serial mon:stdio
 
 .PHONY: clean
@@ -162,6 +197,7 @@ help:
 	@echo "  make check             Run repository regression checks"
 	@echo "  make check-image       Validate the completed image and target"
 	@echo "  make run               Build and launch with QEMU"
+	@echo "  make run-built         Launch the existing image with QEMU"
 	@echo "  make clean             Clean Buildroot outputs"
 	@echo "  make distclean         Remove the entire output directory"
 	@echo "  make rebuild           Clean and rebuild"

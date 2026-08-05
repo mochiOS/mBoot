@@ -1,0 +1,115 @@
+From: mochiOS Project <development@mochios.org>
+Subject: [PATCH] ui/sdl2: create fullscreen window without a window manager
+
+The x86 guest starts at 640x480 and switches to its framebuffer resolution
+after boot.  mBoot intentionally runs Xorg without a window manager, so an
+SDL_WINDOW_FULLSCREEN_DESKTOP request leaves the initial 640x480 window
+centered on the display.  Create a borderless window covering the display
+bounds directly, and leave those dimensions unchanged when the guest surface
+changes.  The SDL renderer's logical size then scales the guest surface to the
+physical display.
+
+The same window-manager-free setup does not grant input focus before QEMU's
+initial fullscreen grab.  SDL then rejects the grab and relative mouse events
+never reach the guest.  In fullscreen kiosk mode, explicitly focus the sole
+window and continue establishing the grab; retain SDL's original focus guard
+for normal windowed use.  Also keep forwarding mouse events in fullscreen
+kiosk mode if the X server has not reflected the grab state yet.
+
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index eeac8c11fd..db80e44435 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -79,14 +79,29 @@ void sdl2_window_create(struct sdl2_console *scon)
+ void sdl2_window_create(struct sdl2_console *scon)
+ {
+     int flags = 0;
++    int x = SDL_WINDOWPOS_UNDEFINED;
++    int y = SDL_WINDOWPOS_UNDEFINED;
++    int width;
++    int height;
+ 
+     if (!scon->surface) {
+         return;
+     }
+     assert(!scon->real_window);
++    width = surface_width(scon->surface);
++    height = surface_height(scon->surface);
+ 
+     if (gui_fullscreen) {
+-        flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
++        SDL_Rect bounds;
++        if (SDL_GetDisplayBounds(0, &bounds) == 0) {
++            x = bounds.x;
++            y = bounds.y;
++            width = bounds.w;
++            height = bounds.h;
++            flags |= SDL_WINDOW_BORDERLESS;
++        } else {
++            flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
++        }
+     } else {
+         flags |= SDL_WINDOW_RESIZABLE;
+     }
+@@ -99,11 +114,13 @@ void sdl2_window_create(struct sdl2_console *scon)
+     }
+ #endif
+ 
+-    scon->real_window = SDL_CreateWindow("", SDL_WINDOWPOS_UNDEFINED,
+-                                         SDL_WINDOWPOS_UNDEFINED,
+-                                         surface_width(scon->surface),
+-                                         surface_height(scon->surface),
+-                                         flags);
++    scon->real_window = SDL_CreateWindow("", x, y, width, height, flags);
++    if (gui_fullscreen) {
++        SDL_ShowWindow(scon->real_window);
++        SDL_RaiseWindow(scon->real_window);
++        SDL_SetWindowInputFocus(scon->real_window);
++        SDL_PumpEvents();
++    }
+     if (scon->opengl) {
+         const char *driver = "opengl";
+ 
+@@ -143,7 +160,7 @@ void sdl2_window_destroy(struct sdl2_console *scon)
+ 
+ void sdl2_window_resize(struct sdl2_console *scon)
+ {
+-    if (!scon->real_window) {
++    if (!scon->real_window || gui_fullscreen) {
+         return;
+     }
+ 
+@@ -246,7 +263,11 @@ static void sdl_grab_start(struct sdl2_console *scon)
+      * application (SDL bug).
+      */
+     if (!(SDL_GetWindowFlags(scon->real_window) & SDL_WINDOW_INPUT_FOCUS)) {
+-        return;
++        if (!gui_fullscreen) {
++            return;
++        }
++        SDL_RaiseWindow(scon->real_window);
++        SDL_SetWindowInputFocus(scon->real_window);
+     }
+     if (guest_cursor) {
+         SDL_SetCursor(guest_sprite);
+@@ -524,7 +545,8 @@ static void handle_mousemotion(SDL_Event *ev)
+             sdl_grab_start(scon);
+         }
+     }
+-    if (gui_grab || qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
++    if (gui_grab || gui_fullscreen ||
++        qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
+         sdl_send_mouse_event(scon, ev->motion.xrel, ev->motion.yrel,
+                              ev->motion.x, ev->motion.y, ev->motion.state);
+     }
+@@ -541,7 +563,7 @@ static void handle_mousebutton(SDL_Event *ev)
+     }
+ 
+     bev = &ev->button;
+-    if (!gui_grab && !qemu_input_is_absolute(scon->dcl.con)) {
++    if (!gui_grab && !gui_fullscreen && !qemu_input_is_absolute(scon->dcl.con)) {
+         if (ev->type == SDL_MOUSEBUTTONUP && bev->button == SDL_BUTTON_LEFT) {
+             /* start grabbing all events */
+             sdl_grab_start(scon);
+-- 
+2.43.0

@@ -201,17 +201,34 @@ if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] &&
 	fi
 	rm -f "$kvm_probe_pidfile"
 fi
-if [ "$kvm_usable" -eq 1 ]; then
-	accel=kvm
-	# Do not expose the physical vendor's complete CPU surface to mochiOS.
-	# qemu64 is deliberately conservative and behaves consistently on Intel
-	# VT-x and AMD-V hosts, while KVM still provides hardware acceleration.
-	cpu=qemu64
-else
-	accel=tcg
-	cpu=max
-	mboot_log WARNING "KVM unavailable; falling back to TCG"
-fi
+accel_preference=$(config_get MBOOT_ACCELERATOR auto)
+case "$accel_preference" in
+	auto)
+		if [ "$kvm_usable" -eq 1 ]; then
+			accel=kvm
+		else
+			accel=tcg,thread=multi
+			mboot_log WARNING "KVM unavailable; falling back to TCG"
+		fi
+		;;
+	kvm)
+		if [ "$kvm_usable" -ne 1 ]; then
+			fail KVM_UNAVAILABLE "KVM was requested but is not usable on this system."
+			exit 1
+		fi
+		accel=kvm
+		;;
+	tcg) accel=tcg,thread=multi ;;
+	*)
+		fail CONFIG_INVALID "Unsupported accelerator: $accel_preference"
+		exit 1
+		;;
+esac
+# Do not expose the physical vendor's complete CPU surface to mochiOS.
+# qemu64 is deliberately conservative and behaves consistently on Intel
+# VT-x and AMD-V hosts, while acceleration remains selected independently.
+cpu=qemu64,+x2apic
+mboot_log INFO "accelerator: preference=$accel_preference selected=$accel"
 
 machine=$(config_get MBOOT_MACHINE q35)
 gpu=$(config_get MBOOT_GUEST_GPU virtio-vga)
@@ -235,7 +252,6 @@ set -- "$QEMU" -name mochiOS,process=mboot-qemu -nodefaults -no-reboot \
 	-drive "if=pflash,format=raw,file=$OVMF_VARS" \
 	-drive "file=$MOCHIOS_IMAGE,format=raw,if=none,id=mochios,cache=$cache,aio=threads" \
 	-device virtio-blk-pci,drive=mochios,serial=MOCHIOS -device "$gpu" \
-	-device virtio-keyboard-pci -device virtio-mouse-pci \
 	-object rng-random,id=rng0,filename=/dev/urandom -device virtio-rng-pci,rng=rng0 \
 	-display sdl,gl=off,show-cursor=off,window-close=off \
 	-monitor none -serial "file:$SERIAL_LOG"
