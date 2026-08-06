@@ -40,9 +40,9 @@ $ROOT/output/host/bin/mcopy -i "$IMAGES/efi-part.vfat" ::/EFI/BOOT/BOOTX64.EFI "
 cmp -s "$IMAGES/bzImage" "$efi_kernel" || fail 'EFI fallback loader is not the Linux EFI-stub kernel'
 rm -f "$efi_kernel"
 
-for path in etc/init.d/S40xorg etc/init.d/S90mboot \
+for path in etc/init.d/S40xorg etc/init.d/S80mbootd etc/init.d/S90mboot \
 	usr/libexec/mboot-launcher \
-	usr/bin/qemu-system-x86_64 usr/bin/Xorg; do
+	usr/sbin/mbootd usr/bin/qemu-system-x86_64 usr/bin/Xorg; do
 	test -x "$TARGET/$path" || fail "missing target executable: /$path"
 done
 test ! -e "$TARGET/usr/libexec/mboot-detect-disk" ||

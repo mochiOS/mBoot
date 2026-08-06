@@ -6,8 +6,9 @@ use mboot_protocol::{
 use std::fs;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +19,7 @@ static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub fn run(path: &Path) -> io::Result<()> {
     prepare_socket(path)?;
     let listener = UnixListener::bind(path)?;
+    let _socket = SocketFile::new(path)?;
     println!("mbootd listening: {}", path.display());
     for connection in listener.incoming() {
         match connection {
@@ -36,8 +38,28 @@ pub fn run(path: &Path) -> io::Result<()> {
 pub fn run_one(path: &Path, state: &mut GuestState) -> io::Result<()> {
     prepare_socket(path)?;
     let listener = UnixListener::bind(path)?;
+    let _socket = SocketFile::new(path)?;
     let (stream, _) = listener.accept()?;
     serve_connection(stream, state, DEFAULT_HEARTBEAT_MS)
+}
+
+struct SocketFile {
+    path: PathBuf,
+}
+
+impl SocketFile {
+    fn new(path: &Path) -> io::Result<Self> {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(Self {
+            path: path.to_owned(),
+        })
+    }
+}
+
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 pub fn serve_connection(
@@ -166,11 +188,9 @@ fn dispatch(
             message.request_id,
             state.status_arguments(),
         )),
-        KnownCommand::HostPoweroff | KnownCommand::HostReboot => Some(Message::ok(
-            Destination::Mochios,
-            message.request_id,
-            Vec::new(),
-        )),
+        KnownCommand::HostPoweroff | KnownCommand::HostReboot => {
+            request_error(message, ErrorCode::Unsupported, None)
+        }
         KnownCommand::ProtocolWelcome
         | KnownCommand::GuestStatus
         | KnownCommand::GuestShutdown
@@ -338,7 +358,10 @@ mod tests {
             );
             assert!(matches!(
                 dispatch(&mut state, &message, "session", 5000),
-                Some(Message { body: Body::Ok, .. })
+                Some(Message {
+                    body: Body::Error(ErrorCode::Unsupported),
+                    ..
+                })
             ));
         }
     }

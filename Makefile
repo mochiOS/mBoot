@@ -16,17 +16,22 @@ QEMU_FULLSCREEN_PATCH_STAMP := $(OUTPUT_DIR)/.mboot-qemu-fullscreen-patch.sha256
 
 JOBS ?= $(shell nproc)
 HOST_CARGO := $(shell command -v cargo)
+MBOOTD_BINARY := $(CURDIR)/target/release/mbootd
 
 # WSL PATH fix for Buildroot
 override export PATH := /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-.PHONY: all protocol-test
+.PHONY: all protocol-test mbootd
 all: build
 
 protocol-test:
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
 	$(HOST_CARGO) test --workspace
 	$(HOST_CARGO) check -p mboot-protocol --no-default-features
+
+mbootd:
+	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
+	$(HOST_CARGO) build --release -p mbootd
 
 .PHONY: check
 check:
@@ -97,8 +102,9 @@ prepare-qemu:
 	fi
 
 .PHONY: build
-build: check-config check-mochios prepare-qemu
+build: check-config check-mochios prepare-qemu mbootd
 	MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))" \
+	MBOOTD_BINARY="$(MBOOTD_BINARY)" \
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
 		-j"$(JOBS)"

@@ -2,7 +2,7 @@ use mboot_protocol::{Argument, KnownCommand, Message};
 use std::fmt;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ConnectionState {
     Disconnected,
     Connected,
@@ -122,6 +122,16 @@ impl GuestState {
         }
         let stage = BootStage::parse(required(message, "stage")?)
             .ok_or(StateError::InvalidArgument("stage"))?;
+        let expected = match self.boot_stage {
+            None => BootStage::Kernel,
+            Some(BootStage::Kernel) => BootStage::Userspace,
+            Some(BootStage::Userspace) => BootStage::Display,
+            Some(BootStage::Display) => BootStage::Desktop,
+            Some(BootStage::Firmware | BootStage::Desktop) => return Err(StateError::InvalidState),
+        };
+        if stage != expected {
+            return Err(StateError::InvalidState);
+        }
         self.boot_stage = Some(stage);
         self.connection_state = if stage == BootStage::Desktop {
             ConnectionState::Ready
@@ -264,13 +274,33 @@ mod tests {
     }
 
     #[test]
+    fn ready_stages_cannot_skip_or_move_backwards() {
+        let mut state = negotiated_state();
+        let display = event(
+            KnownCommand::GuestReady,
+            vec![Argument::new("stage", "display")],
+        );
+        assert_eq!(state.ready(&display), Err(StateError::InvalidState));
+        let kernel = event(
+            KnownCommand::GuestReady,
+            vec![Argument::new("stage", "kernel")],
+        );
+        assert_eq!(state.ready(&kernel), Ok(BootStage::Kernel));
+        assert_eq!(state.ready(&kernel), Err(StateError::InvalidState));
+    }
+
+    #[test]
     fn heartbeat_updates_state_and_can_time_out() {
         let mut state = negotiated_state();
-        let desktop = event(
-            KnownCommand::GuestReady,
-            vec![Argument::new("stage", "desktop")],
-        );
-        state.ready(&desktop).unwrap();
+        for (name, expected) in [
+            ("kernel", BootStage::Kernel),
+            ("userspace", BootStage::Userspace),
+            ("display", BootStage::Display),
+            ("desktop", BootStage::Desktop),
+        ] {
+            let ready = event(KnownCommand::GuestReady, vec![Argument::new("stage", name)]);
+            assert_eq!(state.ready(&ready), Ok(expected));
+        }
         assert_eq!(state.connection_state, ConnectionState::Ready);
         let message = event(
             KnownCommand::GuestHeartbeat,

@@ -1,0 +1,65 @@
+#!/bin/sh
+
+DAEMON=/usr/sbin/mbootd
+SOCKET=/run/mboot/mochios-control.sock
+PIDFILE=/run/mboot/mbootd.pid
+LOG=/var/log/mboot/mbootd.log
+
+valid_pid() {
+	[ -f "$PIDFILE" ] || return 1
+	pid=$(cat "$PIDFILE" 2>/dev/null)
+	case "$pid" in ''|*[!0-9]*) return 1;; esac
+	[ -r "/proc/$pid/cmdline" ] && tr '\000' ' ' < "/proc/$pid/cmdline" | grep -Fq "$DAEMON"
+}
+
+start() {
+	printf 'Starting mBoot control daemon: '
+	install -d -m 0750 /run/mboot /var/log/mboot
+	if valid_pid; then
+		[ -S "$SOCKET" ] && { echo 'already running'; return 0; }
+		stop >/dev/null
+	fi
+	rm -f "$PIDFILE"
+	if [ -e "$SOCKET" ] && [ ! -S "$SOCKET" ]; then
+		echo 'invalid socket path'
+		return 1
+	fi
+	[ -x "$DAEMON" ] || { echo 'missing'; return 1; }
+	start-stop-daemon -S -q -b -m -p "$PIDFILE" -x "$DAEMON" -- "$SOCKET" >>"$LOG" 2>&1
+	count=0
+	while [ "$count" -lt 50 ]; do
+		if valid_pid && [ -S "$SOCKET" ]; then echo 'OK'; return 0; fi
+		count=$((count + 1)); sleep 0.1
+	done
+	stop >/dev/null
+	echo 'FAIL'
+	return 1
+}
+
+stop() {
+	printf 'Stopping mBoot control daemon: '
+	if ! valid_pid; then
+		rm -f "$PIDFILE"
+		[ ! -S "$SOCKET" ] || rm -f "$SOCKET"
+		echo 'not running'
+		return 0
+	fi
+	pid=$(cat "$PIDFILE")
+	kill -TERM "$pid" 2>/dev/null || true
+	count=0
+	while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 50 ]; do
+		count=$((count + 1)); sleep 0.1
+	done
+	if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+	rm -f "$PIDFILE"
+	[ ! -S "$SOCKET" ] || rm -f "$SOCKET"
+	echo 'OK'
+}
+
+case "$1" in
+	start) start ;;
+	stop) stop ;;
+	restart) stop; start ;;
+	status) valid_pid && [ -S "$SOCKET" ] ;;
+	*) echo "Usage: $0 {start|stop|restart|status}" >&2; exit 1 ;;
+esac

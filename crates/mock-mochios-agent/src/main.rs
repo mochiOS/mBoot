@@ -30,6 +30,29 @@ fn run(path: &Path) -> io::Result<()> {
             Destination::Mboot,
             MessageType::Request,
             1,
+            KnownCommand::ProtocolSync,
+            Vec::new(),
+        ),
+    )?;
+    let mut sync_response = String::new();
+    BufReader::new(stream.try_clone()?).read_line(&mut sync_response)?;
+    let sync_response = decode_line(sync_response.as_bytes()).map_err(invalid_data)?;
+    if sync_response.destination != Destination::Mochios
+        || sync_response.message_type != MessageType::Response
+        || sync_response.request_id != 1
+        || !matches!(sync_response.body, mboot_protocol::Body::Ok)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid PROTOCOL.SYNC response",
+        ));
+    }
+    send(
+        &mut stream,
+        &Message::command(
+            Destination::Mboot,
+            MessageType::Request,
+            2,
             KnownCommand::ProtocolHello,
             vec![
                 Argument::new("system", "mochios"),
@@ -44,7 +67,7 @@ fn run(path: &Path) -> io::Result<()> {
     let welcome = decode_line(response.as_bytes()).map_err(invalid_data)?;
     if welcome.destination != Destination::Mochios
         || welcome.message_type != MessageType::Response
-        || welcome.request_id != 1
+        || welcome.request_id != 2
         || welcome.known_command() != Some(KnownCommand::ProtocolWelcome)
         || welcome.argument("version") != Some("1")
         || welcome.argument("session").is_none()

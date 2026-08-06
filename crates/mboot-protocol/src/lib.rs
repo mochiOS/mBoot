@@ -355,7 +355,8 @@ fn valid_key(value: &str) -> bool {
 fn valid_value(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'+' | b'-')
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b':' | b'/' | b'+' | b'-' | b',')
         })
 }
 
@@ -874,6 +875,23 @@ mod tests {
                 Argument::new("boot_id", "01989d34"),
             ],
         ));
+    }
+
+    #[test]
+    fn hello_capability_list_round_trips() {
+        let message = Message::command(
+            Destination::Mboot,
+            MessageType::Request,
+            1,
+            KnownCommand::ProtocolHello,
+            alloc::vec![
+                Argument::new("system", "mochios"),
+                Argument::new("version", "26.0.0"),
+                Argument::new("boot_id", "01989d34"),
+                Argument::new("capabilities", "ready,heartbeat,status"),
+            ],
+        );
+        round_trip(&message);
     }
 
     #[test]

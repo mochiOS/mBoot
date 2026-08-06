@@ -60,12 +60,24 @@ grep -Fq 'QEMU_POST_PATCH_HOOKS += MBOOT_QEMU_APPLY_FULLSCREEN_PATCH' external.m
 
 for script in board/mboot/post-build.sh board/mboot/post-image.sh board/mboot/qemu-configure-wrapper \
 	board/mboot/rootfs-overlay/etc/init.d/S40xorg \
+	board/mboot/rootfs-overlay/etc/init.d/S80mbootd \
 	board/mboot/rootfs-overlay/etc/init.d/S90mboot \
 	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher; do
 	sh -n "$script" || fail "shell syntax: $script"
 done
 grep -Fq 'MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))"' Makefile ||
 	fail 'Makefile does not pass the mochiOS image into Buildroot'
+grep -Fq 'MBOOTD_BINARY="$(MBOOTD_BINARY)"' Makefile ||
+	fail 'Makefile does not pass mbootd into Buildroot'
+grep -Fq -- '-chardev socket,id=mbootctl,path=/run/mboot/mochios-control.sock,server=off,reconnect-ms=1000' \
+	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'mBoot control chardev is missing or is not reconnectable'
+grep -Fq -- '-device virtio-serial-pci,id=mboot-serial,disable-legacy=on,max_ports=2' \
+	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'dedicated modern virtio-serial controller is missing'
+grep -Fq -- 'name=org.mochios.mboot.control' \
+	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'mBoot control port name is missing'
 grep -Fq 'MOCHIOS_IMAGE=/var/lib/mboot/mochiOS.img' \
 	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
 	fail 'launcher does not use the embedded mochiOS image'

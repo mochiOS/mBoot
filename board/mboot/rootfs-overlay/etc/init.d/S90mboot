@@ -1,6 +1,7 @@
 #!/bin/sh
 
 DAEMON=/usr/libexec/mboot-launcher
+CONTROL_SERVICE=/etc/init.d/S80mbootd
 PIDFILE=/run/mboot/launcher.pid
 LOG=/var/log/mboot/launcher.log
 
@@ -16,6 +17,10 @@ start() {
 	mkdir -p /run/mboot /var/log/mboot
 	if valid_pid; then echo 'already running'; return 0; fi
 	rm -f "$PIDFILE" /run/mboot/qemu.pid
+	if ! "$CONTROL_SERVICE" status >/dev/null 2>&1 && ! "$CONTROL_SERVICE" start; then
+		echo 'control daemon failed'
+		return 1
+	fi
 	[ -x "$DAEMON" ] || { echo 'missing'; return 1; }
 	start-stop-daemon -S -q -b -m -p "$PIDFILE" -x "$DAEMON" -- >>"$LOG" 2>&1
 	count=0

@@ -4,6 +4,12 @@ set -e
 
 BOARD_DIR=$(dirname "$0")
 
+if [ -z "${MBOOTD_BINARY:-}" ] || [ ! -x "$MBOOTD_BINARY" ]; then
+	echo 'mBoot: MBOOTD_BINARY must name the built mbootd executable' >&2
+	exit 1
+fi
+install -D -m 0755 "$MBOOTD_BINARY" "$TARGET_DIR/usr/sbin/mbootd"
+
 install -d -m 0755 "$BINARIES_DIR/efi-part/EFI/BOOT"
 rm -f "$BINARIES_DIR/efi-part/EFI/BOOT/bootx64.efi" \
 	"$BINARIES_DIR/efi-part/EFI/BOOT/BOOTX64.EFI" \

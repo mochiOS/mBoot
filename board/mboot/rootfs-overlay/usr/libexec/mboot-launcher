@@ -252,6 +252,9 @@ set -- "$QEMU" -name mochiOS,process=mboot-qemu -nodefaults -no-reboot \
 	-drive "if=pflash,format=raw,file=$OVMF_VARS" \
 	-drive "file=$MOCHIOS_IMAGE,format=raw,if=none,id=mochios,cache=$cache,aio=threads" \
 	-device virtio-blk-pci,drive=mochios,serial=MOCHIOS -device "$gpu" \
+	-chardev socket,id=mbootctl,path=/run/mboot/mochios-control.sock,server=off,reconnect-ms=1000 \
+	-device virtio-serial-pci,id=mboot-serial,disable-legacy=on,max_ports=2 \
+	-device virtserialport,id=mboot-control,chardev=mbootctl,name=org.mochios.mboot.control \
 	-object rng-random,id=rng0,filename=/dev/urandom -device virtio-rng-pci,rng=rng0 \
 	-display sdl,gl=off,show-cursor=off,window-close=off \
 	-monitor none -serial "file:$SERIAL_LOG"
