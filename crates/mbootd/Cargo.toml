@@ -1,0 +1,9 @@
+[package]
+name = "mbootd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mboot-protocol = { path = "../mboot-protocol", features = ["std"] }
+

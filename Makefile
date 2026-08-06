@@ -15,12 +15,18 @@ QEMU_FULLSCREEN_PATCH := $(CURDIR)/board/mboot/patches/qemu/0001-sdl-keep-fullsc
 QEMU_FULLSCREEN_PATCH_STAMP := $(OUTPUT_DIR)/.mboot-qemu-fullscreen-patch.sha256
 
 JOBS ?= $(shell nproc)
+HOST_CARGO := $(shell command -v cargo)
 
 # WSL PATH fix for Buildroot
 override export PATH := /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-.PHONY: all
+.PHONY: all protocol-test
 all: build
+
+protocol-test:
+	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
+	$(HOST_CARGO) test --workspace
+	$(HOST_CARGO) check -p mboot-protocol --no-default-features
 
 .PHONY: check
 check:
@@ -195,6 +201,7 @@ help:
 	@echo "  make linux-update      Update the Linux kernel defconfig"
 	@echo "  make build             Build disk.img and USB-writable mboot.iso with embedded mochiOS"
 	@echo "  make check             Run repository regression checks"
+	@echo "  make protocol-test     Test mBoot Control Protocol and Unix socket tools"
 	@echo "  make check-image       Validate the completed image and target"
 	@echo "  make run               Build and launch with QEMU"
 	@echo "  make run-built         Launch the existing image with QEMU"

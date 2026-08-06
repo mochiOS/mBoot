@@ -104,6 +104,24 @@ mochiOS が正常終了すると mBoot も電源を切ります。初期化失�
 異常終了時はログインシェルを開かず、tty1 に短いエラーコードとログ位置を
 表示します。
 
+## mBoot Control Protocol
+
+通信デバイスに依存しないv1 codecは`crates/mboot-protocol`、Linux daemonは
+`crates/mbootd`にあります。virtio-serial統合前の開発用transportとしてUnix
+domain socketを使用でき、socket pathは第1引数で変更できます。
+
+```sh
+make protocol-test
+cargo run -p mbootd -- /tmp/mochios-control.sock
+# 別のterminalから
+cargo run -p mock-mochios-agent -- /tmp/mochios-control.sock
+```
+
+既定socketは`/run/mboot/mochios-control.sock`です。mock agentはHELLO、4段階の
+READY、uptime 10000msのHEARTBEATを送信し、mbootdのWELCOMEを検証します。
+`HOST.POWEROFF`と`HOST.REBOOT`はprotocol responseまでに限定され、host command
+やshutdown処理は実行しません。
+
 詳しい構成は [docs/architecture.md](docs/architecture.md)、検証項目は
 [docs/test-plan.md](docs/test-plan.md)、同梱 OVMF の由来は
 [docs/ovmf.md](docs/ovmf.md) を参照してください。
