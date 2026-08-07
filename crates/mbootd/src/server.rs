@@ -148,7 +148,15 @@ fn dispatch(
             }
             Err(error) => request_error(message, state_error_code(error), state_error_field(error)),
         },
-        KnownCommand::ProtocolSync | KnownCommand::ProtocolPing => Some(Message::ok(
+        KnownCommand::ProtocolSync => {
+            println!("protocol synchronized");
+            Some(Message::ok(
+                Destination::Mochios,
+                message.request_id,
+                Vec::new(),
+            ))
+        }
+        KnownCommand::ProtocolPing => Some(Message::ok(
             Destination::Mochios,
             message.request_id,
             Vec::new(),
