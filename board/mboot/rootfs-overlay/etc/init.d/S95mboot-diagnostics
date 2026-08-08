@@ -1,0 +1,18 @@
+#!/bin/sh
+
+LOG_DIR=/var/log/mboot
+KERNEL_LOG=$LOG_DIR/kernel.log
+
+start() {
+	mkdir -p "$LOG_DIR"
+	if ! dmesg > "$KERNEL_LOG"; then
+		echo 'mBoot: failed to save kernel diagnostics' >&2
+		return 1
+	fi
+}
+
+case "$1" in
+	start) start ;;
+	stop) : ;;
+	*) echo "Usage: $0 {start|stop}" >&2; exit 1 ;;
+esac

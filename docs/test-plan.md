@@ -55,6 +55,11 @@ cat /etc/passwd
 lsblk -o NAME,TYPE,FSTYPE,UUID,PARTUUID
 ```
 
+serial consoleを保存できない実機では、停止後にUSBのroot partitionを別のLinuxへ
+mountし、`/var/log/mboot/boot.log`、`kernel.log`、`launcher.log`を回収します。
+`kernel.log`はXorgとmBoot launcherの開始後に保存したkernel ring bufferで、i915
+firmware、storage、ACPIに関するwarningの分類に使用します。
+
 `/`は`/proc/cmdline`に記載されたPARTUUIDのpartitionからmountされ、filesystemは
 ext4、hostnameは`mboot`でなければなりません。開発host由来の一般userが存在しては
 なりません。
