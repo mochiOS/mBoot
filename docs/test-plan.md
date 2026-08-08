@@ -39,6 +39,16 @@ KVMを使用できないhostでは`QEMU_ACCELERATOR=tcg`を別のfallback検証�
 mochiOS imageを起動することを確認します。QEMUでの成功は、物理USB controllerと
 storage deviceの動作を証明するものではありません。
 
+USB root経路は完成ディスクをxHCI配下のUSB Mass Storageとして接続して検証します。
+
+```sh
+make check-qemu-usb QEMU_ACCELERATOR=kvm
+```
+
+この検証はfirmwareによるUSB image選択、xHCI enumeration、SCSI diskの`/dev/sda`
+登録、GPT root PARTUUID、ext4 mount、内側mochiOSのuserspace到達をログから検証します。
+物理controller、USB stick固有のquirk、実機firmwareの挙動は引き続き実機検証が必要です。
+
 ## 実機USB検証
 
 `output/images/mboot.iso`をpartitionではなく、検証専用USB device全体へ書き込み
