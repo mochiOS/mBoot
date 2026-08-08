@@ -12,6 +12,7 @@ scripts/generate-boot-config.sh "$GENERATED"
 . "$GENERATED/boot-layout.env"
 
 require_line Makefile 'BUILDROOT_DEFCONFIG := $(BOOT_CONFIG_DIR)/mboot_x86_64_defconfig'
+require_line Makefile 'OUTPUT_COMPATIBILITY_VERSION := 2'
 require_line configs/mboot_x86_64_defconfig.in 'BR2_REPRODUCIBLE=y'
 require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_TARGET_GENERIC_HOSTNAME="mboot"'
 require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_MBOOT_PATH)/board/mboot/post-build.sh"'

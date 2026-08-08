@@ -4,6 +4,8 @@ OUTPUT_DIR := $(CURDIR)/output
 BOOT_CONFIG_DIR := $(OUTPUT_DIR)/generated
 BUILDROOT_DEFCONFIG := $(BOOT_CONFIG_DIR)/mboot_x86_64_defconfig
 BOOT_CONFIG_STAMP := $(BOOT_CONFIG_DIR)/.buildroot-config.sha256
+OUTPUT_COMPATIBILITY_VERSION := 2
+OUTPUT_COMPATIBILITY_STAMP := $(OUTPUT_DIR)/.mboot-output-version
 BOOT_CONFIG_SOURCES := \
 	board/mboot/boot-layout.conf \
 	board/mboot/genimage.cfg.in \
@@ -129,17 +131,25 @@ defconfig: setup prepare-boot-config
 	@sha256sum $(BOOT_CONFIG_SOURCES) | sha256sum | awk '{print $$1}' > \
 		"$(BOOT_CONFIG_STAMP).new"
 	@mv "$(BOOT_CONFIG_STAMP).new" "$(BOOT_CONFIG_STAMP)"
+	@printf '%s\n' "$(OUTPUT_COMPATIBILITY_VERSION)" > \
+		"$(OUTPUT_COMPATIBILITY_STAMP).new"
+	@mv "$(OUTPUT_COMPATIBILITY_STAMP).new" "$(OUTPUT_COMPATIBILITY_STAMP)"
 
 .PHONY: configure
 configure: setup prepare-boot-config
 	@set -eu; \
 	digest=$$(sha256sum $(BOOT_CONFIG_SOURCES) | sha256sum | awk '{print $$1}'); \
 	current=; \
+	output_version=; \
 	if [ -f "$(BOOT_CONFIG_STAMP)" ]; then current=$$(cat "$(BOOT_CONFIG_STAMP)"); fi; \
+	if [ -f "$(OUTPUT_COMPATIBILITY_STAMP)" ]; then \
+		output_version=$$(cat "$(OUTPUT_COMPATIBILITY_STAMP)"); \
+	fi; \
 	if [ -f "$(OUTPUT_DIR)/.config" ] && [ -d "$(OUTPUT_DIR)/target" ] && \
-	   [ -z "$$current" ]; then \
-		echo 'mBoot boot configuration format changed; invalidating old package output'; \
+	   [ "$$output_version" != "$(OUTPUT_COMPATIBILITY_VERSION)" ]; then \
+		echo 'mBoot output format changed; invalidating old package output'; \
 		$(MAKE) -C "$(BUILDROOT_DIR)" O="$(OUTPUT_DIR)" clean; \
+		current=; \
 	fi; \
 	if [ ! -f "$(OUTPUT_DIR)/.config" ] || [ "$$current" != "$$digest" ]; then \
 		$(MAKE) -C "$(BUILDROOT_DIR)" \
@@ -149,7 +159,10 @@ configure: setup prepare-boot-config
 			defconfig; \
 		printf '%s\n' "$$digest" > "$(BOOT_CONFIG_STAMP).new"; \
 		mv "$(BOOT_CONFIG_STAMP).new" "$(BOOT_CONFIG_STAMP)"; \
-	fi
+	fi; \
+	printf '%s\n' "$(OUTPUT_COMPATIBILITY_VERSION)" > \
+		"$(OUTPUT_COMPATIBILITY_STAMP).new"; \
+	mv "$(OUTPUT_COMPATIBILITY_STAMP).new" "$(OUTPUT_COMPATIBILITY_STAMP)"
 
 .PHONY: menuconfig
 menuconfig: configure

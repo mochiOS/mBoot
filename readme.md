@@ -44,6 +44,8 @@ mBoot は内包したファイルを `MOCHIOS` という virtio disk serial 付�
 へ渡します。GPTパーティション名やfilesystem labelの変更は不要です。また、完成
 diskのGPT、root PARTUUID、ext4の可読性、hostname、host identity混入、boot file、
 kernel builtin driverを自動検査し、失敗したimageを成功成果物として扱いません。
+再現ビルド対応前のBuildroot outputは互換versionで一度だけ自動cleanされ、その後は
+通常のcached buildへ戻ります。
 
 ## ビルドと起動
 
