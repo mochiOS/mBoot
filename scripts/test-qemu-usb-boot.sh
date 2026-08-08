@@ -8,6 +8,7 @@ IMAGES=$OUTPUT/images
 FIRMWARE=$OUTPUT/target/usr/share/mboot
 QEMU=${QEMU:-qemu-system-x86_64}
 ACCELERATOR=${QEMU_ACCELERATOR:-auto}
+CONTROLLER=${MBOOT_USB_CONTROLLER:-xhci}
 TIMEOUT_SECONDS=${MBOOT_USB_BOOT_TIMEOUT_SECONDS:-}
 
 fail() { echo "test-qemu-usb-boot: $*" >&2; exit 1; }
@@ -32,7 +33,12 @@ case "$ACCELERATOR" in
 esac
 
 if [ -z "$TIMEOUT_SECONDS" ]; then
-	if [ "$ACCELERATOR" = kvm ]; then TIMEOUT_SECONDS=60; else TIMEOUT_SECONDS=180; fi
+	case "$ACCELERATOR:$CONTROLLER" in
+		kvm:ehci) TIMEOUT_SECONDS=90 ;;
+		kvm:*) TIMEOUT_SECONDS=60 ;;
+		tcg:ehci) TIMEOUT_SECONDS=240 ;;
+		*) TIMEOUT_SECONDS=180 ;;
+	esac
 fi
 case "$TIMEOUT_SECONDS" in
 	''|*[!0-9]*) fail 'timeout must be a positive integer' ;;
@@ -55,14 +61,25 @@ else
 	set -- -accel tcg -cpu qemu64,-vmx,-svm
 fi
 
+case "$CONTROLLER" in
+	xhci)
+		set -- "$@" -device qemu-xhci,id=usb-controller
+		controller_log='using xhci_hcd'
+		;;
+	ehci)
+		set -- "$@" -device ich9-usb-ehci1,id=usb-controller
+		controller_log='using ehci-pci'
+		;;
+	*) fail "invalid USB controller: $CONTROLLER" ;;
+esac
+
 set +e
 timeout "$TIMEOUT_SECONDS" "$QEMU" "$@" \
 	-machine q35,i8042=off -smp 4 -m 4096 \
 	-drive "if=pflash,format=raw,readonly=on,file=$FIRMWARE/OVMF_CODE_4M.fd" \
 	-drive "if=pflash,format=raw,file=$vars" \
-	-device qemu-xhci,id=xhci \
 	-drive "file=$disk,format=raw,if=none,id=mboot" \
-	-device usb-storage,drive=mboot,bus=xhci.0,serial=MBOOT \
+	-device usb-storage,drive=mboot,bus=usb-controller.0,serial=MBOOT \
 	-device virtio-vga -display none -monitor none -serial "file:$serial"
 qemu_status=$?
 set -e
@@ -94,8 +111,8 @@ printf '%s\n' "$boot_log" | grep -Fq '/dev/root / ext4 rw' ||
 	fail 'USB root filesystem was not mounted as ext4'
 printf '%s\n' "$boot_log" | grep -Eq '[[:space:]]sda3$' ||
 	fail 'USB root partition was not detected as sda3'
-printf '%s\n' "$kernel_log" | grep -Fq 'using xhci_hcd' ||
-	fail 'kernel log lacks xHCI USB enumeration'
+printf '%s\n' "$kernel_log" | grep -Fq "$controller_log" ||
+	fail "kernel log lacks $CONTROLLER USB enumeration"
 printf '%s\n' "$kernel_log" | grep -Fq 'Direct-Access     QEMU     QEMU HARDDISK' ||
 	fail 'kernel log lacks SCSI USB mass-storage enumeration'
 printf '%s\n' "$kernel_log" | grep -Fq 'VFS: Mounted root (ext4 filesystem) on device 8:3.' ||
@@ -103,4 +120,4 @@ printf '%s\n' "$kernel_log" | grep -Fq 'VFS: Mounted root (ext4 filesystem) on d
 printf '%s\n' "$guest_log" | grep -Fq "exec: loaded 'core.service'" ||
 	fail 'embedded mochiOS did not reach userspace'
 
-echo "test-qemu-usb-boot: PASS ($ACCELERATOR)"
+echo "test-qemu-usb-boot: PASS ($ACCELERATOR, $CONTROLLER)"

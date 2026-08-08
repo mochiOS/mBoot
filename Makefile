@@ -68,10 +68,14 @@ check-image: build
 
 .PHONY: check-qemu-usb
 check-qemu-usb: build
-	MBOOT_OUTPUT_DIR="$(OUTPUT_DIR)" \
-	QEMU_ACCELERATOR="$(QEMU_ACCELERATOR)" \
-	QEMU="$(QEMU)" \
-	scripts/test-qemu-usb-boot.sh
+	@set -eu; \
+	for controller in xhci ehci; do \
+		MBOOT_OUTPUT_DIR="$(OUTPUT_DIR)" \
+		QEMU_ACCELERATOR="$(QEMU_ACCELERATOR)" \
+		MBOOT_USB_CONTROLLER="$$controller" \
+		QEMU="$(QEMU)" \
+		scripts/test-qemu-usb-boot.sh; \
+	done
 
 .PHONY: check-reproducible
 check-reproducible: build
@@ -288,7 +292,7 @@ help:
 	@echo "  make protocol-test     Test mBoot Control Protocol and Unix socket tools"
 	@echo "  make check-image       Validate the completed image and target"
 	@echo "  make check-reproducible  Build twice and compare the complete image hash"
-	@echo "  make check-qemu-usb    Boot the image as xHCI USB mass storage"
+	@echo "  make check-qemu-usb    Boot the image through xHCI and EHCI USB storage"
 	@echo "  make run               Build and launch with QEMU"
 	@echo "  make run-built         Launch the existing image with QEMU"
 	@echo "  make clean             Clean Buildroot outputs"
