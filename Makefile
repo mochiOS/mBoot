@@ -1,7 +1,17 @@
 BUILDROOT_DIR := $(CURDIR)/buildroot
 BUILDROOT_VERSION := 2025.02.16
 OUTPUT_DIR := $(CURDIR)/output
-BUILDROOT_DEFCONFIG := mboot_x86_64_defconfig
+BOOT_CONFIG_DIR := $(OUTPUT_DIR)/generated
+BUILDROOT_DEFCONFIG := $(BOOT_CONFIG_DIR)/mboot_x86_64_defconfig
+BOOT_CONFIG_STAMP := $(BOOT_CONFIG_DIR)/.buildroot-config.sha256
+BOOT_CONFIG_SOURCES := \
+	board/mboot/boot-layout.conf \
+	board/mboot/genimage.cfg.in \
+	board/mboot/grub-bios.cfg.in \
+	board/mboot/grub-builtin.cfg.in \
+	board/mboot/linux.config.in \
+	configs/mboot_x86_64_defconfig.in \
+	scripts/generate-boot-config.sh
 MOCHIOS ?= $(CURDIR)/mochiOS.img
 QEMU_ACCELERATOR ?= auto
 QEMU_MEMORY ?= 4096
@@ -16,7 +26,11 @@ QEMU_FULLSCREEN_PATCH_STAMP := $(OUTPUT_DIR)/.mboot-qemu-fullscreen-patch.sha256
 
 JOBS ?= $(shell nproc)
 HOST_CARGO := $(shell command -v cargo)
-MBOOTD_BINARY := $(CURDIR)/target/release/mbootd
+HOST_RUSTC := $(shell command -v rustc)
+RUSTC_SYSROOT := $(shell $(HOST_RUSTC) --print sysroot 2>/dev/null)
+MBOOTD_TARGET := x86_64-unknown-linux-gnu
+MBOOTD_BINARY := $(CURDIR)/target/$(MBOOTD_TARGET)/release/mbootd
+MBOOT_SOURCE_DATE_EPOCH := $(shell git log -1 --format=%ct 2>/dev/null || echo 315532800)
 
 # WSL PATH fix for Buildroot
 override export PATH := /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -31,15 +45,38 @@ protocol-test:
 
 mbootd:
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
-	$(HOST_CARGO) build --release -p mbootd
+	@test -n "$(RUSTC_SYSROOT)" || { echo "host rustc sysroot was not found" >&2; exit 1; }
+	SOURCE_DATE_EPOCH="$(MBOOT_SOURCE_DATE_EPOCH)" CARGO_INCREMENTAL=0 \
+	RUSTFLAGS='-C target-feature=+crt-static --remap-path-prefix=$(CURDIR)=/usr/src/mboot --remap-path-prefix=$(RUSTC_SYSROOT)=/usr/src/rust' \
+		$(HOST_CARGO) build --locked --release --target "$(MBOOTD_TARGET)" -p mbootd
+	@if readelf -l "$(MBOOTD_BINARY)" | grep -Fq 'INTERP'; then \
+		echo 'mbootd must not depend on the build host dynamic loader' >&2; \
+		exit 1; \
+	fi
+
+.PHONY: prepare-boot-config
+prepare-boot-config:
+	scripts/generate-boot-config.sh "$(BOOT_CONFIG_DIR)"
 
 .PHONY: check
-check:
-	scripts/check-config.sh
+check: prepare-boot-config
+	MBOOT_BOOT_CONFIG_DIR="$(BOOT_CONFIG_DIR)" scripts/check-config.sh
+	scripts/test-boot-config.sh
 
 .PHONY: check-image
 check-image: build
-	MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))" scripts/check-image.sh
+
+.PHONY: check-reproducible
+check-reproducible: build
+	@set -eu; \
+	before=$$(sha256sum "$(OUTPUT_DIR)/images/disk.img" | awk '{print $$1}'); \
+	$(MAKE) build MOCHIOS="$(MOCHIOS)"; \
+	after=$$(sha256sum "$(OUTPUT_DIR)/images/disk.img" | awk '{print $$1}'); \
+	if [ "$$before" != "$$after" ]; then \
+		echo "mBoot image is not reproducible: $$before != $$after" >&2; \
+		exit 1; \
+	fi; \
+	echo "check-reproducible: PASS ($$after)"
 
 .PHONY: check-mochios
 check-mochios:
@@ -72,15 +109,39 @@ setup:
 	fi
 
 .PHONY: defconfig
-defconfig: setup
-	mkdir -p "$(OUTPUT_DIR)"
+defconfig: setup prepare-boot-config
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
 		BR2_EXTERNAL="$(CURDIR)" \
-		"$(BUILDROOT_DEFCONFIG)"
+		BR2_DEFCONFIG="$(BUILDROOT_DEFCONFIG)" \
+		defconfig
+	@sha256sum $(BOOT_CONFIG_SOURCES) | sha256sum | awk '{print $$1}' > \
+		"$(BOOT_CONFIG_STAMP).new"
+	@mv "$(BOOT_CONFIG_STAMP).new" "$(BOOT_CONFIG_STAMP)"
+
+.PHONY: configure
+configure: setup prepare-boot-config
+	@set -eu; \
+	digest=$$(sha256sum $(BOOT_CONFIG_SOURCES) | sha256sum | awk '{print $$1}'); \
+	current=; \
+	if [ -f "$(BOOT_CONFIG_STAMP)" ]; then current=$$(cat "$(BOOT_CONFIG_STAMP)"); fi; \
+	if [ -f "$(OUTPUT_DIR)/.config" ] && [ -d "$(OUTPUT_DIR)/target" ] && \
+	   [ -z "$$current" ]; then \
+		echo 'mBoot boot configuration format changed; invalidating old package output'; \
+		$(MAKE) -C "$(BUILDROOT_DIR)" O="$(OUTPUT_DIR)" clean; \
+	fi; \
+	if [ ! -f "$(OUTPUT_DIR)/.config" ] || [ "$$current" != "$$digest" ]; then \
+		$(MAKE) -C "$(BUILDROOT_DIR)" \
+			O="$(OUTPUT_DIR)" \
+			BR2_EXTERNAL="$(CURDIR)" \
+			BR2_DEFCONFIG="$(BUILDROOT_DEFCONFIG)" \
+			defconfig; \
+		printf '%s\n' "$$digest" > "$(BOOT_CONFIG_STAMP).new"; \
+		mv "$(BOOT_CONFIG_STAMP).new" "$(BOOT_CONFIG_STAMP)"; \
+	fi
 
 .PHONY: menuconfig
-menuconfig: check-config
+menuconfig: configure
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
 		menuconfig
@@ -102,15 +163,19 @@ prepare-qemu:
 	fi
 
 .PHONY: build
-build: check-config check-mochios prepare-qemu mbootd
+build: configure check check-mochios prepare-qemu mbootd
 	MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))" \
 	MBOOTD_BINARY="$(MBOOTD_BINARY)" \
+	MBOOT_BOOT_CONFIG_DIR="$(BOOT_CONFIG_DIR)" \
+	MBOOT_SOURCE_DATE_EPOCH="$(MBOOT_SOURCE_DATE_EPOCH)" \
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
 		-j"$(JOBS)"
 	@sha256sum "$(QEMU_FULLSCREEN_PATCH)" | awk '{print $$1}' > \
 		"$(QEMU_FULLSCREEN_PATCH_STAMP).new"
 	@mv "$(QEMU_FULLSCREEN_PATCH_STAMP).new" "$(QEMU_FULLSCREEN_PATCH_STAMP)"
+	MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))" \
+	MBOOT_OUTPUT_DIR="$(OUTPUT_DIR)" scripts/check-image.sh
 
 .PHONY: run run-built
 run: build
@@ -167,7 +232,7 @@ distclean:
 rebuild: clean build
 
 .PHONY: check-config
-check-config:
+check-config: configure
 	@if [ ! -f "$(OUTPUT_DIR)/.config" ]; then \
 		echo "Buildroot is not configured."; \
 		echo "Run: make defconfig"; \
@@ -179,22 +244,28 @@ savedefconfig:
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
 		BR2_EXTERNAL="$(CURDIR)" \
-		BR2_DEFCONFIG="$(CURDIR)/configs/mboot_x86_64_defconfig" \
+		BR2_DEFCONFIG="$(BUILDROOT_DEFCONFIG)" \
 		savedefconfig
+	scripts/update-config-template.sh defconfig "$(BUILDROOT_DEFCONFIG)" \
+		configs/mboot_x86_64_defconfig.in
+	scripts/generate-boot-config.sh "$(BOOT_CONFIG_DIR)"
 
 .PHONY: linux-menuconfig
-linux-menuconfig: check-config
+linux-menuconfig: configure
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
 		BR2_EXTERNAL="$(CURDIR)" \
 		linux-menuconfig
 
 .PHONY: linux-update
-linux-update: check-config
+linux-update: configure
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
 		BR2_EXTERNAL="$(CURDIR)" \
 		linux-update-defconfig
+	scripts/update-config-template.sh linux "$(BOOT_CONFIG_DIR)/linux.config" \
+		board/mboot/linux.config.in
+	scripts/generate-boot-config.sh "$(BOOT_CONFIG_DIR)"
 		
 .PHONY: help
 help:
@@ -209,6 +280,7 @@ help:
 	@echo "  make check             Run repository regression checks"
 	@echo "  make protocol-test     Test mBoot Control Protocol and Unix socket tools"
 	@echo "  make check-image       Validate the completed image and target"
+	@echo "  make check-reproducible  Build twice and compare the complete image hash"
 	@echo "  make run               Build and launch with QEMU"
 	@echo "  make run-built         Launch the existing image with QEMU"
 	@echo "  make clean             Clean Buildroot outputs"

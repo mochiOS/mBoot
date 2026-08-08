@@ -1,8 +1,12 @@
 #!/bin/sh
 set -eu
 
-BOARD_DIR="${BR2_EXTERNAL_MBOOT_PATH}/board/mboot"
-support/scripts/genimage.sh -c "$BOARD_DIR/genimage.cfg"
+if [ -z "${MBOOT_BOOT_CONFIG_DIR:-}" ] ||
+	[ ! -f "$MBOOT_BOOT_CONFIG_DIR/genimage.cfg" ]; then
+	echo 'mBoot: generated image configuration is missing' >&2
+	exit 1
+fi
+support/scripts/genimage.sh -c "$MBOOT_BOOT_CONFIG_DIR/genimage.cfg"
 
 # The first GPT partition is a fixed, contiguous 1 MiB BIOS Boot Partition at
 # LBA 2048. grub-bios-setup insists on a host block device, so patch the two

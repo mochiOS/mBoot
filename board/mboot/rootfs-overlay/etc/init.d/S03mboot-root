@@ -1,0 +1,30 @@
+#!/bin/sh
+
+CONFIG=/etc/mboot-boot.conf
+LOG=/var/log/mboot/boot.log
+
+start() {
+	mkdir -p /var/log/mboot
+	{
+		echo 'mBoot root diagnostics'
+		if [ -r "$CONFIG" ]; then
+			. "$CONFIG"
+			echo "expected root: PARTUUID=$MBOOT_ROOT_PARTUUID type=$MBOOT_ROOT_FSTYPE"
+		else
+			echo "expected root: configuration unavailable"
+		fi
+		printf 'kernel command line: '
+		cat /proc/cmdline
+		printf 'mounted root: '
+		awk '$2 == "/" { print; found=1 } END { if (!found) print "not listed" }' /proc/mounts
+		echo 'detected block devices and partitions:'
+		cat /proc/partitions
+	} > "$LOG"
+	cat "$LOG"
+}
+
+case "$1" in
+	start) start ;;
+	stop) : ;;
+	*) echo "Usage: $0 {start|stop}" >&2; exit 1 ;;
+esac

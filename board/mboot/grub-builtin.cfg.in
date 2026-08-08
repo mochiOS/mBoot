@@ -1,0 +1,3 @@
+search --no-floppy --fs-uuid --set=root @MBOOT_ROOT_FSUUID@
+set prefix=($root)/boot/grub
+configfile $prefix/grub.cfg

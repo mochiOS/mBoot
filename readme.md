@@ -41,7 +41,9 @@ make build MOCHIOS=../mochiOS/out/artifacts/disk.img
 
 `make build` はファイルの存在、最小サイズ、GPT header を検査します。完成後の
 mBoot は内包したファイルを `MOCHIOS` という virtio disk serial 付きで mochiOS
-へ渡します。GPTパーティション名やfilesystem labelの変更は不要です。
+へ渡します。GPTパーティション名やfilesystem labelの変更は不要です。また、完成
+diskのGPT、root PARTUUID、ext4の可読性、hostname、host identity混入、boot file、
+kernel builtin driverを自動検査し、失敗したimageを成功成果物として扱いません。
 
 ## ビルドと起動
 
@@ -63,6 +65,12 @@ output/images/mboot.iso  USB書き込みツール向けの配布名
 `mboot.iso` は、CD/DVD用の読み取り専用ISO9660ではありません。mochiOSのディスク
 内容やOVMF状態を実機で永続化するため、BIOS/UEFI両対応の書き込み可能なraw GPT
 イメージを`.iso`という名前でも出力しています。
+
+disk GUID、partition GUID、root filesystem UUID/type、hostname、root deviceの待機
+時間は [boot-layout.conf](board/mboot/boot-layout.conf) だけで定義します。Buildroot、
+kernel、GRUB、genimage用の設定は`output/generated/`へ自動生成されます。kernelは
+root deviceを無期限には待たず、見つからない場合は30秒後に期待値、検出partition、
+VFS errorをconsoleへ表示します。
 
 GUI を使わずシリアルログだけを確認する場合は、次のように実行します。
 

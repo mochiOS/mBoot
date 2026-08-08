@@ -1,5 +1,6 @@
 image efi-part.vfat {
 	vfat {
+		extraargs = "--invariant -i @MBOOT_EFI_VOLUME_ID@"
 		file EFI { image = "efi-part/EFI" }
 		file bzImage { image = "bzImage" }
 	}
@@ -9,26 +10,26 @@ image efi-part.vfat {
 image disk.img {
 	hdimage {
 		partition-table-type = "gpt"
-		disk-uuid = 6d426f6f-7400-4b00-8a00-000000000000
+		disk-uuid = @MBOOT_DISK_GUID@
 	}
 
 	partition grub-core {
 		partition-type-uuid = 21686148-6449-6E6F-744E-656564454649
-		partition-uuid = 6d426f6f-7400-4b00-8a00-000000000002
+		partition-uuid = @MBOOT_BIOS_PARTUUID@
 		offset = 1M
 		size = 1M
 	}
 
 	partition efi-system {
 		partition-type-uuid = U
-		partition-uuid = 6d426f6f-7400-4b00-8a00-000000000003
+		partition-uuid = @MBOOT_EFI_PARTUUID@
 		image = "efi-part.vfat"
 		bootable = true
 	}
 
 	partition root {
-		partition-type-uuid = 44479540-f297-41b2-9af7-d131d5f0458a
-		partition-uuid = 6d426f6f-7400-4b00-8a00-000000000001
+		partition-type-uuid = @MBOOT_ROOT_PARTITION_TYPE@
+		partition-uuid = @MBOOT_ROOT_PARTUUID@
 		image = "rootfs.ext2"
 	}
 }
