@@ -83,8 +83,11 @@ panicすることを確認します。この変更済みimageは配布しませ�
 ## Warningの分類
 
 Intel i915を有効にしているため、選択したlinux-firmwareから
-`i915/tgl_dmc_ver2_12.bin`を収録し、image検査でも必須とします。DMC firmwareの
-欠落warningはmBootのpackaging failureです。
+`i915/tgl_dmc_ver2_12.bin`を収録し、image検査でも必須とします。i915、amdgpu、
+nouveauはroot mount前にfirmwareを要求しないようmoduleとし、S10udevのcoldplugで
+rootfs上のfirmwareを利用してからS40xorgを起動します。DMC firmwareの欠落warningは
+mBootのpackaging failureです。Transparent Hugepageは機能を有効にし、不要な常時
+割り当てを避けるため既定を`madvise`とします。
 
 ACPI table/methodを示すBIOS errorは物理firmwareに由来する場合があります。logを
 隠したりfilterしたりせず、root filesystem、display、input、mochiOS起動がすべて

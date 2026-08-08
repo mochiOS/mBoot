@@ -83,7 +83,8 @@ trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 cmp -s "$IMAGES/bzImage" "$temporary/BOOTX64.EFI" ||
 	fail 'EFI fallback loader is not the Linux EFI-stub kernel'
 
-for path in etc/init.d/S03mboot-root etc/init.d/S40xorg etc/init.d/S80mbootd etc/init.d/S90mboot \
+for path in etc/init.d/S03mboot-root etc/init.d/S10udev etc/init.d/S40xorg \
+	etc/init.d/S80mbootd etc/init.d/S90mboot \
 	etc/init.d/S95mboot-diagnostics \
 	usr/libexec/mboot-launcher usr/sbin/mbootd usr/bin/qemu-system-x86_64 usr/bin/Xorg; do
 	test -x "$TARGET/$path" || fail "missing target executable: /$path"
@@ -143,12 +144,13 @@ for symbol in CONFIG_EFI_PARTITION=y CONFIG_SCSI=y CONFIG_BLK_DEV_SD=y \
 	CONFIG_USB=y CONFIG_USB_XHCI_HCD=y CONFIG_USB_XHCI_PCI=y \
 	CONFIG_USB_EHCI_HCD=y CONFIG_USB_EHCI_PCI=y CONFIG_USB_OHCI_HCD=y \
 	CONFIG_USB_OHCI_HCD_PCI=y CONFIG_USB_UHCI_HCD=y CONFIG_USB_STORAGE=y \
-	CONFIG_USB_UAS=y CONFIG_EXT4_FS=y CONFIG_DRM_I915=y CONFIG_DRM_AMDGPU=y \
-	CONFIG_DRM_NOUVEAU=y CONFIG_DRM_VIRTIO_GPU=y CONFIG_DRM_VMWGFX=y \
+	CONFIG_USB_UAS=y CONFIG_EXT4_FS=y CONFIG_DRM_I915=m CONFIG_DRM_AMDGPU=m \
+	CONFIG_DRM_NOUVEAU=m CONFIG_DRM_VIRTIO_GPU=y CONFIG_DRM_VMWGFX=y \
 	CONFIG_DRM_SIMPLEDRM=y CONFIG_KVM_INTEL=m CONFIG_KVM_AMD=m \
 	CONFIG_SATA_AHCI=y CONFIG_BLK_DEV_NVME=y CONFIG_GENERIC_CPU=y \
 	CONFIG_CPU_SUP_INTEL=y CONFIG_X86_MCE_INTEL=y CONFIG_MICROCODE=y \
 	CONFIG_X86_INTEL_PSTATE=y CONFIG_INTEL_IDLE=y CONFIG_EFI_STUB=y \
+	CONFIG_TRANSPARENT_HUGEPAGE=y CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=y \
 	CONFIG_EFIVAR_FS=y CONFIG_INTEL_IOMMU=y CONFIG_AMD_IOMMU=y \
 	CONFIG_INPUT_EVDEV=y CONFIG_INPUT_KEYBOARD=y CONFIG_KEYBOARD_ATKBD=y \
 	CONFIG_MOUSE_PS2=y CONFIG_HID_MULTITOUCH=m CONFIG_I2C_HID_ACPI=y \
@@ -158,5 +160,22 @@ for symbol in CONFIG_EFI_PARTITION=y CONFIG_SCSI=y CONFIG_BLK_DEV_SD=y \
 done
 test -s "$TARGET/lib/firmware/i915/tgl_dmc_ver2_12.bin" ||
 	fail 'required Intel Tiger Lake DMC firmware is missing'
+debugfs -R 'stat /lib/firmware/i915/tgl_dmc_ver2_12.bin' "$IMAGES/rootfs.ext2" 2>&1 |
+	grep -Fq 'Inode:' || fail 'root filesystem lacks Intel Tiger Lake DMC firmware'
+modules_roots=$(find "$TARGET/lib/modules" -mindepth 1 -maxdepth 1 -type d -print)
+[ "$(printf '%s\n' "$modules_roots" | grep -c .)" -eq 1 ] ||
+	fail 'cannot uniquely locate the kernel module directory'
+modules_root=$modules_roots
+for module in i915 amdgpu nouveau; do
+	module_paths=$(find "$TARGET/lib/modules" -type f -name "$module.ko" -print)
+	[ "$(printf '%s\n' "$module_paths" | grep -c .)" -eq 1 ] ||
+		fail "cannot uniquely locate GPU module: $module.ko"
+	module_path=${module_paths#"$TARGET"}
+	debugfs -R "stat $module_path" "$IMAGES/rootfs.ext2" 2>&1 | grep -Fq 'Inode:' ||
+		fail "root filesystem lacks GPU module: $module.ko"
+	module_relative=${module_paths#"$modules_root"/}
+	grep -Fq "$module_relative:" "$modules_root/modules.dep" ||
+		fail "module dependency index lacks: $module.ko"
+done
 
 echo 'check-image: PASS'
