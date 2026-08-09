@@ -99,6 +99,20 @@ if ! DISPLAY="$display" xset q >/dev/null 2>&1; then fail XORG_FAILED "Xorg did 
 mboot_log INFO "Xorg drivers: $(grep -Ei '\(II\) (modeset|intel|amdgpu|nouveau|vmware|fbdev)\(' "$MBOOT_LOG_DIR/xorg.log" 2>/dev/null | head -n 4 | tr '\n' ';' || true)"
 mboot_log INFO "displays: $(DISPLAY="$display" xrandr --query 2>/dev/null | grep ' connected' | tr '\n' ';' || echo unavailable)"
 
+active_display_geometry() {
+	query=$(DISPLAY="$display" xrandr --current 2>/dev/null) || return 1
+	geometry=$(printf '%s\n' "$query" |
+		sed -n 's/^[^ ]* connected primary \([0-9][0-9]*\)x\([0-9][0-9]*\)+.*/\1 \2/p' |
+		sed -n '1p')
+	if [ -z "$geometry" ]; then
+		geometry=$(printf '%s\n' "$query" |
+			sed -n 's/^[^ ]* connected \([0-9][0-9]*\)x\([0-9][0-9]*\)+.*/\1 \2/p' |
+			sed -n '1p')
+	fi
+	[ -n "$geometry" ] || return 1
+	printf '%s\n' "$geometry"
+}
+
 if [ ! -f "$MOCHIOS_IMAGE" ]; then
 	fail IMAGE_MISSING "The embedded mochiOS image is missing. Rebuild mBoot with MOCHIOS=<disk.img>."
 	exit 1
@@ -231,18 +245,54 @@ cpu=qemu64,+x2apic
 mboot_log INFO "accelerator: preference=$accel_preference selected=$accel"
 
 machine=$(config_get MBOOT_MACHINE q35)
-gpu=$(config_get MBOOT_GUEST_GPU virtio-vga)
+gpu=$(config_get MBOOT_GUEST_GPU virtio-vga-gl)
+guest_width=$(config_get MBOOT_GUEST_WIDTH auto)
+guest_height=$(config_get MBOOT_GUEST_HEIGHT auto)
 display_backend=$(config_get MBOOT_DISPLAY sdl)
 fullscreen=$(config_get MBOOT_FULLSCREEN yes)
 network=$(config_get MBOOT_NETWORK user)
 audio=$(config_get MBOOT_AUDIO auto)
 cache=$(config_get MBOOT_DISK_CACHE auto)
 case "$machine" in q35|pc) ;; *) fail CONFIG_INVALID "Unsupported machine: $machine"; exit 1;; esac
-case "$gpu" in virtio-vga|virtio-gpu-pci) ;; *) fail CONFIG_INVALID "Unsupported guest GPU: $gpu"; exit 1;; esac
+case "$gpu" in
+	virtio-vga-gl|virtio-gpu-gl-pci) display_gl=on ;;
+	virtio-vga|virtio-gpu-pci) display_gl=off ;;
+	*) fail CONFIG_INVALID "Unsupported guest GPU: $gpu"; exit 1 ;;
+esac
+if [ "$guest_width" = auto ] && [ "$guest_height" = auto ]; then
+	if geometry=$(active_display_geometry); then
+		guest_width=${geometry% *}
+		guest_height=${geometry#* }
+	else
+		guest_width=1280
+		guest_height=800
+		mboot_log WARNING "Cannot determine the active display mode; using ${guest_width}x${guest_height}"
+	fi
+elif [ "$guest_width" = auto ] || [ "$guest_height" = auto ]; then
+	fail CONFIG_INVALID "MBOOT_GUEST_WIDTH and MBOOT_GUEST_HEIGHT must both be auto or numeric."
+	exit 1
+fi
+unsigned "$guest_width" && unsigned "$guest_height" &&
+	[ "$guest_width" -ge 640 ] && [ "$guest_height" -ge 480 ] &&
+	[ "$guest_width" -le 4096 ] && [ "$guest_height" -le 4096 ] || {
+	fail CONFIG_INVALID "Guest display dimensions must be between 640x480 and 4096x4096."
+	exit 1
+}
+gpu_device=$gpu,xres=$guest_width,yres=$guest_height
 [ "$display_backend" = sdl ] || { fail CONFIG_INVALID "Only the SDL/X11 display module is installed."; exit 1; }
 case "$network" in user|none) ;; *) fail CONFIG_INVALID "Unsupported network mode: $network"; exit 1;; esac
 case "$audio" in auto|on|off) ;; *) fail CONFIG_INVALID "Unsupported audio mode: $audio"; exit 1;; esac
-case "$cache" in auto) cache=none;; none|directsync|writeback) :;; *) fail CONFIG_INVALID "Unsupported disk cache mode: $cache"; exit 1;; esac
+case "$cache" in auto) cache=writethrough;; none|directsync|writethrough|writeback) :;; *) fail CONFIG_INVALID "Unsupported disk cache mode: $cache"; exit 1;; esac
+mboot_log INFO "guest graphics: device=$gpu resolution=${guest_width}x${guest_height} display=$display_backend gl=$display_gl"
+
+if [ "$cache" = writethrough ] || [ "$cache" = writeback ]; then
+	mboot_log INFO "warming embedded mochiOS image into host page cache"
+	if dd if="$MOCHIOS_IMAGE" of=/dev/null bs=4M 2>/dev/null; then
+		mboot_log INFO "embedded mochiOS image cache warmup complete"
+	else
+		mboot_log WARNING "embedded mochiOS image cache warmup failed; continuing"
+	fi
+fi
 
 export DISPLAY="$display"
 export SDL_VIDEODRIVER=x11
@@ -251,12 +301,12 @@ set -- "$QEMU" -name mochiOS,process=mboot-qemu -nodefaults -no-reboot \
 	-drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
 	-drive "if=pflash,format=raw,file=$OVMF_VARS" \
 	-drive "file=$MOCHIOS_IMAGE,format=raw,if=none,id=mochios,cache=$cache,aio=threads" \
-	-device virtio-blk-pci,drive=mochios,serial=MOCHIOS -device "$gpu" \
+	-device virtio-blk-pci,drive=mochios,serial=MOCHIOS -device "$gpu_device" \
 	-chardev socket,id=mbootctl,path=/run/mboot/mochios-control.sock,server=off,reconnect-ms=1000 \
 	-device virtio-serial-pci,id=mboot-serial,disable-legacy=on,max_ports=2 \
 	-device virtserialport,id=mboot-control,chardev=mbootctl,name=org.mochios.mboot.control \
 	-object rng-random,id=rng0,filename=/dev/urandom -device virtio-rng-pci,rng=rng0 \
-	-display sdl,gl=off,show-cursor=off,window-close=off \
+	-display "sdl,gl=$display_gl,show-cursor=off,window-close=off" \
 	-monitor none -serial "file:$SERIAL_LOG"
 [ "$fullscreen" != yes ] || set -- "$@" -full-screen
 [ "$network" != user ] || set -- "$@" -netdev user,id=net0 -device virtio-net-pci,netdev=net0

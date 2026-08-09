@@ -9,6 +9,7 @@ GENERATED=$OUTPUT/generated
 KCONFIG=$OUTPUT/build/linux-6.12.98/.config
 KERNEL_SOURCE=$OUTPUT/build/linux-6.12.98
 QEMU_CONFIG=$OUTPUT/build/qemu-9.2.0/build/config-host.h
+SDL2_CONFIG=$OUTPUT/staging/usr/include/SDL2/SDL_config.h
 
 fail() { echo "check-image: $*" >&2; exit 1; }
 
@@ -129,6 +130,18 @@ for identity in "${USER:-}" "${LOGNAME:-}" "$(hostname 2>/dev/null || true)" jni
 done
 
 grep -Fqx '#define CONFIG_AUDIO_ALSA' "$QEMU_CONFIG" || fail 'target QEMU lacks ALSA support'
+grep -Fqx '#define CONFIG_OPENGL' "$QEMU_CONFIG" || fail 'target QEMU lacks OpenGL support'
+grep -Fqx '#define SDL_VIDEO_OPENGL_EGL 1' "$SDL2_CONFIG" ||
+	fail 'target SDL2 lacks EGL context support'
+grep -Fqx '#define SDL_VIDEO_OPENGL_GLX 1' "$SDL2_CONFIG" ||
+	fail 'target SDL2 lacks GLX fallback support'
+grep -Eq '^#define VIRGL_VERSION_MAJOR [1-9][0-9]*$' "$QEMU_CONFIG" ||
+	fail 'target QEMU lacks VirGL renderer support'
+test -s "$TARGET/usr/lib/libvirglrenderer.so.1" || fail 'VirGL renderer library is missing'
+debugfs -R 'stat /usr/lib/libvirglrenderer.so.1' "$IMAGES/rootfs.ext2" 2>&1 |
+	grep -Fq 'Inode:' || fail 'root filesystem lacks VirGL renderer library'
+test ! -e "$TARGET/usr/bin/virgl_test_server" ||
+	fail 'VirGL development test server remains in target'
 grep -q '^root:!:' "$TARGET/etc/shadow" || fail 'root account is not locked'
 ! grep -q '^[^#].*getty' "$TARGET/etc/inittab" || fail 'an interactive getty is enabled'
 readelf -l "$TARGET/usr/sbin/mbootd" | grep -Fq 'INTERP' &&

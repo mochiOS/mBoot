@@ -84,6 +84,27 @@ fs_uuid_sources=$(grep -R -l -F "$MBOOT_ROOT_FSUUID" \
 
 grep -Fq -- '--enable-alsa' board/mboot/qemu-configure-wrapper ||
 	fail 'target QEMU ALSA override is missing'
+grep -Fq -- '--enable-opengl' board/mboot/qemu-configure-wrapper ||
+	fail 'target QEMU OpenGL override is missing'
+grep -Fq -- '--enable-virglrenderer' board/mboot/qemu-configure-wrapper ||
+	fail 'target QEMU VirGL renderer override is missing'
+require_line configs/mboot_x86_64_defconfig.in 'BR2_PACKAGE_MESA3D_OPENGL_EGL=y'
+require_line configs/mboot_x86_64_defconfig.in 'BR2_PACKAGE_VIRGLRENDERER=y'
+require_line configs/mboot_x86_64_defconfig.in 'BR2_PACKAGE_SDL2_OPENGL=y'
+require_line board/mboot/rootfs-overlay/etc/mboot.conf 'MBOOT_GUEST_GPU=virtio-vga-gl'
+require_line board/mboot/rootfs-overlay/etc/mboot.conf 'MBOOT_GUEST_WIDTH=auto'
+require_line board/mboot/rootfs-overlay/etc/mboot.conf 'MBOOT_GUEST_HEIGHT=auto'
+grep -Fq 'virtio-vga-gl|virtio-gpu-gl-pci) display_gl=on' \
+	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'inner QEMU VirGL display selection is missing'
+grep -Fq -- '-display "sdl,gl=$display_gl,show-cursor=off,window-close=off"' \
+	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'inner QEMU SDL OpenGL selection is missing'
+grep -Fq 'active_display_geometry()' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'active display geometry detection is missing'
+grep -Fq 'gpu_device=$gpu,xres=$guest_width,yres=$guest_height' \
+	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'inner QEMU native display resolution is missing'
 grep -Fq 'cpu=qemu64,+x2apic' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
 	fail 'guest CPU is not vendor-neutral with x2APIC enabled'
 if grep -Eq -- 'virtio-(keyboard|mouse)-pci' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher; then
@@ -95,14 +116,39 @@ grep -Fq -- '-device usb-mouse,bus=xhci.0' Makefile || fail 'outer QEMU mouse is
 grep -Fq 'RUN_DISK_IMAGE := $(OUTPUT_DIR)/run/mboot.img' Makefile ||
 	fail 'outer QEMU runtime image is not isolated from the build artifact'
 grep -Fq 'QEMU_FULLSCREEN ?= yes' Makefile || fail 'outer QEMU is not fullscreen by default'
+grep -Fq 'auto) cache=writethrough' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'embedded image auto cache mode does not use buffered reads'
+grep -Fq 'warming embedded mochiOS image into host page cache' \
+	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'embedded image cache warmup is missing'
 grep -Fq '|| gui_fullscreen)' board/mboot/patches/qemu/0001-sdl-keep-fullscreen-window-size.patch ||
 	fail 'inner QEMU fullscreen resize patch is missing'
 grep -Fq 'SDL_SetWindowInputFocus(scon->real_window)' board/mboot/patches/qemu/0001-sdl-keep-fullscreen-window-size.patch ||
 	fail 'inner QEMU fullscreen input focus patch is missing'
 grep -Fq 'if (gui_grab || gui_fullscreen ||' board/mboot/patches/qemu/0001-sdl-keep-fullscreen-window-size.patch ||
 	fail 'inner QEMU fullscreen input forwarding patch is missing'
-grep -Fq 'QEMU_POST_PATCH_HOOKS += MBOOT_QEMU_APPLY_FULLSCREEN_PATCH' external.mk ||
-	fail 'inner QEMU fullscreen resize patch hook is missing'
+grep -Fq 'SDL_HINT_VIDEO_X11_FORCE_EGL' board/mboot/patches/qemu/0002-sdl-prefer-egl-for-virgl.patch ||
+	fail 'inner QEMU SDL EGL preference patch is missing'
+grep -Fq 'qemu_egl_display = eglGetCurrentDisplay()' board/mboot/patches/qemu/0002-sdl-prefer-egl-for-virgl.patch ||
+	fail 'inner QEMU SDL EGL display handoff is missing'
+grep -Fq 'SDL_GL_MakeCurrent(scon->real_window, ctx) != 0' board/mboot/patches/qemu/0002-sdl-prefer-egl-for-virgl.patch ||
+	fail 'inner QEMU VirGL context validation is missing'
+grep -Fq 'QEMU_POST_PATCH_HOOKS += MBOOT_QEMU_APPLY_MBOOT_PATCHES' external.mk ||
+	fail 'inner QEMU patch hook is missing'
+grep -Fq 'QEMU_PRE_CONFIGURE_HOOKS += MBOOT_QEMU_INSTALL_CONFIGURE_WRAPPER' external.mk ||
+	fail 'inner QEMU configure wrapper hook is missing'
+grep -Fq 'QEMU_CONFIG_INPUTS :=' Makefile ||
+	fail 'inner QEMU cache invalidation inputs are missing'
+grep -Fq 'board/mboot/qemu-configure-wrapper' Makefile ||
+	fail 'inner QEMU configure wrapper is not a cache invalidation input'
+grep -Fq '$(CURDIR)/configs/mboot_x86_64_defconfig.in' Makefile ||
+	fail 'inner QEMU display configuration is not a cache invalidation input'
+grep -Fq '$(CURDIR)/external.mk' Makefile ||
+	fail 'inner QEMU package configuration is not a cache invalidation input'
+grep -Fq '$(CURDIR)/package/virglrenderer/virglrenderer.mk' Makefile ||
+	fail 'VirGL renderer configuration is not a cache invalidation input'
+grep -Fq -- '-Dplatforms=egl' package/virglrenderer/virglrenderer.mk ||
+	fail 'VirGL renderer EGL platform is missing'
 
 for script in board/mboot/post-build.sh board/mboot/post-image.sh \
 	board/mboot/qemu-configure-wrapper board/mboot/rootfs-overlay/etc/init.d/S40xorg \

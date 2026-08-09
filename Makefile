@@ -23,8 +23,13 @@ QEMU ?= qemu-system-x86_64
 RUN_OVMF_CODE := $(CURDIR)/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_CODE_4M.fd
 RUN_OVMF_VARS_TEMPLATE := $(CURDIR)/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_VARS_4M.fd
 RUN_DISK_IMAGE := $(OUTPUT_DIR)/run/mboot.img
-QEMU_FULLSCREEN_PATCH := $(CURDIR)/board/mboot/patches/qemu/0001-sdl-keep-fullscreen-window-size.patch
-QEMU_FULLSCREEN_PATCH_STAMP := $(OUTPUT_DIR)/.mboot-qemu-fullscreen-patch.sha256
+QEMU_CONFIG_INPUTS := \
+	$(wildcard $(CURDIR)/board/mboot/patches/qemu/*.patch) \
+	$(CURDIR)/board/mboot/qemu-configure-wrapper \
+	$(CURDIR)/configs/mboot_x86_64_defconfig.in \
+	$(CURDIR)/external.mk \
+	$(CURDIR)/package/virglrenderer/virglrenderer.mk
+QEMU_CONFIG_STAMP := $(OUTPUT_DIR)/.mboot-qemu-config.sha256
 
 JOBS ?= $(shell nproc)
 HOST_CARGO := $(shell command -v cargo)
@@ -173,17 +178,31 @@ menuconfig: configure
 .PHONY: prepare-qemu
 prepare-qemu:
 	@set -eu; \
-	digest=$$(sha256sum "$(QEMU_FULLSCREEN_PATCH)" | awk '{print $$1}'); \
-	if [ -f "$(QEMU_FULLSCREEN_PATCH_STAMP)" ] && \
-	   [ "$$(cat "$(QEMU_FULLSCREEN_PATCH_STAMP)")" = "$$digest" ]; then \
+	digest=$$(sha256sum $(QEMU_CONFIG_INPUTS) | sha256sum | awk '{print $$1}'); \
+	if [ -f "$(QEMU_CONFIG_STAMP)" ] && \
+	   [ "$$(cat "$(QEMU_CONFIG_STAMP)")" = "$$digest" ]; then \
 		exit 0; \
 	fi; \
 	qemu_built=0; \
+	sdl2_built=0; \
+	virglrenderer_built=0; \
 	for directory in "$(OUTPUT_DIR)"/build/qemu-*; do \
 		[ ! -d "$$directory" ] || qemu_built=1; \
 	done; \
+	for directory in "$(OUTPUT_DIR)"/build/virglrenderer-*; do \
+		[ ! -d "$$directory" ] || virglrenderer_built=1; \
+	done; \
+	for directory in "$(OUTPUT_DIR)"/build/sdl2-*; do \
+		[ ! -d "$$directory" ] || sdl2_built=1; \
+	done; \
 	if [ "$$qemu_built" -eq 1 ]; then \
 		$(MAKE) -C "$(BUILDROOT_DIR)" O="$(OUTPUT_DIR)" qemu-dirclean; \
+	fi; \
+	if [ "$$virglrenderer_built" -eq 1 ]; then \
+		$(MAKE) -C "$(BUILDROOT_DIR)" O="$(OUTPUT_DIR)" virglrenderer-dirclean; \
+	fi; \
+	if [ "$$sdl2_built" -eq 1 ]; then \
+		$(MAKE) -C "$(BUILDROOT_DIR)" O="$(OUTPUT_DIR)" sdl2-dirclean; \
 	fi
 
 .PHONY: build
@@ -195,9 +214,9 @@ build: configure check check-mochios prepare-qemu mbootd
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
 		-j"$(JOBS)"
-	@sha256sum "$(QEMU_FULLSCREEN_PATCH)" | awk '{print $$1}' > \
-		"$(QEMU_FULLSCREEN_PATCH_STAMP).new"
-	@mv "$(QEMU_FULLSCREEN_PATCH_STAMP).new" "$(QEMU_FULLSCREEN_PATCH_STAMP)"
+	@sha256sum $(QEMU_CONFIG_INPUTS) | sha256sum | awk '{print $$1}' > \
+		"$(QEMU_CONFIG_STAMP).new"
+	@mv "$(QEMU_CONFIG_STAMP).new" "$(QEMU_CONFIG_STAMP)"
 	MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))" \
 	MBOOT_OUTPUT_DIR="$(OUTPUT_DIR)" scripts/check-image.sh
 

@@ -1,0 +1,17 @@
+config BR2_PACKAGE_VIRGLRENDERER
+	bool "virglrenderer"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	depends on !BR2_STATIC_LIBS
+	depends on BR2_PACKAGE_HAS_LIBEGL
+	depends on BR2_PACKAGE_HAS_LIBGBM
+	select BR2_PACKAGE_LIBDRM
+	select BR2_PACKAGE_LIBEPOXY
+	help
+	  VirGL renderer library used by QEMU to execute a guest's
+	  virtio-gpu 3D command stream with the host OpenGL driver.
+
+	  https://gitlab.freedesktop.org/virgl/virglrenderer
+
+comment "virglrenderer needs EGL, GBM, threads and a dynamic library toolchain"
+	depends on !BR2_TOOLCHAIN_HAS_THREADS || BR2_STATIC_LIBS || \
+		!BR2_PACKAGE_HAS_LIBEGL || !BR2_PACKAGE_HAS_LIBGBM

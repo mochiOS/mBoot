@@ -1,0 +1,99 @@
+From: mochiOS Project <development@mochios.org>
+Subject: [PATCH] ui/sdl2: prefer EGL for X11 VirGL contexts
+
+libepoxy must be able to identify the API owning the current context when
+virglrenderer initializes.  SDL defaults to GLX on X11, while QEMU's VirGL
+integration only publishes qemu_egl_display when an EGL display is known.
+This can leave virglrenderer with a context that SDL failed to make current
+and cause libepoxy to abort.
+
+Prefer SDL's X11 EGL path, publish the EGL display created by SDL, and reject
+contexts that cannot actually be made current.  Newer QEMU releases use the
+same EGL preference and qemu_egl_display handoff for the SDL backend.
+
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index d2f202d3da..888918a7cd 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -144,7 +144,11 @@ QEMUGLContext sdl2_gl_create_context(DisplayGLCtx *dgc,
+ 
+     assert(scon->opengl);
+ 
+-    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
++    if (SDL_GL_MakeCurrent(scon->real_window, scon->winctx) != 0) {
++        fprintf(stderr, "SDL: cannot activate the shared OpenGL context: %s\n",
++                SDL_GetError());
++        return NULL;
++    }
+ 
+     SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+     if (scon->opts->gl == DISPLAY_GL_MODE_ON ||
+@@ -169,6 +173,14 @@ QEMUGLContext sdl2_gl_create_context(DisplayGLCtx *dgc,
+                             SDL_GL_CONTEXT_PROFILE_ES);
+         ctx = SDL_GL_CreateContext(scon->real_window);
+     }
++    if (ctx && SDL_GL_MakeCurrent(scon->real_window, ctx) != 0) {
++        fprintf(stderr,
++                "SDL: cannot activate a VirGL OpenGL %d.%d context: %s\n",
++                params->major_ver, params->minor_ver, SDL_GetError());
++        SDL_GL_DeleteContext(ctx);
++        ctx = NULL;
++    }
++
+     return (QEMUGLContext)ctx;
+ }
+ 
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index db80e44435..36f106470b 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -116,6 +116,11 @@ void sdl2_window_create(struct sdl2_console *scon)
+ #endif
+ 
+     scon->real_window = SDL_CreateWindow("", x, y, width, height, flags);
++    if (!scon->real_window) {
++        fprintf(stderr, "SDL: cannot create the display window: %s\n",
++                SDL_GetError());
++        exit(1);
++    }
+     if (gui_fullscreen) {
+         SDL_ShowWindow(scon->real_window);
+         SDL_RaiseWindow(scon->real_window);
+@@ -133,7 +138,20 @@ void sdl2_window_create(struct sdl2_console *scon)
+         SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
+ 
+         scon->winctx = SDL_GL_CreateContext(scon->real_window);
++        if (!scon->winctx ||
++            SDL_GL_MakeCurrent(scon->real_window, scon->winctx) != 0) {
++            fprintf(stderr,
++                    "SDL: cannot create the display OpenGL context: %s\n",
++                    SDL_GetError());
++            exit(1);
++        }
+         SDL_GL_SetSwapInterval(0);
++        qemu_egl_display = eglGetCurrentDisplay();
++        if (qemu_egl_display == EGL_NO_DISPLAY) {
++            fprintf(stderr,
++                    "SDL: the display OpenGL context is not backed by EGL\n");
++            exit(1);
++        }
+     } else {
+         /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
+         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
+@@ -876,6 +894,14 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
+         SDL_LogSetAllPriority(SDL_LOG_PRIORITY_VERBOSE);
+     }
+ 
++    /*
++     * mBoot runs SDL on X11 and provides Mesa EGL.  Use the EGL path so the
++     * SDL display and VirGL contexts share one context API.
++     */
++#ifdef SDL_HINT_VIDEO_X11_FORCE_EGL
++    SDL_SetHint(SDL_HINT_VIDEO_X11_FORCE_EGL, "1");
++#endif
++
+     if (SDL_Init(SDL_INIT_VIDEO)) {
+         fprintf(stderr, "Could not initialize SDL(%s) - exiting\n",
+                 SDL_GetError());
+-- 
+2.43.0

@@ -3,4 +3,6 @@
 # occurrence, so append the appliance-owned backend selection.
 exec "$(dirname "$0")/configure.mboot-real" "$@" \
 	--audio-drv-list=alsa \
-	--enable-alsa
+	--enable-alsa \
+	--enable-opengl \
+	--enable-virglrenderer
