@@ -21,7 +21,7 @@ require_line "$GENERATED/mboot_x86_64_defconfig" '# BR2_TARGET_GENERIC_GETTY is 
 require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="$(BR2_EXTERNAL_MBOOT_PATH)/output/generated/linux.config"'
 require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_TARGET_GRUB2_BUILTIN_CONFIG_PC="$(BR2_EXTERNAL_MBOOT_PATH)/output/generated/grub-builtin.cfg"'
 require_line "$GENERATED/mboot_x86_64_defconfig" '# BR2_TARGET_GRUB2_X86_64_EFI is not set'
-require_line board/mboot/rootfs-overlay/etc/mboot.conf 'MBOOT_VCPUS=1'
+require_line board/mboot/rootfs-overlay/etc/mboot.conf 'MBOOT_VCPUS='
 require_line board/mboot/rootfs-overlay/etc/mboot.conf 'MBOOT_ACCELERATOR=auto'
 require_line "$GENERATED/grub-builtin.cfg" "search --no-floppy --fs-uuid --set=root $MBOOT_ROOT_FSUUID"
 require_line "$GENERATED/linux.config" 'CONFIG_CMDLINE_OVERRIDE=y'
@@ -107,6 +107,8 @@ grep -Fq 'gpu_device=$gpu,xres=$guest_width,yres=$guest_height' \
 	fail 'inner QEMU native display resolution is missing'
 grep -Fq 'cpu=qemu64,+x2apic' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
 	fail 'guest CPU is not vendor-neutral with x2APIC enabled'
+grep -Fq 'host_cpus=$(online_cpu_count)' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'online host CPU discovery is missing'
 if grep -Eq -- 'virtio-(keyboard|mouse)-pci' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher; then
 	fail 'inner QEMU must use the mochiOS-supported q35 i8042 input path'
 fi

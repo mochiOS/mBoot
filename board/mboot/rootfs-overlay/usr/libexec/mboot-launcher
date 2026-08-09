@@ -25,6 +25,22 @@ config_get() {
 
 unsigned() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
 
+online_cpu_count() {
+	count=0
+	for cpu_path in /sys/devices/system/cpu/cpu[0-9]*; do
+		[ -d "$cpu_path" ] || continue
+		if [ -r "$cpu_path/online" ] && [ "$(cat "$cpu_path/online")" != 1 ]; then
+			continue
+		fi
+		count=$((count + 1))
+	done
+	if [ "$count" -gt 0 ]; then
+		printf '%s\n' "$count"
+	else
+		getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n'
+	fi
+}
+
 fail() {
 	code=$1
 	shift
@@ -158,7 +174,7 @@ if [ ! -e "$OVMF_VARS" ]; then
 	fi
 fi
 
-host_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+host_cpus=$(online_cpu_count)
 max_cpus=$(config_get MBOOT_MAX_VCPUS 8)
 vcpus=$(config_get MBOOT_VCPUS '')
 unsigned "$host_cpus" || host_cpus=1
