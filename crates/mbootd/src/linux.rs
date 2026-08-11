@@ -147,6 +147,8 @@ impl LinuxBridge {
                 windows.push(window);
             }
         }
+        self.frames
+            .retain(|(owner, window), _| *owner != instance || windows.contains(window));
         Ok(windows)
     }
 
@@ -193,16 +195,9 @@ impl LinuxBridge {
         if expected > MAX_FRAME_BYTES || bytes.len() < expected {
             return Err(LinuxError::InvalidState);
         }
-        let generation = self.allocate_generation();
         let encoded = encode_rle32(&bytes[..expected])?;
         let encoded_size = encoded.len();
-        self.frames.insert(
-            (instance, window),
-            CachedFrame {
-                generation,
-                bytes: encoded,
-            },
-        );
+        let generation = self.cache_frame((instance, window), encoded);
         Ok(WindowInfo {
             width,
             height,
@@ -326,7 +321,7 @@ impl LinuxBridge {
             }
             "focus" => connection.set_input_focus(
                 x11rb::protocol::xproto::InputFocus::PARENT,
-                window,
+                if value == 0 { root } else { window },
                 CURRENT_TIME,
             ),
             _ => return Err(LinuxError::InvalidArgument),
@@ -415,11 +410,28 @@ impl LinuxBridge {
             }
         }
     }
+
+    fn cache_frame(&mut self, key: (u64, Window), encoded: Vec<u8>) -> u64 {
+        if let Some(frame) = self.frames.get(&key).filter(|frame| frame.bytes == encoded) {
+            return frame.generation;
+        }
+        let generation = self.allocate_generation();
+        self.frames.insert(
+            key,
+            CachedFrame {
+                generation,
+                bytes: encoded,
+            },
+        );
+        generation
+    }
 }
 
 fn application_executable(application: &str) -> Option<&'static str> {
     match application {
         "xterm" => Some("/usr/bin/xterm"),
+        "xcalc" => Some("/usr/bin/xcalc"),
+        "xclock" => Some("/usr/bin/xclock"),
         _ => None,
     }
 }
@@ -430,9 +442,19 @@ fn window_title(connection: &RustConnection, window: Window) -> Vec<u8> {
     else {
         return Vec::new();
     };
-    property
+    let raw = property
         .reply()
-        .map_or_else(|_| Vec::new(), |reply| reply.value)
+        .map_or_else(|_| Vec::new(), |reply| reply.value);
+    let title = String::from_utf8_lossy(&raw);
+    let mut end = title.len().min(64);
+    while !title.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 {
+        b"Linux application".to_vec()
+    } else {
+        title.as_bytes()[..end].to_vec()
+    }
 }
 
 fn encode_rle32(frame: &[u8]) -> Result<Vec<u8>, LinuxError> {
@@ -463,6 +485,8 @@ mod tests {
     #[test]
     fn launch_allowlist_does_not_accept_paths_or_shells() {
         assert_eq!(application_executable("xterm"), Some("/usr/bin/xterm"));
+        assert_eq!(application_executable("xcalc"), Some("/usr/bin/xcalc"));
+        assert_eq!(application_executable("xclock"), Some("/usr/bin/xclock"));
         assert_eq!(application_executable("/bin/sh"), None);
         assert_eq!(application_executable("xterm;id"), None);
     }
@@ -493,5 +517,15 @@ mod tests {
         assert_eq!(&encoded[2..6], &[0x11; 4]);
         assert_eq!(&encoded[6..8], &2u16.to_le_bytes());
         assert_eq!(&encoded[8..12], &[0x22; 4]);
+    }
+
+    #[test]
+    fn identical_frames_reuse_generation_and_changed_frames_advance_it() {
+        let mut bridge = LinuxBridge::default();
+        let first = bridge.cache_frame((4, 8), vec![1, 2, 3]);
+        let unchanged = bridge.cache_frame((4, 8), vec![1, 2, 3]);
+        let changed = bridge.cache_frame((4, 8), vec![1, 2, 4]);
+        assert_eq!(unchanged, first);
+        assert_ne!(changed, first);
     }
 }
