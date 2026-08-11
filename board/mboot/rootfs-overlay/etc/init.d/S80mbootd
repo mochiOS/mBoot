@@ -4,6 +4,10 @@ DAEMON=/usr/sbin/mbootd
 SOCKET=/run/mboot/mochios-control.sock
 PIDFILE=/run/mboot/mbootd.pid
 LOG=/var/log/mboot/mbootd.log
+DISPLAY_NUMBER=:0
+
+configured=$(sed -n 's/^MBOOT_X_DISPLAY=//p' /etc/mboot.conf 2>/dev/null | tail -n 1)
+[ -z "$configured" ] || DISPLAY_NUMBER=$configured
 
 valid_pid() {
 	[ -f "$PIDFILE" ] || return 1
@@ -25,7 +29,8 @@ start() {
 		return 1
 	fi
 	[ -x "$DAEMON" ] || { echo 'missing'; return 1; }
-	start-stop-daemon -S -q -b -m -p "$PIDFILE" -x "$DAEMON" -- "$SOCKET" >>"$LOG" 2>&1
+	MBOOT_LINUX_DISPLAY="$DISPLAY_NUMBER" \
+		start-stop-daemon -S -q -b -m -p "$PIDFILE" -x "$DAEMON" -- "$SOCKET" >>"$LOG" 2>&1
 	count=0
 	while [ "$count" -lt 50 ]; do
 		if valid_pid && [ -S "$SOCKET" ]; then echo 'OK'; return 0; fi

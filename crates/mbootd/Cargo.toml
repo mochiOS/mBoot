@@ -6,4 +6,4 @@ license.workspace = true
 
 [dependencies]
 mboot-protocol = { path = "../mboot-protocol", features = ["std"] }
-
+x11rb = { version = "0.14.0", default-features = false, features = ["xtest"] }

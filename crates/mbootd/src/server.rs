@@ -1,4 +1,5 @@
 use crate::developer::{encode_hex, DeveloperBuildState, DeveloperError};
+use crate::linux::{LinuxBridge, LinuxError};
 use crate::{GuestState, StateError};
 use mboot_protocol::{
     decode_line, encode_to_string, Argument, Body, Command, ConnectionValidator, Destination,
@@ -73,6 +74,7 @@ pub fn serve_connection(
     let mut reader = BufReader::new(read_stream);
     let mut validator = ConnectionValidator::new();
     let mut developer = DeveloperBuildState::default();
+    let mut linux = LinuxBridge::default();
     let session = session_id();
     state.connected();
     println!("guest connected");
@@ -107,7 +109,14 @@ pub fn serve_connection(
             continue;
         }
 
-        let response = dispatch(state, &mut developer, &message, &session, heartbeat_ms);
+        let response = dispatch(
+            state,
+            &mut developer,
+            &mut linux,
+            &message,
+            &session,
+            heartbeat_ms,
+        );
         if let Some(response) = response {
             send(&mut stream, &response)?;
             if message.message_type == MessageType::Request {
@@ -122,6 +131,7 @@ pub fn serve_connection(
 fn dispatch(
     state: &mut GuestState,
     developer: &mut DeveloperBuildState,
+    linux: &mut LinuxBridge,
     message: &Message,
     session: &str,
     heartbeat_ms: u64,
@@ -245,6 +255,79 @@ fn dispatch(
             developer.cancel(required_u64(message, "transaction")?)?;
             Ok(Vec::new())
         }),
+        KnownCommand::LinuxLaunch => linux_response(message, || {
+            let process = linux.launch(
+                linux_u64(message, "instance")?,
+                message
+                    .argument("application")
+                    .ok_or(LinuxError::InvalidArgument)?,
+            )?;
+            Ok(vec![Argument::new("process", process.to_string())])
+        }),
+        KnownCommand::LinuxWindows => linux_response(message, || {
+            let windows = linux.windows(linux_u64(message, "instance")?)?;
+            let list = if windows.is_empty() {
+                String::from("none")
+            } else {
+                windows
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            Ok(vec![Argument::new("windows", list)])
+        }),
+        KnownCommand::LinuxWindowInfo => linux_response(message, || {
+            let info =
+                linux.window_info(linux_u64(message, "instance")?, linux_window(message)?)?;
+            Ok(vec![
+                Argument::new("width", info.width.to_string()),
+                Argument::new("height", info.height.to_string()),
+                Argument::new("generation", info.generation.to_string()),
+                Argument::new("frame_size", info.frame_size.to_string()),
+                Argument::new("title", encode_hex(&info.title)),
+            ])
+        }),
+        KnownCommand::LinuxFrame => linux_response(message, || {
+            let chunk = linux.frame(
+                linux_u64(message, "instance")?,
+                linux_window(message)?,
+                linux_u64(message, "generation")?,
+                linux_u64(message, "offset")?,
+                linux_u64(message, "maximum")?,
+            )?;
+            Ok(vec![
+                Argument::new("total_size", chunk.total_size.to_string()),
+                Argument::new("data", encode_hex(&chunk.bytes)),
+            ])
+        }),
+        KnownCommand::LinuxInput => linux_response(message, || {
+            linux.input(
+                linux_u64(message, "instance")?,
+                linux_window(message)?,
+                message
+                    .argument("kind")
+                    .ok_or(LinuxError::InvalidArgument)?,
+                linux_u8(message, "code")?,
+                linux_i32(message, "value")?,
+                linux_i16(message, "x")?,
+                linux_i16(message, "y")?,
+            )?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxConfigure => linux_response(message, || {
+            linux.configure(
+                linux_u64(message, "instance")?,
+                linux_window(message)?,
+                linux_u16(message, "width")?,
+                linux_u16(message, "height")?,
+            )?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxClose => linux_response(message, || {
+            linux.close(linux_u64(message, "instance")?, linux_window(message)?)?;
+            Ok(Vec::new())
+        }),
         KnownCommand::ProtocolWelcome
         | KnownCommand::GuestStatus
         | KnownCommand::GuestShutdown
@@ -279,6 +362,75 @@ fn developer_error_code(error: DeveloperError) -> ErrorCode {
         DeveloperError::InvalidArgument => ErrorCode::InvalidArgument,
         DeveloperError::InvalidState => ErrorCode::InvalidState,
         DeveloperError::Internal => ErrorCode::Internal,
+    }
+}
+
+fn linux_response(
+    message: &Message,
+    operation: impl FnOnce() -> Result<Vec<Argument>, LinuxError>,
+) -> Option<Message> {
+    match operation() {
+        Ok(arguments) => Some(Message::ok(
+            Destination::Mochios,
+            message.request_id,
+            arguments,
+        )),
+        Err(error) => request_error(message, linux_error_code(error), None),
+    }
+}
+
+fn linux_u64(message: &Message, key: &str) -> Result<u64, LinuxError> {
+    message
+        .argument(key)
+        .and_then(|value| value.parse().ok())
+        .ok_or(LinuxError::InvalidArgument)
+}
+
+fn linux_u32(message: &Message, key: &str) -> Result<u32, LinuxError> {
+    message
+        .argument(key)
+        .and_then(|value| value.parse().ok())
+        .ok_or(LinuxError::InvalidArgument)
+}
+
+fn linux_u16(message: &Message, key: &str) -> Result<u16, LinuxError> {
+    message
+        .argument(key)
+        .and_then(|value| value.parse().ok())
+        .ok_or(LinuxError::InvalidArgument)
+}
+
+fn linux_u8(message: &Message, key: &str) -> Result<u8, LinuxError> {
+    message
+        .argument(key)
+        .and_then(|value| value.parse().ok())
+        .ok_or(LinuxError::InvalidArgument)
+}
+
+fn linux_i32(message: &Message, key: &str) -> Result<i32, LinuxError> {
+    message
+        .argument(key)
+        .and_then(|value| value.parse().ok())
+        .ok_or(LinuxError::InvalidArgument)
+}
+
+fn linux_i16(message: &Message, key: &str) -> Result<i16, LinuxError> {
+    message
+        .argument(key)
+        .and_then(|value| value.parse().ok())
+        .ok_or(LinuxError::InvalidArgument)
+}
+
+fn linux_window(message: &Message) -> Result<u32, LinuxError> {
+    linux_u32(message, "window")
+}
+
+fn linux_error_code(error: LinuxError) -> ErrorCode {
+    match error {
+        LinuxError::Busy => ErrorCode::Busy,
+        LinuxError::InvalidArgument => ErrorCode::InvalidArgument,
+        LinuxError::InvalidState | LinuxError::NotFound => ErrorCode::InvalidState,
+        LinuxError::Internal => ErrorCode::Internal,
     }
 }
 
@@ -433,6 +585,7 @@ mod tests {
             ..GuestState::default()
         };
         let mut developer = DeveloperBuildState::default();
+        let mut linux = LinuxBridge::default();
         for command in [KnownCommand::HostPoweroff, KnownCommand::HostReboot] {
             let message = Message::command(
                 Destination::Mboot,
@@ -442,7 +595,14 @@ mod tests {
                 Vec::new(),
             );
             assert!(matches!(
-                dispatch(&mut state, &mut developer, &message, "session", 5000),
+                dispatch(
+                    &mut state,
+                    &mut developer,
+                    &mut linux,
+                    &message,
+                    "session",
+                    5000,
+                ),
                 Some(Message {
                     body: Body::Error(ErrorCode::Unsupported),
                     ..

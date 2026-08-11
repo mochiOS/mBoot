@@ -177,6 +177,11 @@ grep -Fq 'MBOOT_SOURCE_DATE_EPOCH="$(MBOOT_SOURCE_DATE_EPOCH)"' Makefile ||
 	fail 'Makefile does not pass a reproducible timestamp into Buildroot hooks'
 grep -Fq 'target-feature=+crt-static' Makefile ||
 	fail 'mbootd is not built independently of the host dynamic loader'
+grep -Fq 'BR2_PACKAGE_XTERM=y' configs/mboot_x86_64_defconfig.in ||
+	fail 'Linux GUI bridge test application is missing'
+grep -Fq 'MBOOT_LINUX_DISPLAY="$DISPLAY_NUMBER"' \
+	board/mboot/rootfs-overlay/etc/init.d/S80mbootd ||
+	fail 'mbootd does not inherit the configured X display'
 grep -Fq -- '-chardev socket,id=mbootctl,path=/run/mboot/mochios-control.sock,server=off,reconnect-ms=1000' \
 	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
 	fail 'mBoot control chardev is missing or is not reconnectable'

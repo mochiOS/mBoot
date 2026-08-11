@@ -65,10 +65,17 @@ pub enum KnownCommand {
     DeveloperCompile,
     DeveloperRead,
     DeveloperCancel,
+    LinuxLaunch,
+    LinuxWindows,
+    LinuxWindowInfo,
+    LinuxFrame,
+    LinuxInput,
+    LinuxConfigure,
+    LinuxClose,
 }
 
 impl KnownCommand {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 26] = [
         Self::ProtocolSync,
         Self::ProtocolHello,
         Self::ProtocolWelcome,
@@ -88,6 +95,13 @@ impl KnownCommand {
         Self::DeveloperCompile,
         Self::DeveloperRead,
         Self::DeveloperCancel,
+        Self::LinuxLaunch,
+        Self::LinuxWindows,
+        Self::LinuxWindowInfo,
+        Self::LinuxFrame,
+        Self::LinuxInput,
+        Self::LinuxConfigure,
+        Self::LinuxClose,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -111,6 +125,13 @@ impl KnownCommand {
             Self::DeveloperCompile => "DEVELOPER.COMPILE",
             Self::DeveloperRead => "DEVELOPER.READ",
             Self::DeveloperCancel => "DEVELOPER.CANCEL",
+            Self::LinuxLaunch => "LINUX.LAUNCH",
+            Self::LinuxWindows => "LINUX.WINDOWS",
+            Self::LinuxWindowInfo => "LINUX.WINDOW.INFO",
+            Self::LinuxFrame => "LINUX.FRAME",
+            Self::LinuxInput => "LINUX.INPUT",
+            Self::LinuxConfigure => "LINUX.CONFIGURE",
+            Self::LinuxClose => "LINUX.CLOSE",
         }
     }
 
@@ -135,6 +156,13 @@ impl KnownCommand {
             "DEVELOPER.COMPILE" => Self::DeveloperCompile,
             "DEVELOPER.READ" => Self::DeveloperRead,
             "DEVELOPER.CANCEL" => Self::DeveloperCancel,
+            "LINUX.LAUNCH" => Self::LinuxLaunch,
+            "LINUX.WINDOWS" => Self::LinuxWindows,
+            "LINUX.WINDOW.INFO" => Self::LinuxWindowInfo,
+            "LINUX.FRAME" => Self::LinuxFrame,
+            "LINUX.INPUT" => Self::LinuxInput,
+            "LINUX.CONFIGURE" => Self::LinuxConfigure,
+            "LINUX.CLOSE" => Self::LinuxClose,
             _ => return None,
         })
     }
@@ -502,6 +530,55 @@ fn validate_command_arguments(
                 return Err(ValidationError::InvalidArgument);
             }
         }
+        KnownCommand::LinuxLaunch => {
+            if message.argument("application").is_none()
+                || parse_u64_argument(message, "instance").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::LinuxWindows if parse_u64_argument(message, "instance").is_none() => {
+            return Err(ValidationError::InvalidArgument);
+        }
+        KnownCommand::LinuxWindowInfo | KnownCommand::LinuxClose | KnownCommand::LinuxConfigure => {
+            if parse_u64_argument(message, "instance").is_none()
+                || parse_u64_argument(message, "window").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+            if command == KnownCommand::LinuxConfigure
+                && (parse_u64_argument(message, "width").is_none()
+                    || parse_u64_argument(message, "height").is_none())
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::LinuxFrame => {
+            if parse_u64_argument(message, "instance").is_none()
+                || parse_u64_argument(message, "window").is_none()
+                || parse_u64_argument(message, "generation").is_none()
+                || parse_u64_argument(message, "offset").is_none()
+                || parse_u64_argument(message, "maximum").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::LinuxInput => {
+            if parse_u64_argument(message, "instance").is_none()
+                || parse_u64_argument(message, "window").is_none()
+                || !matches!(
+                    message.argument("kind"),
+                    Some("motion" | "button" | "key" | "scroll" | "focus")
+                )
+                || parse_u64_argument(message, "code").is_none()
+                || parse_u64_argument(message, "value").is_none()
+                || parse_u64_argument(message, "x").is_none()
+                || parse_u64_argument(message, "y").is_none()
+                || parse_u64_argument(message, "modifiers").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -539,9 +616,9 @@ const fn command_contract(command: KnownCommand) -> (AllowedDestination, Message
         GuestReady | GuestHeartbeat | GuestStopping | GuestPanic => (Mboot, MessageType::Event),
         GuestStatus | GuestShutdown | GuestReboot => (Mochios, MessageType::Request),
         HostStatus | HostPoweroff | HostReboot => (Mboot, MessageType::Request),
-        DeveloperBegin | DeveloperChunk | DeveloperCompile | DeveloperRead | DeveloperCancel => {
-            (Mboot, MessageType::Request)
-        }
+        DeveloperBegin | DeveloperChunk | DeveloperCompile | DeveloperRead | DeveloperCancel
+        | LinuxLaunch | LinuxWindows | LinuxWindowInfo | LinuxFrame | LinuxInput
+        | LinuxConfigure | LinuxClose => (Mboot, MessageType::Request),
     }
 }
 
@@ -857,7 +934,14 @@ mod tests {
             | KnownCommand::DeveloperChunk
             | KnownCommand::DeveloperCompile
             | KnownCommand::DeveloperRead
-            | KnownCommand::DeveloperCancel => (Destination::Mboot, MessageType::Request, 1),
+            | KnownCommand::DeveloperCancel
+            | KnownCommand::LinuxLaunch
+            | KnownCommand::LinuxWindows
+            | KnownCommand::LinuxWindowInfo
+            | KnownCommand::LinuxFrame
+            | KnownCommand::LinuxInput
+            | KnownCommand::LinuxConfigure
+            | KnownCommand::LinuxClose => (Destination::Mboot, MessageType::Request, 1),
         };
         let arguments = match command {
             KnownCommand::ProtocolHello => alloc::vec![
@@ -891,6 +975,38 @@ mod tests {
                 Argument::new("stream", "output"),
                 Argument::new("offset", "0"),
                 Argument::new("maximum", "1024"),
+            ],
+            KnownCommand::LinuxLaunch => alloc::vec![
+                Argument::new("application", "xterm"),
+                Argument::new("instance", "9"),
+            ],
+            KnownCommand::LinuxWindows => alloc::vec![Argument::new("instance", "9")],
+            KnownCommand::LinuxWindowInfo | KnownCommand::LinuxClose => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("window", "12"),
+            ],
+            KnownCommand::LinuxConfigure => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("window", "12"),
+                Argument::new("width", "800"),
+                Argument::new("height", "600"),
+            ],
+            KnownCommand::LinuxFrame => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("window", "12"),
+                Argument::new("generation", "3"),
+                Argument::new("offset", "0"),
+                Argument::new("maximum", "1024"),
+            ],
+            KnownCommand::LinuxInput => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("window", "12"),
+                Argument::new("kind", "motion"),
+                Argument::new("code", "0"),
+                Argument::new("value", "0"),
+                Argument::new("x", "40"),
+                Argument::new("y", "20"),
+                Argument::new("modifiers", "0"),
             ],
             _ => Vec::new(),
         };
