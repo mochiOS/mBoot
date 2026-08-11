@@ -285,6 +285,8 @@ fn dispatch(
                 Argument::new("height", info.height.to_string()),
                 Argument::new("generation", info.generation.to_string()),
                 Argument::new("frame_size", info.frame_size.to_string()),
+                Argument::new("encoded_size", info.encoded_size.to_string()),
+                Argument::new("encoding", "rle32"),
                 Argument::new("title", encode_hex(&info.title)),
             ])
         }),

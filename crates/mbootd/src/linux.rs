@@ -28,6 +28,13 @@ struct LinuxInstance {
     child: Child,
 }
 
+impl Drop for LinuxInstance {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 struct CachedFrame {
     generation: u64,
     bytes: Vec<u8>,
@@ -38,6 +45,7 @@ pub(crate) struct WindowInfo {
     pub(crate) height: u16,
     pub(crate) generation: u64,
     pub(crate) frame_size: usize,
+    pub(crate) encoded_size: usize,
     pub(crate) title: Vec<u8>,
 }
 
@@ -186,11 +194,13 @@ impl LinuxBridge {
             return Err(LinuxError::InvalidState);
         }
         let generation = self.allocate_generation();
+        let encoded = encode_rle32(&bytes[..expected])?;
+        let encoded_size = encoded.len();
         self.frames.insert(
             (instance, window),
             CachedFrame {
                 generation,
-                bytes: bytes[..expected].to_vec(),
+                bytes: encoded,
             },
         );
         Ok(WindowInfo {
@@ -198,6 +208,7 @@ impl LinuxBridge {
             height,
             generation,
             frame_size: expected,
+            encoded_size,
             title,
         })
     }
@@ -424,6 +435,27 @@ fn window_title(connection: &RustConnection, window: Window) -> Vec<u8> {
         .map_or_else(|_| Vec::new(), |reply| reply.value)
 }
 
+fn encode_rle32(frame: &[u8]) -> Result<Vec<u8>, LinuxError> {
+    if frame.len() % 4 != 0 {
+        return Err(LinuxError::InvalidState);
+    }
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve(frame.len().min(64 * 1024))
+        .map_err(|_| LinuxError::Internal)?;
+    let mut pixels = frame.chunks_exact(4).peekable();
+    while let Some(pixel) = pixels.next() {
+        let mut count = 1u16;
+        while count < u16::MAX && pixels.peek().is_some_and(|candidate| *candidate == pixel) {
+            let _ = pixels.next();
+            count += 1;
+        }
+        encoded.extend_from_slice(&count.to_le_bytes());
+        encoded.extend_from_slice(pixel);
+    }
+    Ok(encoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +482,16 @@ mod tests {
             bridge.frame(9, 12, 4, 0, 1),
             Err(LinuxError::InvalidState)
         ));
+    }
+
+    #[test]
+    fn rle32_compacts_solid_pixels_without_losing_run_boundaries() {
+        let mut frame = vec![0x11; usize::from(u16::MAX) * 4];
+        frame.extend_from_slice(&[0x22; 8]);
+        let encoded = encode_rle32(&frame).unwrap();
+        assert_eq!(&encoded[..2], &u16::MAX.to_le_bytes());
+        assert_eq!(&encoded[2..6], &[0x11; 4]);
+        assert_eq!(&encoded[6..8], &2u16.to_le_bytes());
+        assert_eq!(&encoded[8..12], &[0x22; 4]);
     }
 }
