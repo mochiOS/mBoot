@@ -60,10 +60,15 @@ pub enum KnownCommand {
     HostStatus,
     HostPoweroff,
     HostReboot,
+    DeveloperBegin,
+    DeveloperChunk,
+    DeveloperCompile,
+    DeveloperRead,
+    DeveloperCancel,
 }
 
 impl KnownCommand {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 19] = [
         Self::ProtocolSync,
         Self::ProtocolHello,
         Self::ProtocolWelcome,
@@ -78,6 +83,11 @@ impl KnownCommand {
         Self::HostStatus,
         Self::HostPoweroff,
         Self::HostReboot,
+        Self::DeveloperBegin,
+        Self::DeveloperChunk,
+        Self::DeveloperCompile,
+        Self::DeveloperRead,
+        Self::DeveloperCancel,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -96,6 +106,11 @@ impl KnownCommand {
             Self::HostStatus => "HOST.STATUS",
             Self::HostPoweroff => "HOST.POWEROFF",
             Self::HostReboot => "HOST.REBOOT",
+            Self::DeveloperBegin => "DEVELOPER.BEGIN",
+            Self::DeveloperChunk => "DEVELOPER.CHUNK",
+            Self::DeveloperCompile => "DEVELOPER.COMPILE",
+            Self::DeveloperRead => "DEVELOPER.READ",
+            Self::DeveloperCancel => "DEVELOPER.CANCEL",
         }
     }
 
@@ -115,6 +130,11 @@ impl KnownCommand {
             "HOST.STATUS" => Self::HostStatus,
             "HOST.POWEROFF" => Self::HostPoweroff,
             "HOST.REBOOT" => Self::HostReboot,
+            "DEVELOPER.BEGIN" => Self::DeveloperBegin,
+            "DEVELOPER.CHUNK" => Self::DeveloperChunk,
+            "DEVELOPER.COMPILE" => Self::DeveloperCompile,
+            "DEVELOPER.READ" => Self::DeveloperRead,
+            "DEVELOPER.CANCEL" => Self::DeveloperCancel,
             _ => return None,
         })
     }
@@ -455,6 +475,33 @@ fn validate_command_arguments(
         KnownCommand::GuestHeartbeat if parse_u64_argument(message, "uptime_ms").is_none() => {
             return Err(ValidationError::InvalidArgument);
         }
+        KnownCommand::DeveloperBegin
+            if parse_u64_argument(message, "transaction").is_none()
+                || parse_u64_argument(message, "size").is_none() =>
+        {
+            return Err(ValidationError::InvalidArgument);
+        }
+        KnownCommand::DeveloperChunk
+            if parse_u64_argument(message, "transaction").is_none()
+                || parse_u64_argument(message, "offset").is_none()
+                || message.argument("data").is_none() =>
+        {
+            return Err(ValidationError::InvalidArgument);
+        }
+        KnownCommand::DeveloperCompile | KnownCommand::DeveloperCancel
+            if parse_u64_argument(message, "transaction").is_none() =>
+        {
+            return Err(ValidationError::InvalidArgument);
+        }
+        KnownCommand::DeveloperRead => {
+            if parse_u64_argument(message, "transaction").is_none()
+                || parse_u64_argument(message, "offset").is_none()
+                || parse_u64_argument(message, "maximum").is_none()
+                || !matches!(message.argument("stream"), Some("output" | "diagnostics"))
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -492,6 +539,9 @@ const fn command_contract(command: KnownCommand) -> (AllowedDestination, Message
         GuestReady | GuestHeartbeat | GuestStopping | GuestPanic => (Mboot, MessageType::Event),
         GuestStatus | GuestShutdown | GuestReboot => (Mochios, MessageType::Request),
         HostStatus | HostPoweroff | HostReboot => (Mboot, MessageType::Request),
+        DeveloperBegin | DeveloperChunk | DeveloperCompile | DeveloperRead | DeveloperCancel => {
+            (Mboot, MessageType::Request)
+        }
     }
 }
 
@@ -803,6 +853,11 @@ mod tests {
             KnownCommand::HostStatus | KnownCommand::HostPoweroff | KnownCommand::HostReboot => {
                 (Destination::Mboot, MessageType::Request, 1)
             }
+            KnownCommand::DeveloperBegin
+            | KnownCommand::DeveloperChunk
+            | KnownCommand::DeveloperCompile
+            | KnownCommand::DeveloperRead
+            | KnownCommand::DeveloperCancel => (Destination::Mboot, MessageType::Request, 1),
         };
         let arguments = match command {
             KnownCommand::ProtocolHello => alloc::vec![
@@ -819,6 +874,24 @@ mod tests {
             KnownCommand::GuestHeartbeat => {
                 alloc::vec![Argument::new("uptime_ms", "10000")]
             }
+            KnownCommand::DeveloperBegin => alloc::vec![
+                Argument::new("transaction", "7"),
+                Argument::new("size", "64"),
+            ],
+            KnownCommand::DeveloperChunk => alloc::vec![
+                Argument::new("transaction", "7"),
+                Argument::new("offset", "0"),
+                Argument::new("data", "00ff"),
+            ],
+            KnownCommand::DeveloperCompile | KnownCommand::DeveloperCancel => {
+                alloc::vec![Argument::new("transaction", "7")]
+            }
+            KnownCommand::DeveloperRead => alloc::vec![
+                Argument::new("transaction", "7"),
+                Argument::new("stream", "output"),
+                Argument::new("offset", "0"),
+                Argument::new("maximum", "1024"),
+            ],
             _ => Vec::new(),
         };
         Message::command(destination, message_type, request_id, command, arguments)

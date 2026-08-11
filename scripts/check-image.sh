@@ -87,10 +87,19 @@ cmp -s "$IMAGES/bzImage" "$temporary/BOOTX64.EFI" ||
 for path in etc/init.d/S03mboot-root etc/init.d/S10udev etc/init.d/S40xorg \
 	etc/init.d/S80mbootd etc/init.d/S90mboot \
 	etc/init.d/S95mboot-diagnostics \
-	usr/libexec/mboot-launcher usr/sbin/mbootd usr/bin/qemu-system-x86_64 usr/bin/Xorg; do
+	usr/libexec/mboot-launcher usr/sbin/mbootd usr/bin/qemu-system-x86_64 usr/bin/Xorg \
+	usr/bin/x86_64-elf-gcc; do
 	test -x "$TARGET/$path" || fail "missing target executable: /$path"
 	debugfs -R "stat /$path" "$IMAGES/rootfs.ext2" 2>&1 | grep -Fq 'Inode:' ||
 		fail "root filesystem lacks: /$path"
+done
+for path in usr/lib/mochios-sdk/crt0.o \
+	usr/lib/mochios-sdk/libmochi_user_newlib_runtime.a \
+	usr/lib/mochios-sdk/linker.ld usr/lib/mochios-sdk/x86_64-elf/lib/libc.a \
+	usr/lib/mochios-sdk/x86_64-elf/include/stdio.h; do
+	test -s "$TARGET/$path" || fail "missing mochiOS SDK file: /$path"
+	debugfs -R "stat /$path" "$IMAGES/rootfs.ext2" 2>&1 | grep -Fq 'Inode:' ||
+		fail "root filesystem lacks SDK file: /$path"
 done
 debugfs -R 'stat /etc/mboot-boot.conf' "$IMAGES/rootfs.ext2" 2>&1 | grep -Fq 'Inode:' ||
 	fail 'root filesystem lacks generated boot diagnostics configuration'

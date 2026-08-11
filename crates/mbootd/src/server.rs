@@ -1,3 +1,4 @@
+use crate::developer::{encode_hex, DeveloperBuildState, DeveloperError};
 use crate::{GuestState, StateError};
 use mboot_protocol::{
     decode_line, encode_to_string, Argument, Body, Command, ConnectionValidator, Destination,
@@ -71,6 +72,7 @@ pub fn serve_connection(
     read_stream.set_read_timeout(Some(Duration::from_millis(heartbeat_ms)))?;
     let mut reader = BufReader::new(read_stream);
     let mut validator = ConnectionValidator::new();
+    let mut developer = DeveloperBuildState::default();
     let session = session_id();
     state.connected();
     println!("guest connected");
@@ -105,7 +107,7 @@ pub fn serve_connection(
             continue;
         }
 
-        let response = dispatch(state, &message, &session, heartbeat_ms);
+        let response = dispatch(state, &mut developer, &message, &session, heartbeat_ms);
         if let Some(response) = response {
             send(&mut stream, &response)?;
             if message.message_type == MessageType::Request {
@@ -119,6 +121,7 @@ pub fn serve_connection(
 
 fn dispatch(
     state: &mut GuestState,
+    developer: &mut DeveloperBuildState,
     message: &Message,
     session: &str,
     heartbeat_ms: u64,
@@ -199,10 +202,83 @@ fn dispatch(
         KnownCommand::HostPoweroff | KnownCommand::HostReboot => {
             request_error(message, ErrorCode::Unsupported, None)
         }
+        KnownCommand::DeveloperBegin => developer_response(message, || {
+            developer.begin(
+                required_u64(message, "transaction")?,
+                required_u64(message, "size")?,
+            )?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::DeveloperChunk => developer_response(message, || {
+            developer.append_chunk(
+                required_u64(message, "transaction")?,
+                required_u64(message, "offset")?,
+                message
+                    .argument("data")
+                    .ok_or(DeveloperError::InvalidArgument)?,
+            )?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::DeveloperCompile => developer_response(message, || {
+            let result = developer.compile(required_u64(message, "transaction")?)?;
+            Ok(vec![
+                Argument::new("status", result.status.to_string()),
+                Argument::new("output_size", result.output_size.to_string()),
+                Argument::new("diagnostics_size", result.diagnostics_size.to_string()),
+            ])
+        }),
+        KnownCommand::DeveloperRead => developer_response(message, || {
+            let result = developer.read(
+                required_u64(message, "transaction")?,
+                message
+                    .argument("stream")
+                    .ok_or(DeveloperError::InvalidArgument)?,
+                required_u64(message, "offset")?,
+                required_u64(message, "maximum")?,
+            )?;
+            Ok(vec![
+                Argument::new("total_size", result.total_size.to_string()),
+                Argument::new("data", encode_hex(&result.data)),
+            ])
+        }),
+        KnownCommand::DeveloperCancel => developer_response(message, || {
+            developer.cancel(required_u64(message, "transaction")?)?;
+            Ok(Vec::new())
+        }),
         KnownCommand::ProtocolWelcome
         | KnownCommand::GuestStatus
         | KnownCommand::GuestShutdown
         | KnownCommand::GuestReboot => request_error(message, ErrorCode::InvalidCommand, None),
+    }
+}
+
+fn developer_response(
+    message: &Message,
+    operation: impl FnOnce() -> Result<Vec<Argument>, DeveloperError>,
+) -> Option<Message> {
+    match operation() {
+        Ok(arguments) => Some(Message::ok(
+            Destination::Mochios,
+            message.request_id,
+            arguments,
+        )),
+        Err(error) => request_error(message, developer_error_code(error), None),
+    }
+}
+
+fn required_u64(message: &Message, key: &str) -> Result<u64, DeveloperError> {
+    message
+        .argument(key)
+        .and_then(|value| value.parse().ok())
+        .ok_or(DeveloperError::InvalidArgument)
+}
+
+fn developer_error_code(error: DeveloperError) -> ErrorCode {
+    match error {
+        DeveloperError::Busy => ErrorCode::Busy,
+        DeveloperError::InvalidArgument => ErrorCode::InvalidArgument,
+        DeveloperError::InvalidState => ErrorCode::InvalidState,
+        DeveloperError::Internal => ErrorCode::Internal,
     }
 }
 
@@ -356,6 +432,7 @@ mod tests {
             connection_state: ConnectionState::Negotiated,
             ..GuestState::default()
         };
+        let mut developer = DeveloperBuildState::default();
         for command in [KnownCommand::HostPoweroff, KnownCommand::HostReboot] {
             let message = Message::command(
                 Destination::Mboot,
@@ -365,7 +442,7 @@ mod tests {
                 Vec::new(),
             );
             assert!(matches!(
-                dispatch(&mut state, &message, "session", 5000),
+                dispatch(&mut state, &mut developer, &message, "session", 5000),
                 Some(Message {
                     body: Body::Error(ErrorCode::Unsupported),
                     ..

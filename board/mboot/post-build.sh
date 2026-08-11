@@ -21,6 +21,57 @@ if readelf -l "$TARGET_DIR/usr/sbin/mbootd" | grep -Fq 'INTERP'; then
 	exit 1
 fi
 
+for sdk_file in MBOOT_MOCHIOS_SDK_SYSROOT MBOOT_MOCHIOS_SDK_CRT0 \
+	MBOOT_MOCHIOS_SDK_RUNTIME MBOOT_MOCHIOS_SDK_LINKER; do
+	eval "sdk_path=\${$sdk_file:-}"
+	[ -n "$sdk_path" ] && [ -e "$sdk_path" ] || {
+		echo "mBoot: $sdk_file is missing" >&2
+		exit 1
+	}
+done
+
+gcc_real="$HOST_DIR/bin/x86_64-buildroot-linux-gnu-gcc.br_real"
+set -- "$HOST_DIR"/libexec/gcc/x86_64-buildroot-linux-gnu/*
+[ "$#" -eq 1 ] && [ -d "$1" ] || {
+	echo 'mBoot: cannot uniquely locate the Buildroot GCC runtime' >&2
+	exit 1
+}
+gcc_runtime=$1
+gcc_version=${gcc_runtime##*/}
+gcc_target_runtime="$TARGET_DIR/usr/libexec/gcc/x86_64-buildroot-linux-gnu/$gcc_version"
+gcc_target_lib="$TARGET_DIR/usr/lib/gcc/x86_64-buildroot-linux-gnu/$gcc_version"
+[ -x "$gcc_real" ] || { echo 'mBoot: Buildroot GCC is missing' >&2; exit 1; }
+install -D -m 0755 "$gcc_real" "$TARGET_DIR/usr/bin/x86_64-elf-gcc"
+install -d -m 0755 "$gcc_target_runtime" "$gcc_target_lib" \
+	"$TARGET_DIR/usr/x86_64-buildroot-linux-gnu/bin"
+for program in cc1 collect2 lto-wrapper liblto_plugin.so; do
+	install -m 0755 "$gcc_runtime/$program" "$gcc_target_runtime/$program"
+done
+install -m 0644 "$HOST_DIR/lib/gcc/x86_64-buildroot-linux-gnu/$gcc_version/libgcc.a" \
+	"$gcc_target_lib/libgcc.a"
+cp -a "$HOST_DIR/lib/gcc/x86_64-buildroot-linux-gnu/$gcc_version/include" \
+	"$gcc_target_lib/include"
+cp -a "$HOST_DIR/lib/gcc/x86_64-buildroot-linux-gnu/$gcc_version/include-fixed" \
+	"$gcc_target_lib/include-fixed"
+for program in as ld; do
+	install -m 0755 "$HOST_DIR/x86_64-buildroot-linux-gnu/bin/$program" \
+		"$TARGET_DIR/usr/x86_64-buildroot-linux-gnu/bin/$program"
+done
+for library in libmpc.so.3 libmpfr.so.6 libgmp.so.10 libz.so.1; do
+	source=$(readlink -f "$HOST_DIR/lib/$library")
+	install -m 0755 "$source" "$TARGET_DIR/usr/lib/${source##*/}"
+	ln -snf "${source##*/}" "$TARGET_DIR/usr/lib/$library"
+done
+
+sdk_target="$TARGET_DIR/usr/lib/mochios-sdk"
+rm -rf "$sdk_target/x86_64-elf"
+install -d -m 0755 "$sdk_target"
+cp -a "$MBOOT_MOCHIOS_SDK_SYSROOT" "$sdk_target/x86_64-elf"
+install -m 0644 "$MBOOT_MOCHIOS_SDK_CRT0" "$sdk_target/crt0.o"
+install -m 0644 "$MBOOT_MOCHIOS_SDK_RUNTIME" \
+	"$sdk_target/libmochi_user_newlib_runtime.a"
+install -m 0644 "$MBOOT_MOCHIOS_SDK_LINKER" "$sdk_target/linker.ld"
+
 install -d -m 0755 "$BINARIES_DIR/efi-part/EFI/BOOT"
 rm -f "$BINARIES_DIR/efi-part/EFI/BOOT/bootx64.efi" \
 	"$BINARIES_DIR/efi-part/EFI/BOOT/BOOTX64.EFI" \

@@ -164,6 +164,11 @@ for script in board/mboot/post-build.sh board/mboot/post-image.sh \
 done
 grep -Fq 'MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))"' Makefile ||
 	fail 'Makefile does not pass the mochiOS image into Buildroot'
+for variable in MBOOT_MOCHIOS_SDK_SYSROOT MBOOT_MOCHIOS_SDK_CRT0 \
+	MBOOT_MOCHIOS_SDK_RUNTIME MBOOT_MOCHIOS_SDK_LINKER; do
+	grep -Fq "$variable" Makefile ||
+		fail "Makefile does not pass $variable into Buildroot"
+done
 grep -Fq 'MBOOTD_BINARY="$(MBOOTD_BINARY)"' Makefile ||
 	fail 'Makefile does not pass mbootd into Buildroot'
 grep -Fq 'MBOOT_BOOT_CONFIG_DIR="$(BOOT_CONFIG_DIR)"' Makefile ||
