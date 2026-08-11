@@ -179,6 +179,10 @@ grep -Fq 'target-feature=+crt-static' Makefile ||
 	fail 'mbootd is not built independently of the host dynamic loader'
 grep -Fq 'BR2_PACKAGE_XTERM=y' configs/mboot_x86_64_defconfig.in ||
 	fail 'Linux GUI bridge test application is missing'
+grep -Fq 'BR2_PACKAGE_XSERVER_XORG_SERVER_XVFB=y' configs/mboot_x86_64_defconfig.in ||
+	fail 'Linux GUI bridge private X server is missing'
+grep -Fq 'MBOOT_LINUX_DISPLAY=:99' board/mboot/rootfs-overlay/etc/mboot.conf ||
+	fail 'Linux GUI bridge display is not isolated from the appliance display'
 grep -Fq 'MBOOT_LINUX_DISPLAY="$DISPLAY_NUMBER"' \
 	board/mboot/rootfs-overlay/etc/init.d/S80mbootd ||
 	fail 'mbootd does not inherit the configured X display'

@@ -85,9 +85,10 @@ cmp -s "$IMAGES/bzImage" "$temporary/BOOTX64.EFI" ||
 	fail 'EFI fallback loader is not the Linux EFI-stub kernel'
 
 for path in etc/init.d/S03mboot-root etc/init.d/S10udev etc/init.d/S40xorg \
+	etc/init.d/S45linux-xvfb \
 	etc/init.d/S80mbootd etc/init.d/S90mboot \
 	etc/init.d/S95mboot-diagnostics \
-	usr/libexec/mboot-launcher usr/sbin/mbootd usr/bin/qemu-system-x86_64 usr/bin/Xorg \
+	usr/libexec/mboot-launcher usr/sbin/mbootd usr/bin/qemu-system-x86_64 usr/bin/Xorg usr/bin/Xvfb \
 	usr/bin/xterm usr/bin/xcalc usr/bin/xclock usr/bin/x86_64-elf-gcc; do
 	test -x "$TARGET/$path" || fail "missing target executable: /$path"
 	debugfs -R "stat /$path" "$IMAGES/rootfs.ext2" 2>&1 | grep -Fq 'Inode:' ||

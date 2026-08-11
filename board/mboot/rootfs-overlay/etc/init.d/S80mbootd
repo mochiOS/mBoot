@@ -4,9 +4,9 @@ DAEMON=/usr/sbin/mbootd
 SOCKET=/run/mboot/mochios-control.sock
 PIDFILE=/run/mboot/mbootd.pid
 LOG=/var/log/mboot/mbootd.log
-DISPLAY_NUMBER=:0
+DISPLAY_NUMBER=:99
 
-configured=$(sed -n 's/^MBOOT_X_DISPLAY=//p' /etc/mboot.conf 2>/dev/null | tail -n 1)
+configured=$(sed -n 's/^MBOOT_LINUX_DISPLAY=//p' /etc/mboot.conf 2>/dev/null | tail -n 1)
 [ -z "$configured" ] || DISPLAY_NUMBER=$configured
 
 valid_pid() {
