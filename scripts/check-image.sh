@@ -89,6 +89,7 @@ for path in etc/init.d/S03mboot-root etc/init.d/S10udev etc/init.d/S40xorg \
 	etc/init.d/S80mbootd etc/init.d/S90mboot \
 	etc/init.d/S95mboot-diagnostics \
 	usr/libexec/mboot-launcher usr/sbin/mbootd usr/bin/qemu-system-x86_64 usr/bin/Xorg usr/bin/Xvfb \
+	usr/bin/mount usr/bin/mountpoint usr/sbin/losetup usr/bin/unshare \
 	usr/bin/xterm usr/bin/xcalc usr/bin/xclock usr/bin/x86_64-elf-gcc; do
 	test -x "$TARGET/$path" || fail "missing target executable: /$path"
 	debugfs -R "stat /$path" "$IMAGES/rootfs.ext2" 2>&1 | grep -Fq 'Inode:' ||
@@ -182,7 +183,8 @@ for symbol in CONFIG_EFI_PARTITION=y CONFIG_SCSI=y CONFIG_BLK_DEV_SD=y \
 	CONFIG_INPUT_EVDEV=y CONFIG_INPUT_KEYBOARD=y CONFIG_KEYBOARD_ATKBD=y \
 	CONFIG_MOUSE_PS2=y CONFIG_HID_MULTITOUCH=m CONFIG_I2C_HID_ACPI=y \
 	CONFIG_SND_HDA_INTEL=y CONFIG_SND_USB_AUDIO=m CONFIG_VFAT_FS=y \
-	CONFIG_IGC=m CONFIG_IXGBE=m; do
+	CONFIG_IGC=m CONFIG_IXGBE=m CONFIG_BLK_DEV_LOOP=y CONFIG_OVERLAY_FS=y \
+	CONFIG_SQUASHFS=y CONFIG_TMPFS=y; do
 	grep -Fqx "$symbol" "$KCONFIG" || fail "final kernel config lacks $symbol"
 done
 test -s "$TARGET/lib/firmware/i915/tgl_dmc_ver2_12.bin" ||

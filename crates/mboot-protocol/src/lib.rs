@@ -66,6 +66,11 @@ pub enum KnownCommand {
     DeveloperRead,
     DeveloperCancel,
     LinuxLaunch,
+    LinuxStageBegin,
+    LinuxStageChunk,
+    LinuxStageCommit,
+    LinuxStageCancel,
+    LinuxBundleLaunch,
     LinuxWindows,
     LinuxWindowInfo,
     LinuxFrame,
@@ -75,7 +80,7 @@ pub enum KnownCommand {
 }
 
 impl KnownCommand {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 31] = [
         Self::ProtocolSync,
         Self::ProtocolHello,
         Self::ProtocolWelcome,
@@ -96,6 +101,11 @@ impl KnownCommand {
         Self::DeveloperRead,
         Self::DeveloperCancel,
         Self::LinuxLaunch,
+        Self::LinuxStageBegin,
+        Self::LinuxStageChunk,
+        Self::LinuxStageCommit,
+        Self::LinuxStageCancel,
+        Self::LinuxBundleLaunch,
         Self::LinuxWindows,
         Self::LinuxWindowInfo,
         Self::LinuxFrame,
@@ -126,6 +136,11 @@ impl KnownCommand {
             Self::DeveloperRead => "DEVELOPER.READ",
             Self::DeveloperCancel => "DEVELOPER.CANCEL",
             Self::LinuxLaunch => "LINUX.LAUNCH",
+            Self::LinuxStageBegin => "LINUX.STAGE.BEGIN",
+            Self::LinuxStageChunk => "LINUX.STAGE.CHUNK",
+            Self::LinuxStageCommit => "LINUX.STAGE.COMMIT",
+            Self::LinuxStageCancel => "LINUX.STAGE.CANCEL",
+            Self::LinuxBundleLaunch => "LINUX.BUNDLE.LAUNCH",
             Self::LinuxWindows => "LINUX.WINDOWS",
             Self::LinuxWindowInfo => "LINUX.WINDOW.INFO",
             Self::LinuxFrame => "LINUX.FRAME",
@@ -157,6 +172,11 @@ impl KnownCommand {
             "DEVELOPER.READ" => Self::DeveloperRead,
             "DEVELOPER.CANCEL" => Self::DeveloperCancel,
             "LINUX.LAUNCH" => Self::LinuxLaunch,
+            "LINUX.STAGE.BEGIN" => Self::LinuxStageBegin,
+            "LINUX.STAGE.CHUNK" => Self::LinuxStageChunk,
+            "LINUX.STAGE.COMMIT" => Self::LinuxStageCommit,
+            "LINUX.STAGE.CANCEL" => Self::LinuxStageCancel,
+            "LINUX.BUNDLE.LAUNCH" => Self::LinuxBundleLaunch,
             "LINUX.WINDOWS" => Self::LinuxWindows,
             "LINUX.WINDOW.INFO" => Self::LinuxWindowInfo,
             "LINUX.FRAME" => Self::LinuxFrame,
@@ -537,6 +557,38 @@ fn validate_command_arguments(
                 return Err(ValidationError::InvalidArgument);
             }
         }
+        KnownCommand::LinuxStageBegin => {
+            if parse_u64_argument(message, "instance").is_none()
+                || message.argument("bundle").is_none()
+                || parse_u64_argument(message, "size").is_none()
+                || message.argument("digest").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::LinuxStageChunk => {
+            if parse_u64_argument(message, "instance").is_none()
+                || parse_u64_argument(message, "offset").is_none()
+                || message.argument("data").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::LinuxStageCommit | KnownCommand::LinuxStageCancel
+            if parse_u64_argument(message, "instance").is_none() =>
+        {
+            return Err(ValidationError::InvalidArgument);
+        }
+        KnownCommand::LinuxBundleLaunch => {
+            if parse_u64_argument(message, "instance").is_none()
+                || message.argument("bundle").is_none()
+                || message.argument("entry").is_none()
+                || message.argument("user").is_none()
+                || message.argument("writable").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
         KnownCommand::LinuxWindows if parse_u64_argument(message, "instance").is_none() => {
             return Err(ValidationError::InvalidArgument);
         }
@@ -617,7 +669,8 @@ const fn command_contract(command: KnownCommand) -> (AllowedDestination, Message
         GuestStatus | GuestShutdown | GuestReboot => (Mochios, MessageType::Request),
         HostStatus | HostPoweroff | HostReboot => (Mboot, MessageType::Request),
         DeveloperBegin | DeveloperChunk | DeveloperCompile | DeveloperRead | DeveloperCancel
-        | LinuxLaunch | LinuxWindows | LinuxWindowInfo | LinuxFrame | LinuxInput
+        | LinuxLaunch | LinuxStageBegin | LinuxStageChunk | LinuxStageCommit | LinuxStageCancel
+        | LinuxBundleLaunch | LinuxWindows | LinuxWindowInfo | LinuxFrame | LinuxInput
         | LinuxConfigure | LinuxClose => (Mboot, MessageType::Request),
     }
 }
@@ -936,6 +989,11 @@ mod tests {
             | KnownCommand::DeveloperRead
             | KnownCommand::DeveloperCancel
             | KnownCommand::LinuxLaunch
+            | KnownCommand::LinuxStageBegin
+            | KnownCommand::LinuxStageChunk
+            | KnownCommand::LinuxStageCommit
+            | KnownCommand::LinuxStageCancel
+            | KnownCommand::LinuxBundleLaunch
             | KnownCommand::LinuxWindows
             | KnownCommand::LinuxWindowInfo
             | KnownCommand::LinuxFrame
@@ -979,6 +1037,30 @@ mod tests {
             KnownCommand::LinuxLaunch => alloc::vec![
                 Argument::new("application", "xterm"),
                 Argument::new("instance", "9"),
+            ],
+            KnownCommand::LinuxStageBegin => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("bundle", "org.example.editor"),
+                Argument::new("size", "4096"),
+                Argument::new(
+                    "digest",
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                ),
+            ],
+            KnownCommand::LinuxStageChunk => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("offset", "0"),
+                Argument::new("data", "00ff"),
+            ],
+            KnownCommand::LinuxStageCommit | KnownCommand::LinuxStageCancel => {
+                alloc::vec![Argument::new("instance", "9")]
+            }
+            KnownCommand::LinuxBundleLaunch => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("bundle", "org.example.editor"),
+                Argument::new("entry", "/usr/bin/editor"),
+                Argument::new("user", "alice"),
+                Argument::new("writable", "/usr/share/editor,/var/lib/editor"),
             ],
             KnownCommand::LinuxWindows => alloc::vec![Argument::new("instance", "9")],
             KnownCommand::LinuxWindowInfo | KnownCommand::LinuxClose => alloc::vec![

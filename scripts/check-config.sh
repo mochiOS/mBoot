@@ -181,6 +181,16 @@ grep -Fq 'BR2_PACKAGE_XTERM=y' configs/mboot_x86_64_defconfig.in ||
 	fail 'Linux GUI bridge test application is missing'
 grep -Fq 'BR2_PACKAGE_XSERVER_XORG_SERVER_XVFB=y' configs/mboot_x86_64_defconfig.in ||
 	fail 'Linux GUI bridge private X server is missing'
+for symbol in BR2_PACKAGE_UTIL_LINUX_MOUNT=y BR2_PACKAGE_UTIL_LINUX_MOUNTPOINT=y \
+	BR2_PACKAGE_UTIL_LINUX_LOSETUP=y BR2_PACKAGE_UTIL_LINUX_UNSHARE=y; do
+	grep -Fqx "$symbol" configs/mboot_x86_64_defconfig.in ||
+		fail "Linux application sandbox lacks $symbol"
+done
+for symbol in CONFIG_BLK_DEV_LOOP=y CONFIG_OVERLAY_FS=y CONFIG_SQUASHFS=y \
+	CONFIG_TMPFS=y; do
+	grep -Fqx "$symbol" board/mboot/linux.config.in ||
+		fail "Linux application sandbox kernel lacks $symbol"
+done
 grep -Fq 'MBOOT_LINUX_DISPLAY=:99' board/mboot/rootfs-overlay/etc/mboot.conf ||
 	fail 'Linux GUI bridge display is not isolated from the appliance display'
 grep -Fq 'MBOOT_LINUX_DISPLAY="$DISPLAY_NUMBER"' \

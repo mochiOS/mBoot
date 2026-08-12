@@ -1,5 +1,6 @@
 use crate::developer::{encode_hex, DeveloperBuildState, DeveloperError};
 use crate::linux::{LinuxBridge, LinuxError};
+use crate::linux_stage::{LinuxStageState, StageError};
 use crate::{GuestState, StateError};
 use mboot_protocol::{
     decode_line, encode_to_string, Argument, Body, Command, ConnectionValidator, Destination,
@@ -75,6 +76,7 @@ pub fn serve_connection(
     let mut validator = ConnectionValidator::new();
     let mut developer = DeveloperBuildState::default();
     let mut linux = LinuxBridge::default();
+    let mut linux_stage = LinuxStageState::default();
     let session = session_id();
     state.connected();
     println!("guest connected");
@@ -113,6 +115,7 @@ pub fn serve_connection(
             state,
             &mut developer,
             &mut linux,
+            &mut linux_stage,
             &message,
             &session,
             heartbeat_ms,
@@ -132,6 +135,7 @@ fn dispatch(
     state: &mut GuestState,
     developer: &mut DeveloperBuildState,
     linux: &mut LinuxBridge,
+    linux_stage: &mut LinuxStageState,
     message: &Message,
     session: &str,
     heartbeat_ms: u64,
@@ -264,6 +268,55 @@ fn dispatch(
             )?;
             Ok(vec![Argument::new("process", process.to_string())])
         }),
+        KnownCommand::LinuxStageBegin => stage_response(message, || {
+            let cached = linux_stage.begin(
+                stage_u64(message, "instance")?,
+                message
+                    .argument("bundle")
+                    .ok_or(StageError::InvalidArgument)?,
+                stage_u64(message, "size")?,
+                message
+                    .argument("digest")
+                    .ok_or(StageError::InvalidArgument)?,
+            )?;
+            Ok(vec![Argument::new("cached", u8::from(cached).to_string())])
+        }),
+        KnownCommand::LinuxStageChunk => stage_response(message, || {
+            linux_stage.append(
+                stage_u64(message, "instance")?,
+                stage_u64(message, "offset")?,
+                message
+                    .argument("data")
+                    .ok_or(StageError::InvalidArgument)?,
+            )?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxStageCommit => stage_response(message, || {
+            linux_stage.commit(stage_u64(message, "instance")?)?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxStageCancel => stage_response(message, || {
+            linux_stage.cancel(stage_u64(message, "instance")?)?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxBundleLaunch => linux_response(message, || {
+            let process = linux.launch_bundle(
+                linux_u64(message, "instance")?,
+                message
+                    .argument("bundle")
+                    .ok_or(LinuxError::InvalidArgument)?,
+                message
+                    .argument("entry")
+                    .ok_or(LinuxError::InvalidArgument)?,
+                message
+                    .argument("user")
+                    .ok_or(LinuxError::InvalidArgument)?,
+                message
+                    .argument("writable")
+                    .ok_or(LinuxError::InvalidArgument)?,
+            )?;
+            Ok(vec![Argument::new("process", process.to_string())])
+        }),
         KnownCommand::LinuxWindows => linux_response(message, || {
             let windows = linux.windows(linux_u64(message, "instance")?)?;
             let list = if windows.is_empty() {
@@ -335,6 +388,38 @@ fn dispatch(
         | KnownCommand::GuestShutdown
         | KnownCommand::GuestReboot => request_error(message, ErrorCode::InvalidCommand, None),
     }
+}
+
+fn stage_response(
+    message: &Message,
+    operation: impl FnOnce() -> Result<Vec<Argument>, StageError>,
+) -> Option<Message> {
+    match operation() {
+        Ok(arguments) => Some(Message::ok(
+            Destination::Mochios,
+            message.request_id,
+            arguments,
+        )),
+        Err(error) => request_error(message, stage_error_code(error), None),
+    }
+}
+
+fn stage_error_code(error: StageError) -> ErrorCode {
+    match error {
+        StageError::Busy => ErrorCode::Busy,
+        StageError::InvalidArgument => ErrorCode::InvalidArgument,
+        StageError::InvalidState => ErrorCode::InvalidState,
+        StageError::Integrity => ErrorCode::PermissionDenied,
+        StageError::Internal => ErrorCode::Internal,
+    }
+}
+
+fn stage_u64(message: &Message, key: &str) -> Result<u64, StageError> {
+    message
+        .argument(key)
+        .ok_or(StageError::InvalidArgument)?
+        .parse::<u64>()
+        .map_err(|_| StageError::InvalidArgument)
 }
 
 fn developer_response(
@@ -588,6 +673,7 @@ mod tests {
         };
         let mut developer = DeveloperBuildState::default();
         let mut linux = LinuxBridge::default();
+        let mut linux_stage = LinuxStageState::default();
         for command in [KnownCommand::HostPoweroff, KnownCommand::HostReboot] {
             let message = Message::command(
                 Destination::Mboot,
@@ -601,6 +687,7 @@ mod tests {
                     &mut state,
                     &mut developer,
                     &mut linux,
+                    &mut linux_stage,
                     &message,
                     "session",
                     5000,

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::env;
+use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::thread;
+use std::time::Duration;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
@@ -12,6 +15,8 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::CURRENT_TIME;
+
+use crate::linux_sandbox::{LinuxSandbox, SandboxError};
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FRAME_CHUNK: usize = 1536;
@@ -27,6 +32,22 @@ pub(crate) enum LinuxError {
 
 struct LinuxInstance {
     child: Child,
+    display: Option<InstanceDisplay>,
+    _sandbox: Option<LinuxSandbox>,
+}
+
+struct InstanceDisplay {
+    connection: RustConnection,
+    screen: usize,
+    _name: String,
+    xvfb: Child,
+}
+
+impl Drop for InstanceDisplay {
+    fn drop(&mut self) {
+        let _ = self.xvfb.kill();
+        let _ = self.xvfb.wait();
+    }
 }
 
 impl Drop for LinuxInstance {
@@ -98,17 +119,97 @@ impl LinuxBridge {
             .spawn()
             .map_err(|_| LinuxError::Internal)?;
         let pid = child.id();
-        self.instances.insert(instance, LinuxInstance { child });
+        self.instances.insert(
+            instance,
+            LinuxInstance {
+                child,
+                display: None,
+                _sandbox: None,
+            },
+        );
+        Ok(pid)
+    }
+
+    pub(crate) fn launch_bundle(
+        &mut self,
+        instance: u64,
+        bundle: &str,
+        entrypoint: &str,
+        user: &str,
+        writable: &str,
+    ) -> Result<u32, LinuxError> {
+        if instance == 0 || self.instances.contains_key(&instance) {
+            return Err(if instance == 0 {
+                LinuxError::InvalidArgument
+            } else {
+                LinuxError::Busy
+            });
+        }
+        let mut sandbox =
+            LinuxSandbox::prepare(instance, bundle, user, writable).map_err(sandbox_error)?;
+        let display_name = format!(":{}", 1000 + instance % 50_000);
+        let display_number = display_name
+            .strip_prefix(':')
+            .ok_or(LinuxError::InvalidArgument)?;
+        let socket = PathBuf::from(format!("/tmp/.X11-unix/X{display_number}"));
+        let mut xvfb = Command::new("Xvfb")
+            .arg(&display_name)
+            .args([
+                "-screen",
+                "0",
+                "1280x800x24",
+                "-nolisten",
+                "tcp",
+                "-noreset",
+                "-ac",
+            ])
+            .spawn()
+            .map_err(|_| LinuxError::Internal)?;
+        let (connection, screen) = match wait_for_display(&display_name, &socket, &mut xvfb) {
+            Ok(display) => display,
+            Err(error) => {
+                let _ = xvfb.kill();
+                let _ = xvfb.wait();
+                return Err(error);
+            }
+        };
+        if let Err(error) = sandbox.expose_x11(&socket) {
+            let _ = xvfb.kill();
+            let _ = xvfb.wait();
+            return Err(sandbox_error(error));
+        }
+        let child = match sandbox.launch(entrypoint, &display_name, instance) {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = xvfb.kill();
+                let _ = xvfb.wait();
+                return Err(sandbox_error(error));
+            }
+        };
+        let pid = child.id();
+        self.instances.insert(
+            instance,
+            LinuxInstance {
+                child,
+                display: Some(InstanceDisplay {
+                    connection,
+                    screen,
+                    _name: display_name,
+                    xvfb,
+                }),
+                _sandbox: Some(sandbox),
+            },
+        );
         Ok(pid)
     }
 
     pub(crate) fn windows(&mut self, instance: u64) -> Result<Vec<Window>, LinuxError> {
         let pid = self.live_pid(instance)?;
-        let connection = self.connection()?;
+        let (connection, screen_index) = self.connection_for(instance)?;
         let screen = connection
             .setup()
             .roots
-            .get(self.screen)
+            .get(screen_index)
             .ok_or(LinuxError::InvalidState)?;
         let pid_atom = connection
             .intern_atom(false, b"_NET_WM_PID")
@@ -150,7 +251,7 @@ impl LinuxBridge {
     ) -> Result<WindowInfo, LinuxError> {
         self.require_owned_window(instance, window)?;
         let (width, height, bytes, title) = {
-            let connection = self.connection()?;
+            let (connection, _) = self.connection_for(instance)?;
             let geometry = connection
                 .get_geometry(window)
                 .map_err(|_| LinuxError::NotFound)?
@@ -246,11 +347,11 @@ impl LinuxBridge {
         y: i16,
     ) -> Result<(), LinuxError> {
         self.require_owned_window(instance, window)?;
-        let connection = self.connection()?;
+        let (connection, screen_index) = self.connection_for(instance)?;
         let root = connection
             .setup()
             .roots
-            .get(self.screen)
+            .get(screen_index)
             .ok_or(LinuxError::InvalidState)?
             .root;
         let translated = connection
@@ -340,7 +441,7 @@ impl LinuxBridge {
             return Err(LinuxError::InvalidArgument);
         }
         self.require_owned_window(instance, window)?;
-        let connection = self.connection()?;
+        let (connection, _) = self.connection_for(instance)?;
         connection
             .configure_window(
                 window,
@@ -354,7 +455,7 @@ impl LinuxBridge {
 
     pub(crate) fn close(&mut self, instance: u64, window: Window) -> Result<(), LinuxError> {
         self.require_owned_window(instance, window)?;
-        let connection = self.connection()?;
+        let (connection, _) = self.connection_for(instance)?;
         let wm_protocols = connection
             .intern_atom(false, b"WM_PROTOCOLS")
             .map_err(|_| LinuxError::Internal)?
@@ -376,6 +477,17 @@ impl LinuxBridge {
 
     fn connection(&self) -> Result<&RustConnection, LinuxError> {
         self.connection.as_ref().ok_or(LinuxError::InvalidState)
+    }
+
+    fn connection_for(&self, instance: u64) -> Result<(&RustConnection, usize), LinuxError> {
+        match self
+            .instances
+            .get(&instance)
+            .and_then(|instance| instance.display.as_ref())
+        {
+            Some(display) => Ok((&display.connection, display.screen)),
+            None => Ok((self.connection()?, self.screen)),
+        }
     }
 
     fn live_pid(&mut self, instance: u64) -> Result<u32, LinuxError> {
@@ -442,6 +554,33 @@ fn connect_display(display: &str) -> Result<(Option<RustConnection>, usize), Lin
         .map_err(|_| LinuxError::InvalidState)?;
     connection.flush().map_err(|_| LinuxError::InvalidState)?;
     Ok((Some(connection), screen))
+}
+
+fn wait_for_display(
+    display: &str,
+    socket: &std::path::Path,
+    xvfb: &mut Child,
+) -> Result<(RustConnection, usize), LinuxError> {
+    for _ in 0..100 {
+        if xvfb.try_wait().map_err(|_| LinuxError::Internal)?.is_some() {
+            return Err(LinuxError::Internal);
+        }
+        if socket.exists() {
+            if let Ok((Some(connection), screen)) = connect_display(display) {
+                return Ok((connection, screen));
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(LinuxError::Internal)
+}
+
+fn sandbox_error(error: SandboxError) -> LinuxError {
+    match error {
+        SandboxError::InvalidArgument => LinuxError::InvalidArgument,
+        SandboxError::NotFound => LinuxError::NotFound,
+        SandboxError::Internal => LinuxError::Internal,
+    }
 }
 
 fn window_matches_instance(
