@@ -211,6 +211,9 @@ impl LinuxSandbox {
             if !valid_absolute_path(&portal.target) || !portal.source.is_dir() {
                 return Err(SandboxError::InvalidArgument);
             }
+            if portal.writable {
+                set_sandbox_owner(&portal.source)?;
+            }
             let destination = target.join(&portal.target[1..]);
             fs::create_dir_all(&destination).map_err(|_| SandboxError::Internal)?;
             run_mount(["--bind", path_str(&portal.source)?, path_str(&destination)?])?;

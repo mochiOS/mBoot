@@ -1,6 +1,6 @@
 use crate::developer::{DeveloperBuildState, DeveloperError, encode_hex};
 use crate::linux::{LinuxBridge, LinuxError};
-use crate::linux_portal::{LinuxPortalState, PortalError, decode_path};
+use crate::linux_portal::{ExportKind, LinuxPortalState, PortalError, decode_path};
 use crate::linux_stage::{LinuxStageState, StageError};
 use crate::{GuestState, StateError};
 use mboot_protocol::{
@@ -323,6 +323,7 @@ fn dispatch(
                 portal_u64(message, "grant")?,
                 writable,
                 &path,
+                portal_u32(message, "mode")?,
             )?;
             Ok(Vec::new())
         }),
@@ -336,6 +337,7 @@ fn dispatch(
                 portal_u64(message, "instance")?,
                 portal_u64(message, "grant")?,
                 &path,
+                portal_u32(message, "mode")?,
             )?;
             Ok(Vec::new())
         }),
@@ -350,6 +352,7 @@ fn dispatch(
                 portal_u64(message, "grant")?,
                 &path,
                 portal_u64(message, "size")?,
+                portal_u32(message, "mode")?,
             )?;
             Ok(Vec::new())
         }),
@@ -369,6 +372,61 @@ fn dispatch(
         }),
         KnownCommand::LinuxPortalFileCancel => portal_response(message, || {
             linux_portal.cancel_file(portal_u64(message, "instance")?)?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxPortalRelease => portal_response(message, || {
+            linux_portal.release(portal_u64(message, "instance")?)?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxPortalExportBegin => portal_response(message, || {
+            let (entries, mode) = linux_portal.begin_export(
+                portal_u64(message, "instance")?,
+                portal_u64(message, "grant")?,
+            )?;
+            Ok(vec![
+                Argument::new("entries", entries.to_string()),
+                Argument::new("mode", mode.to_string()),
+            ])
+        }),
+        KnownCommand::LinuxPortalExportEntry => portal_response(message, || {
+            let entry = linux_portal.export_entry(
+                portal_u64(message, "instance")?,
+                portal_usize(message, "index")?,
+            )?;
+            Ok(vec![
+                Argument::new(
+                    "kind",
+                    match entry.kind {
+                        ExportKind::Directory => "directory",
+                        ExportKind::File => "file",
+                    },
+                ),
+                Argument::new("path", encode_hex(entry.path.as_bytes())),
+                Argument::new("size", entry.size.to_string()),
+                Argument::new("mode", entry.mode.to_string()),
+            ])
+        }),
+        KnownCommand::LinuxPortalExportChunk => portal_response(message, || {
+            let (total_size, bytes) = linux_portal.export_chunk(
+                portal_u64(message, "instance")?,
+                portal_usize(message, "index")?,
+                portal_u64(message, "offset")?,
+                portal_usize(message, "maximum")?,
+            )?;
+            Ok(vec![
+                Argument::new("total_size", total_size.to_string()),
+                Argument::new(
+                    "data",
+                    if bytes.is_empty() {
+                        "none".to_string()
+                    } else {
+                        encode_hex(&bytes)
+                    },
+                ),
+            ])
+        }),
+        KnownCommand::LinuxPortalExportEnd => portal_response(message, || {
+            linux_portal.end_export(portal_u64(message, "instance")?)?;
             Ok(Vec::new())
         }),
         KnownCommand::LinuxBundleLaunch => linux_response(message, || {
@@ -522,6 +580,22 @@ fn portal_error_code(error: PortalError) -> ErrorCode {
 }
 
 fn portal_u64(message: &Message, key: &str) -> Result<u64, PortalError> {
+    message
+        .argument(key)
+        .ok_or(PortalError::InvalidArgument)?
+        .parse()
+        .map_err(|_| PortalError::InvalidArgument)
+}
+
+fn portal_usize(message: &Message, key: &str) -> Result<usize, PortalError> {
+    message
+        .argument(key)
+        .ok_or(PortalError::InvalidArgument)?
+        .parse()
+        .map_err(|_| PortalError::InvalidArgument)
+}
+
+fn portal_u32(message: &Message, key: &str) -> Result<u32, PortalError> {
     message
         .argument(key)
         .ok_or(PortalError::InvalidArgument)?

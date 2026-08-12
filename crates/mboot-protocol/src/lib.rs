@@ -77,6 +77,11 @@ pub enum KnownCommand {
     LinuxPortalFileChunk,
     LinuxPortalFileCommit,
     LinuxPortalFileCancel,
+    LinuxPortalRelease,
+    LinuxPortalExportBegin,
+    LinuxPortalExportEntry,
+    LinuxPortalExportChunk,
+    LinuxPortalExportEnd,
     LinuxBundleLaunch,
     LinuxWindows,
     LinuxWindowInfo,
@@ -87,7 +92,7 @@ pub enum KnownCommand {
 }
 
 impl KnownCommand {
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 43] = [
         Self::ProtocolSync,
         Self::ProtocolHello,
         Self::ProtocolWelcome,
@@ -119,6 +124,11 @@ impl KnownCommand {
         Self::LinuxPortalFileChunk,
         Self::LinuxPortalFileCommit,
         Self::LinuxPortalFileCancel,
+        Self::LinuxPortalRelease,
+        Self::LinuxPortalExportBegin,
+        Self::LinuxPortalExportEntry,
+        Self::LinuxPortalExportChunk,
+        Self::LinuxPortalExportEnd,
         Self::LinuxBundleLaunch,
         Self::LinuxWindows,
         Self::LinuxWindowInfo,
@@ -161,6 +171,11 @@ impl KnownCommand {
             Self::LinuxPortalFileChunk => "LINUX.PORTAL.FILE.CHUNK",
             Self::LinuxPortalFileCommit => "LINUX.PORTAL.FILE.COMMIT",
             Self::LinuxPortalFileCancel => "LINUX.PORTAL.FILE.CANCEL",
+            Self::LinuxPortalRelease => "LINUX.PORTAL.RELEASE",
+            Self::LinuxPortalExportBegin => "LINUX.PORTAL.EXPORT.BEGIN",
+            Self::LinuxPortalExportEntry => "LINUX.PORTAL.EXPORT.ENTRY",
+            Self::LinuxPortalExportChunk => "LINUX.PORTAL.EXPORT.CHUNK",
+            Self::LinuxPortalExportEnd => "LINUX.PORTAL.EXPORT.END",
             Self::LinuxBundleLaunch => "LINUX.BUNDLE.LAUNCH",
             Self::LinuxWindows => "LINUX.WINDOWS",
             Self::LinuxWindowInfo => "LINUX.WINDOW.INFO",
@@ -204,6 +219,11 @@ impl KnownCommand {
             "LINUX.PORTAL.FILE.CHUNK" => Self::LinuxPortalFileChunk,
             "LINUX.PORTAL.FILE.COMMIT" => Self::LinuxPortalFileCommit,
             "LINUX.PORTAL.FILE.CANCEL" => Self::LinuxPortalFileCancel,
+            "LINUX.PORTAL.RELEASE" => Self::LinuxPortalRelease,
+            "LINUX.PORTAL.EXPORT.BEGIN" => Self::LinuxPortalExportBegin,
+            "LINUX.PORTAL.EXPORT.ENTRY" => Self::LinuxPortalExportEntry,
+            "LINUX.PORTAL.EXPORT.CHUNK" => Self::LinuxPortalExportChunk,
+            "LINUX.PORTAL.EXPORT.END" => Self::LinuxPortalExportEnd,
             "LINUX.BUNDLE.LAUNCH" => Self::LinuxBundleLaunch,
             "LINUX.WINDOWS" => Self::LinuxWindows,
             "LINUX.WINDOW.INFO" => Self::LinuxWindowInfo,
@@ -610,6 +630,8 @@ fn validate_command_arguments(
         KnownCommand::LinuxPortalReset
         | KnownCommand::LinuxPortalFileCommit
         | KnownCommand::LinuxPortalFileCancel
+        | KnownCommand::LinuxPortalRelease
+        | KnownCommand::LinuxPortalExportEnd
             if parse_u64_argument(message, "instance").is_none() =>
         {
             return Err(ValidationError::InvalidArgument);
@@ -619,6 +641,7 @@ fn validate_command_arguments(
                 || parse_u64_argument(message, "grant").is_none()
                 || !matches!(message.argument("access"), Some("read" | "write"))
                 || message.argument("path").is_none()
+                || parse_u64_argument(message, "mode").is_none()
             {
                 return Err(ValidationError::InvalidArgument);
             }
@@ -627,6 +650,7 @@ fn validate_command_arguments(
             if parse_u64_argument(message, "instance").is_none()
                 || parse_u64_argument(message, "grant").is_none()
                 || message.argument("path").is_none()
+                || parse_u64_argument(message, "mode").is_none()
             {
                 return Err(ValidationError::InvalidArgument);
             }
@@ -636,6 +660,7 @@ fn validate_command_arguments(
                 || parse_u64_argument(message, "grant").is_none()
                 || parse_u64_argument(message, "size").is_none()
                 || message.argument("path").is_none()
+                || parse_u64_argument(message, "mode").is_none()
             {
                 return Err(ValidationError::InvalidArgument);
             }
@@ -644,6 +669,29 @@ fn validate_command_arguments(
             if parse_u64_argument(message, "instance").is_none()
                 || parse_u64_argument(message, "offset").is_none()
                 || message.argument("data").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::LinuxPortalExportBegin => {
+            if parse_u64_argument(message, "instance").is_none()
+                || parse_u64_argument(message, "grant").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::LinuxPortalExportEntry => {
+            if parse_u64_argument(message, "instance").is_none()
+                || parse_u64_argument(message, "index").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::LinuxPortalExportChunk => {
+            if parse_u64_argument(message, "instance").is_none()
+                || parse_u64_argument(message, "index").is_none()
+                || parse_u64_argument(message, "offset").is_none()
+                || parse_u64_argument(message, "maximum").is_none()
             {
                 return Err(ValidationError::InvalidArgument);
             }
@@ -754,6 +802,11 @@ const fn command_contract(command: KnownCommand) -> (AllowedDestination, Message
         | LinuxPortalFileChunk
         | LinuxPortalFileCommit
         | LinuxPortalFileCancel
+        | LinuxPortalRelease
+        | LinuxPortalExportBegin
+        | LinuxPortalExportEntry
+        | LinuxPortalExportChunk
+        | LinuxPortalExportEnd
         | LinuxBundleLaunch
         | LinuxWindows
         | LinuxWindowInfo
@@ -1089,6 +1142,11 @@ mod tests {
             | KnownCommand::LinuxPortalFileChunk
             | KnownCommand::LinuxPortalFileCommit
             | KnownCommand::LinuxPortalFileCancel
+            | KnownCommand::LinuxPortalRelease
+            | KnownCommand::LinuxPortalExportBegin
+            | KnownCommand::LinuxPortalExportEntry
+            | KnownCommand::LinuxPortalExportChunk
+            | KnownCommand::LinuxPortalExportEnd
             | KnownCommand::LinuxBundleLaunch
             | KnownCommand::LinuxWindows
             | KnownCommand::LinuxWindowInfo
@@ -1153,7 +1211,9 @@ mod tests {
             }
             KnownCommand::LinuxPortalReset
             | KnownCommand::LinuxPortalFileCommit
-            | KnownCommand::LinuxPortalFileCancel => {
+            | KnownCommand::LinuxPortalFileCancel
+            | KnownCommand::LinuxPortalRelease
+            | KnownCommand::LinuxPortalExportEnd => {
                 alloc::vec![Argument::new("instance", "9")]
             }
             KnownCommand::LinuxPortalGrant => alloc::vec![
@@ -1161,22 +1221,37 @@ mod tests {
                 Argument::new("grant", "12"),
                 Argument::new("access", "read"),
                 Argument::new("path", "2f686f6d652f616c696365"),
+                Argument::new("mode", "493"),
             ],
             KnownCommand::LinuxPortalMkdir => alloc::vec![
                 Argument::new("instance", "9"),
                 Argument::new("grant", "12"),
                 Argument::new("path", "2f686f6d652f616c6963652f446576656c6f70"),
+                Argument::new("mode", "493"),
             ],
             KnownCommand::LinuxPortalFileBegin => alloc::vec![
                 Argument::new("instance", "9"),
                 Argument::new("grant", "12"),
                 Argument::new("path", "2f686f6d652f616c6963652f446576656c6f702f612e747874"),
                 Argument::new("size", "3"),
+                Argument::new("mode", "420"),
             ],
             KnownCommand::LinuxPortalFileChunk => alloc::vec![
                 Argument::new("instance", "9"),
                 Argument::new("offset", "0"),
                 Argument::new("data", "616263"),
+            ],
+            KnownCommand::LinuxPortalExportBegin => {
+                alloc::vec![Argument::new("instance", "9"), Argument::new("grant", "12"),]
+            }
+            KnownCommand::LinuxPortalExportEntry => {
+                alloc::vec![Argument::new("instance", "9"), Argument::new("index", "0"),]
+            }
+            KnownCommand::LinuxPortalExportChunk => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("index", "0"),
+                Argument::new("offset", "0"),
+                Argument::new("maximum", "1024"),
             ],
             KnownCommand::LinuxBundleLaunch => alloc::vec![
                 Argument::new("instance", "9"),

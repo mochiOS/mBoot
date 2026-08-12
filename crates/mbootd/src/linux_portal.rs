@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 const PORTAL_ROOT: &str = "/run/mboot/linux-portal";
@@ -24,6 +25,21 @@ pub(crate) struct PortalMount {
     pub(crate) writable: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExportKind {
+    Directory,
+    File,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExportEntry {
+    pub(crate) kind: ExportKind,
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) mode: u32,
+    source: PathBuf,
+}
+
 struct Grant {
     instance: u64,
     id: u64,
@@ -34,23 +50,30 @@ struct Grant {
 struct Transaction {
     instance: u64,
     expected_size: u64,
+    mode: u32,
     written: u64,
     temporary: PathBuf,
     destination: PathBuf,
     file: File,
 }
 
+struct Export {
+    instance: u64,
+    entries: Vec<ExportEntry>,
+}
+
 #[derive(Default)]
 pub(crate) struct LinuxPortalState {
     grants: Vec<Grant>,
     transaction: Option<Transaction>,
+    export: Option<Export>,
     entries: usize,
     total_size: u64,
 }
 
 impl LinuxPortalState {
     pub(crate) fn reset(&mut self, instance: u64) -> Result<(), PortalError> {
-        if instance == 0 || self.transaction.is_some() {
+        if instance == 0 || self.transaction.is_some() || self.export.is_some() {
             return Err(if instance == 0 {
                 PortalError::InvalidArgument
             } else {
@@ -74,22 +97,31 @@ impl LinuxPortalState {
         id: u64,
         writable: bool,
         path: &str,
+        mode: u32,
     ) -> Result<(), PortalError> {
         if instance == 0
             || id == 0
             || !valid_absolute_path(path)
             || self.grants.len() >= MAX_GRANTS
             || self.grants.iter().any(|grant| grant.id == id)
+            || mode > 0o777
             || self
                 .grants
                 .iter()
                 .filter(|grant| grant.instance == instance)
                 .any(|grant| paths_overlap(&grant.path, path))
+            || (writable
+                && self
+                    .grants
+                    .iter()
+                    .any(|grant| grant.writable && paths_overlap(&grant.path, path)))
         {
             return Err(PortalError::InvalidArgument);
         }
         let destination = staged_path(instance, path)?;
         fs::create_dir_all(&destination).map_err(|_| PortalError::Internal)?;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(mode))
+            .map_err(|_| PortalError::Internal)?;
         self.grants.push(Grant {
             instance,
             id,
@@ -104,10 +136,17 @@ impl LinuxPortalState {
         instance: u64,
         grant: u64,
         path: &str,
+        mode: u32,
     ) -> Result<(), PortalError> {
         self.validate_entry(instance, grant, path)?;
+        if mode > 0o777 {
+            return Err(PortalError::InvalidArgument);
+        }
         self.reserve_entry()?;
-        fs::create_dir_all(staged_path(instance, path)?).map_err(|_| PortalError::Internal)
+        let destination = staged_path(instance, path)?;
+        fs::create_dir_all(&destination).map_err(|_| PortalError::Internal)?;
+        fs::set_permissions(destination, fs::Permissions::from_mode(mode))
+            .map_err(|_| PortalError::Internal)
     }
 
     pub(crate) fn begin_file(
@@ -116,12 +155,16 @@ impl LinuxPortalState {
         grant: u64,
         path: &str,
         size: u64,
+        mode: u32,
     ) -> Result<(), PortalError> {
         if self.transaction.is_some() {
             return Err(PortalError::Busy);
         }
         self.validate_entry(instance, grant, path)?;
-        if size > MAX_FILE_SIZE || self.total_size.saturating_add(size) > MAX_TOTAL_SIZE {
+        if size > MAX_FILE_SIZE
+            || mode > 0o777
+            || self.total_size.saturating_add(size) > MAX_TOTAL_SIZE
+        {
             return Err(PortalError::InvalidArgument);
         }
         self.reserve_entry()?;
@@ -143,6 +186,7 @@ impl LinuxPortalState {
         self.transaction = Some(Transaction {
             instance,
             expected_size: size,
+            mode,
             written: 0,
             temporary,
             destination,
@@ -192,6 +236,11 @@ impl LinuxPortalState {
             .map_err(|_| PortalError::Internal)?;
         fs::rename(&transaction.temporary, &transaction.destination)
             .map_err(|_| PortalError::Internal)?;
+        fs::set_permissions(
+            &transaction.destination,
+            fs::Permissions::from_mode(transaction.mode),
+        )
+        .map_err(|_| PortalError::Internal)?;
         self.total_size += transaction.expected_size;
         Ok(())
     }
@@ -217,6 +266,110 @@ impl LinuxPortalState {
                 })
             })
             .collect()
+    }
+
+    pub(crate) fn release(&mut self, instance: u64) -> Result<(), PortalError> {
+        if instance == 0
+            || self
+                .transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.instance == instance)
+            || self
+                .export
+                .as_ref()
+                .is_some_and(|export| export.instance == instance)
+        {
+            return Err(PortalError::Busy);
+        }
+        let root = instance_root(instance);
+        if root.exists() {
+            fs::remove_dir_all(root).map_err(|_| PortalError::Internal)?;
+        }
+        self.grants.retain(|grant| grant.instance != instance);
+        Ok(())
+    }
+
+    pub(crate) fn begin_export(
+        &mut self,
+        instance: u64,
+        grant_id: u64,
+    ) -> Result<(usize, u32), PortalError> {
+        if self
+            .export
+            .as_ref()
+            .is_some_and(|export| export.instance != instance)
+        {
+            return Err(PortalError::Busy);
+        }
+        self.export = None;
+        let grant = self
+            .grants
+            .iter()
+            .find(|grant| grant.instance == instance && grant.id == grant_id && grant.writable)
+            .ok_or(PortalError::InvalidState)?;
+        let root = staged_path(instance, &grant.path)?;
+        let root_mode = fs::symlink_metadata(&root)
+            .map_err(|_| PortalError::Internal)?
+            .permissions()
+            .mode()
+            & 0o777;
+        let mut entries = Vec::new();
+        let mut total_size = 0u64;
+        collect_export_entries(&root, &root, &mut entries, &mut total_size)?;
+        self.export = Some(Export { instance, entries });
+        Ok((
+            self.export
+                .as_ref()
+                .map_or(0, |export| export.entries.len()),
+            root_mode,
+        ))
+    }
+
+    pub(crate) fn export_entry(
+        &self,
+        instance: u64,
+        index: usize,
+    ) -> Result<&ExportEntry, PortalError> {
+        self.export
+            .as_ref()
+            .filter(|export| export.instance == instance)
+            .and_then(|export| export.entries.get(index))
+            .ok_or(PortalError::InvalidState)
+    }
+
+    pub(crate) fn export_chunk(
+        &self,
+        instance: u64,
+        index: usize,
+        offset: u64,
+        maximum: usize,
+    ) -> Result<(u64, Vec<u8>), PortalError> {
+        let entry = self.export_entry(instance, index)?;
+        if entry.kind != ExportKind::File
+            || offset > entry.size
+            || maximum == 0
+            || maximum > MAX_CHUNK_SIZE
+        {
+            return Err(PortalError::InvalidArgument);
+        }
+        let remaining = entry.size.saturating_sub(offset);
+        let count = remaining.min(maximum as u64) as usize;
+        let mut bytes = vec![0u8; count];
+        let mut file = File::open(&entry.source).map_err(|_| PortalError::Internal)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| PortalError::Internal)?;
+        file.read_exact(&mut bytes)
+            .map_err(|_| PortalError::Internal)?;
+        Ok((entry.size, bytes))
+    }
+
+    pub(crate) fn end_export(&mut self, instance: u64) -> Result<(), PortalError> {
+        let export = self.export.take().ok_or(PortalError::InvalidState)?;
+        if export.instance != instance {
+            self.export = Some(export);
+            return Err(PortalError::InvalidState);
+        }
+        Ok(())
     }
 
     fn validate_entry(&self, instance: u64, grant: u64, path: &str) -> Result<(), PortalError> {
@@ -253,6 +406,60 @@ impl Drop for LinuxPortalState {
             let _ = fs::remove_file(transaction.temporary);
         }
     }
+}
+
+fn collect_export_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<ExportEntry>,
+    total_size: &mut u64,
+) -> Result<(), PortalError> {
+    let mut children = fs::read_dir(directory)
+        .map_err(|_| PortalError::Internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| PortalError::Internal)?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        if entries.len() >= MAX_ENTRIES {
+            return Err(PortalError::InvalidArgument);
+        }
+        let source = child.path();
+        let metadata = fs::symlink_metadata(&source).map_err(|_| PortalError::Internal)?;
+        let relative = source
+            .strip_prefix(root)
+            .map_err(|_| PortalError::InvalidState)?
+            .to_str()
+            .ok_or(PortalError::InvalidArgument)?
+            .to_string();
+        if metadata.file_type().is_symlink() {
+            return Err(PortalError::InvalidArgument);
+        }
+        if metadata.is_dir() {
+            entries.push(ExportEntry {
+                kind: ExportKind::Directory,
+                path: relative,
+                size: 0,
+                mode: metadata.permissions().mode() & 0o777,
+                source: source.clone(),
+            });
+            collect_export_entries(root, &source, entries, total_size)?;
+        } else if metadata.is_file() && metadata.len() <= MAX_FILE_SIZE {
+            *total_size = total_size.saturating_add(metadata.len());
+            if *total_size > MAX_TOTAL_SIZE {
+                return Err(PortalError::InvalidArgument);
+            }
+            entries.push(ExportEntry {
+                kind: ExportKind::File,
+                path: relative,
+                size: metadata.len(),
+                mode: metadata.permissions().mode() & 0o777,
+                source,
+            });
+        } else {
+            return Err(PortalError::InvalidArgument);
+        }
+    }
+    Ok(())
 }
 
 fn instance_root(instance: u64) -> PathBuf {
