@@ -70,6 +70,13 @@ pub enum KnownCommand {
     LinuxStageChunk,
     LinuxStageCommit,
     LinuxStageCancel,
+    LinuxPortalReset,
+    LinuxPortalGrant,
+    LinuxPortalMkdir,
+    LinuxPortalFileBegin,
+    LinuxPortalFileChunk,
+    LinuxPortalFileCommit,
+    LinuxPortalFileCancel,
     LinuxBundleLaunch,
     LinuxWindows,
     LinuxWindowInfo,
@@ -80,7 +87,7 @@ pub enum KnownCommand {
 }
 
 impl KnownCommand {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 38] = [
         Self::ProtocolSync,
         Self::ProtocolHello,
         Self::ProtocolWelcome,
@@ -105,6 +112,13 @@ impl KnownCommand {
         Self::LinuxStageChunk,
         Self::LinuxStageCommit,
         Self::LinuxStageCancel,
+        Self::LinuxPortalReset,
+        Self::LinuxPortalGrant,
+        Self::LinuxPortalMkdir,
+        Self::LinuxPortalFileBegin,
+        Self::LinuxPortalFileChunk,
+        Self::LinuxPortalFileCommit,
+        Self::LinuxPortalFileCancel,
         Self::LinuxBundleLaunch,
         Self::LinuxWindows,
         Self::LinuxWindowInfo,
@@ -140,6 +154,13 @@ impl KnownCommand {
             Self::LinuxStageChunk => "LINUX.STAGE.CHUNK",
             Self::LinuxStageCommit => "LINUX.STAGE.COMMIT",
             Self::LinuxStageCancel => "LINUX.STAGE.CANCEL",
+            Self::LinuxPortalReset => "LINUX.PORTAL.RESET",
+            Self::LinuxPortalGrant => "LINUX.PORTAL.GRANT",
+            Self::LinuxPortalMkdir => "LINUX.PORTAL.MKDIR",
+            Self::LinuxPortalFileBegin => "LINUX.PORTAL.FILE.BEGIN",
+            Self::LinuxPortalFileChunk => "LINUX.PORTAL.FILE.CHUNK",
+            Self::LinuxPortalFileCommit => "LINUX.PORTAL.FILE.COMMIT",
+            Self::LinuxPortalFileCancel => "LINUX.PORTAL.FILE.CANCEL",
             Self::LinuxBundleLaunch => "LINUX.BUNDLE.LAUNCH",
             Self::LinuxWindows => "LINUX.WINDOWS",
             Self::LinuxWindowInfo => "LINUX.WINDOW.INFO",
@@ -176,6 +197,13 @@ impl KnownCommand {
             "LINUX.STAGE.CHUNK" => Self::LinuxStageChunk,
             "LINUX.STAGE.COMMIT" => Self::LinuxStageCommit,
             "LINUX.STAGE.CANCEL" => Self::LinuxStageCancel,
+            "LINUX.PORTAL.RESET" => Self::LinuxPortalReset,
+            "LINUX.PORTAL.GRANT" => Self::LinuxPortalGrant,
+            "LINUX.PORTAL.MKDIR" => Self::LinuxPortalMkdir,
+            "LINUX.PORTAL.FILE.BEGIN" => Self::LinuxPortalFileBegin,
+            "LINUX.PORTAL.FILE.CHUNK" => Self::LinuxPortalFileChunk,
+            "LINUX.PORTAL.FILE.COMMIT" => Self::LinuxPortalFileCommit,
+            "LINUX.PORTAL.FILE.CANCEL" => Self::LinuxPortalFileCancel,
             "LINUX.BUNDLE.LAUNCH" => Self::LinuxBundleLaunch,
             "LINUX.WINDOWS" => Self::LinuxWindows,
             "LINUX.WINDOW.INFO" => Self::LinuxWindowInfo,
@@ -449,13 +477,13 @@ pub fn validate_message(message: &Message) -> Result<(), ValidationError> {
     }
     match message.message_type {
         MessageType::Event if message.request_id != 0 => {
-            return Err(ValidationError::InvalidRequestId)
+            return Err(ValidationError::InvalidRequestId);
         }
         MessageType::Request if message.request_id == 0 => {
-            return Err(ValidationError::InvalidRequestId)
+            return Err(ValidationError::InvalidRequestId);
         }
         MessageType::Response if message.request_id == 0 => {
-            return Err(ValidationError::InvalidRequestId)
+            return Err(ValidationError::InvalidRequestId);
         }
         _ => {}
     }
@@ -472,7 +500,7 @@ pub fn validate_message(message: &Message) -> Result<(), ValidationError> {
                 Ok(())
             } else {
                 Err(ValidationError::InvalidMessageType)
-            }
+            };
         }
     };
 
@@ -579,6 +607,47 @@ fn validate_command_arguments(
         {
             return Err(ValidationError::InvalidArgument);
         }
+        KnownCommand::LinuxPortalReset
+        | KnownCommand::LinuxPortalFileCommit
+        | KnownCommand::LinuxPortalFileCancel
+            if parse_u64_argument(message, "instance").is_none() =>
+        {
+            return Err(ValidationError::InvalidArgument);
+        }
+        KnownCommand::LinuxPortalGrant => {
+            if parse_u64_argument(message, "instance").is_none()
+                || parse_u64_argument(message, "grant").is_none()
+                || !matches!(message.argument("access"), Some("read" | "write"))
+                || message.argument("path").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::LinuxPortalMkdir => {
+            if parse_u64_argument(message, "instance").is_none()
+                || parse_u64_argument(message, "grant").is_none()
+                || message.argument("path").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::LinuxPortalFileBegin => {
+            if parse_u64_argument(message, "instance").is_none()
+                || parse_u64_argument(message, "grant").is_none()
+                || parse_u64_argument(message, "size").is_none()
+                || message.argument("path").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::LinuxPortalFileChunk => {
+            if parse_u64_argument(message, "instance").is_none()
+                || parse_u64_argument(message, "offset").is_none()
+                || message.argument("data").is_none()
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
         KnownCommand::LinuxBundleLaunch => {
             if parse_u64_argument(message, "instance").is_none()
                 || message.argument("bundle").is_none()
@@ -668,10 +737,30 @@ const fn command_contract(command: KnownCommand) -> (AllowedDestination, Message
         GuestReady | GuestHeartbeat | GuestStopping | GuestPanic => (Mboot, MessageType::Event),
         GuestStatus | GuestShutdown | GuestReboot => (Mochios, MessageType::Request),
         HostStatus | HostPoweroff | HostReboot => (Mboot, MessageType::Request),
-        DeveloperBegin | DeveloperChunk | DeveloperCompile | DeveloperRead | DeveloperCancel
-        | LinuxLaunch | LinuxStageBegin | LinuxStageChunk | LinuxStageCommit | LinuxStageCancel
-        | LinuxBundleLaunch | LinuxWindows | LinuxWindowInfo | LinuxFrame | LinuxInput
-        | LinuxConfigure | LinuxClose => (Mboot, MessageType::Request),
+        DeveloperBegin
+        | DeveloperChunk
+        | DeveloperCompile
+        | DeveloperRead
+        | DeveloperCancel
+        | LinuxLaunch
+        | LinuxStageBegin
+        | LinuxStageChunk
+        | LinuxStageCommit
+        | LinuxStageCancel
+        | LinuxPortalReset
+        | LinuxPortalGrant
+        | LinuxPortalMkdir
+        | LinuxPortalFileBegin
+        | LinuxPortalFileChunk
+        | LinuxPortalFileCommit
+        | LinuxPortalFileCancel
+        | LinuxBundleLaunch
+        | LinuxWindows
+        | LinuxWindowInfo
+        | LinuxFrame
+        | LinuxInput
+        | LinuxConfigure
+        | LinuxClose => (Mboot, MessageType::Request),
     }
 }
 
@@ -993,6 +1082,13 @@ mod tests {
             | KnownCommand::LinuxStageChunk
             | KnownCommand::LinuxStageCommit
             | KnownCommand::LinuxStageCancel
+            | KnownCommand::LinuxPortalReset
+            | KnownCommand::LinuxPortalGrant
+            | KnownCommand::LinuxPortalMkdir
+            | KnownCommand::LinuxPortalFileBegin
+            | KnownCommand::LinuxPortalFileChunk
+            | KnownCommand::LinuxPortalFileCommit
+            | KnownCommand::LinuxPortalFileCancel
             | KnownCommand::LinuxBundleLaunch
             | KnownCommand::LinuxWindows
             | KnownCommand::LinuxWindowInfo
@@ -1055,6 +1151,33 @@ mod tests {
             KnownCommand::LinuxStageCommit | KnownCommand::LinuxStageCancel => {
                 alloc::vec![Argument::new("instance", "9")]
             }
+            KnownCommand::LinuxPortalReset
+            | KnownCommand::LinuxPortalFileCommit
+            | KnownCommand::LinuxPortalFileCancel => {
+                alloc::vec![Argument::new("instance", "9")]
+            }
+            KnownCommand::LinuxPortalGrant => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("grant", "12"),
+                Argument::new("access", "read"),
+                Argument::new("path", "2f686f6d652f616c696365"),
+            ],
+            KnownCommand::LinuxPortalMkdir => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("grant", "12"),
+                Argument::new("path", "2f686f6d652f616c6963652f446576656c6f70"),
+            ],
+            KnownCommand::LinuxPortalFileBegin => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("grant", "12"),
+                Argument::new("path", "2f686f6d652f616c6963652f446576656c6f702f612e747874"),
+                Argument::new("size", "3"),
+            ],
+            KnownCommand::LinuxPortalFileChunk => alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("offset", "0"),
+                Argument::new("data", "616263"),
+            ],
             KnownCommand::LinuxBundleLaunch => alloc::vec![
                 Argument::new("instance", "9"),
                 Argument::new("bundle", "org.example.editor"),

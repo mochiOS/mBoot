@@ -5,17 +5,18 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::Duration;
 
+use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
 use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
 use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, ImageFormat,
-    MapState, Window, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
-    MOTION_NOTIFY_EVENT,
+    AtomEnum, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ClientMessageEvent, ConfigureWindowAux,
+    ConnectionExt as _, EventMask, ImageFormat, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
+    MOTION_NOTIFY_EVENT, MapState, Window,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
-use x11rb::CURRENT_TIME;
 
+use crate::linux_portal::PortalMount;
 use crate::linux_sandbox::{LinuxSandbox, SandboxError};
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -137,6 +138,7 @@ impl LinuxBridge {
         entrypoint: &str,
         user: &str,
         writable: &str,
+        portal_mounts: &[PortalMount],
     ) -> Result<u32, LinuxError> {
         if instance == 0 || self.instances.contains_key(&instance) {
             return Err(if instance == 0 {
@@ -145,8 +147,8 @@ impl LinuxBridge {
                 LinuxError::Busy
             });
         }
-        let mut sandbox =
-            LinuxSandbox::prepare(instance, bundle, user, writable).map_err(sandbox_error)?;
+        let mut sandbox = LinuxSandbox::prepare(instance, bundle, user, writable, portal_mounts)
+            .map_err(sandbox_error)?;
         let display_name = format!(":{}", 1000 + instance % 50_000);
         let display_number = display_name
             .strip_prefix(':')

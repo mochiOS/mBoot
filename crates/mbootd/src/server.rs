@@ -1,10 +1,11 @@
-use crate::developer::{encode_hex, DeveloperBuildState, DeveloperError};
+use crate::developer::{DeveloperBuildState, DeveloperError, encode_hex};
 use crate::linux::{LinuxBridge, LinuxError};
+use crate::linux_portal::{LinuxPortalState, PortalError, decode_path};
 use crate::linux_stage::{LinuxStageState, StageError};
 use crate::{GuestState, StateError};
 use mboot_protocol::{
-    decode_line, encode_to_string, Argument, Body, Command, ConnectionValidator, Destination,
-    ErrorCode, KnownCommand, Message, MessageType, ValidationError, MAX_MESSAGE_LEN,
+    Argument, Body, Command, ConnectionValidator, Destination, ErrorCode, KnownCommand,
+    MAX_MESSAGE_LEN, Message, MessageType, ValidationError, decode_line, encode_to_string,
 };
 use std::fs;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
@@ -77,6 +78,7 @@ pub fn serve_connection(
     let mut developer = DeveloperBuildState::default();
     let mut linux = LinuxBridge::default();
     let mut linux_stage = LinuxStageState::default();
+    let mut linux_portal = LinuxPortalState::default();
     let session = session_id();
     state.connected();
     println!("guest connected");
@@ -116,6 +118,7 @@ pub fn serve_connection(
             &mut developer,
             &mut linux,
             &mut linux_stage,
+            &mut linux_portal,
             &message,
             &session,
             heartbeat_ms,
@@ -136,6 +139,7 @@ fn dispatch(
     developer: &mut DeveloperBuildState,
     linux: &mut LinuxBridge,
     linux_stage: &mut LinuxStageState,
+    linux_portal: &mut LinuxPortalState,
     message: &Message,
     session: &str,
     heartbeat_ms: u64,
@@ -143,7 +147,7 @@ fn dispatch(
     let command = match &message.body {
         Body::Command(Command::Known(command)) => *command,
         Body::Command(Command::Unsupported(_)) => {
-            return request_error(message, ErrorCode::Unsupported, None)
+            return request_error(message, ErrorCode::Unsupported, None);
         }
         Body::Ok | Body::Error(_) => return None,
     };
@@ -299,7 +303,78 @@ fn dispatch(
             linux_stage.cancel(stage_u64(message, "instance")?)?;
             Ok(Vec::new())
         }),
+        KnownCommand::LinuxPortalReset => portal_response(message, || {
+            linux_portal.reset(portal_u64(message, "instance")?)?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxPortalGrant => portal_response(message, || {
+            let path = decode_path(
+                message
+                    .argument("path")
+                    .ok_or(PortalError::InvalidArgument)?,
+            )?;
+            let writable = match message.argument("access") {
+                Some("read") => false,
+                Some("write") => true,
+                _ => return Err(PortalError::InvalidArgument),
+            };
+            linux_portal.grant(
+                portal_u64(message, "instance")?,
+                portal_u64(message, "grant")?,
+                writable,
+                &path,
+            )?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxPortalMkdir => portal_response(message, || {
+            let path = decode_path(
+                message
+                    .argument("path")
+                    .ok_or(PortalError::InvalidArgument)?,
+            )?;
+            linux_portal.mkdir(
+                portal_u64(message, "instance")?,
+                portal_u64(message, "grant")?,
+                &path,
+            )?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxPortalFileBegin => portal_response(message, || {
+            let path = decode_path(
+                message
+                    .argument("path")
+                    .ok_or(PortalError::InvalidArgument)?,
+            )?;
+            linux_portal.begin_file(
+                portal_u64(message, "instance")?,
+                portal_u64(message, "grant")?,
+                &path,
+                portal_u64(message, "size")?,
+            )?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxPortalFileChunk => portal_response(message, || {
+            linux_portal.append(
+                portal_u64(message, "instance")?,
+                portal_u64(message, "offset")?,
+                message
+                    .argument("data")
+                    .ok_or(PortalError::InvalidArgument)?,
+            )?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxPortalFileCommit => portal_response(message, || {
+            linux_portal.commit_file(portal_u64(message, "instance")?)?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::LinuxPortalFileCancel => portal_response(message, || {
+            linux_portal.cancel_file(portal_u64(message, "instance")?)?;
+            Ok(Vec::new())
+        }),
         KnownCommand::LinuxBundleLaunch => linux_response(message, || {
+            let portal_mounts = linux_portal
+                .mounts(linux_u64(message, "instance")?)
+                .map_err(|_| LinuxError::InvalidState)?;
             let process = linux.launch_bundle(
                 linux_u64(message, "instance")?,
                 message
@@ -314,6 +389,7 @@ fn dispatch(
                 message
                     .argument("writable")
                     .ok_or(LinuxError::InvalidArgument)?,
+                &portal_mounts,
             )?;
             Ok(vec![Argument::new("process", process.to_string())])
         }),
@@ -420,6 +496,37 @@ fn stage_u64(message: &Message, key: &str) -> Result<u64, StageError> {
         .ok_or(StageError::InvalidArgument)?
         .parse::<u64>()
         .map_err(|_| StageError::InvalidArgument)
+}
+
+fn portal_response(
+    message: &Message,
+    operation: impl FnOnce() -> Result<Vec<Argument>, PortalError>,
+) -> Option<Message> {
+    match operation() {
+        Ok(arguments) => Some(Message::ok(
+            Destination::Mochios,
+            message.request_id,
+            arguments,
+        )),
+        Err(error) => request_error(message, portal_error_code(error), None),
+    }
+}
+
+fn portal_error_code(error: PortalError) -> ErrorCode {
+    match error {
+        PortalError::Busy => ErrorCode::Busy,
+        PortalError::InvalidArgument => ErrorCode::InvalidArgument,
+        PortalError::InvalidState => ErrorCode::InvalidState,
+        PortalError::Internal => ErrorCode::Internal,
+    }
+}
+
+fn portal_u64(message: &Message, key: &str) -> Result<u64, PortalError> {
+    message
+        .argument(key)
+        .ok_or(PortalError::InvalidArgument)?
+        .parse()
+        .map_err(|_| PortalError::InvalidArgument)
 }
 
 fn developer_response(
@@ -674,6 +781,7 @@ mod tests {
         let mut developer = DeveloperBuildState::default();
         let mut linux = LinuxBridge::default();
         let mut linux_stage = LinuxStageState::default();
+        let mut linux_portal = LinuxPortalState::default();
         for command in [KnownCommand::HostPoweroff, KnownCommand::HostReboot] {
             let message = Message::command(
                 Destination::Mboot,
@@ -688,6 +796,7 @@ mod tests {
                     &mut developer,
                     &mut linux,
                     &mut linux_stage,
+                    &mut linux_portal,
                     &message,
                     "session",
                     5000,

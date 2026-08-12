@@ -3,6 +3,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
+use crate::linux_portal::PortalMount;
 use crate::linux_stage::valid_bundle_id;
 
 const INSTANCE_ROOT: &str = "/run/mboot/linux";
@@ -29,6 +30,7 @@ impl LinuxSandbox {
         bundle: &str,
         user: &str,
         writable: &str,
+        portal_mounts: &[PortalMount],
     ) -> Result<Self, SandboxError> {
         if instance == 0 || !valid_bundle_id(bundle) || !valid_user(user) {
             return Err(SandboxError::InvalidArgument);
@@ -70,7 +72,7 @@ impl LinuxSandbox {
             sandbox.mount_writable_path(&lower, &merged, &storage, path)?;
         }
         sandbox.mount_tmp(&merged)?;
-        sandbox.mount_mochios_guard(&merged)?;
+        sandbox.mount_mochios(&merged, portal_mounts)?;
         Ok(sandbox)
     }
 
@@ -187,7 +189,11 @@ impl LinuxSandbox {
         Ok(())
     }
 
-    fn mount_mochios_guard(&mut self, merged: &Path) -> Result<(), SandboxError> {
+    fn mount_mochios(
+        &mut self,
+        merged: &Path,
+        portal_mounts: &[PortalMount],
+    ) -> Result<(), SandboxError> {
         let target = merged.join("mochios");
         if !target.is_dir() {
             return Err(SandboxError::NotFound);
@@ -196,11 +202,28 @@ impl LinuxSandbox {
             "-t",
             "tmpfs",
             "-o",
-            "ro,nodev,nosuid,noexec,mode=0555,size=64K",
+            "nodev,nosuid,noexec,mode=0555,size=64K",
             "tmpfs",
             path_str(&target)?,
         ])?;
-        self.mounts.push(target);
+        self.mounts.push(target.clone());
+        for portal in portal_mounts {
+            if !valid_absolute_path(&portal.target) || !portal.source.is_dir() {
+                return Err(SandboxError::InvalidArgument);
+            }
+            let destination = target.join(&portal.target[1..]);
+            fs::create_dir_all(&destination).map_err(|_| SandboxError::Internal)?;
+            run_mount(["--bind", path_str(&portal.source)?, path_str(&destination)?])?;
+            self.mounts.push(destination.clone());
+            if !portal.writable {
+                run_mount([
+                    "-o",
+                    "remount,bind,ro,nodev,nosuid,noexec",
+                    path_str(&destination)?,
+                ])?;
+            }
+        }
+        run_mount(["-o", "remount,ro,nodev,nosuid,noexec", path_str(&target)?])?;
         Ok(())
     }
 }
