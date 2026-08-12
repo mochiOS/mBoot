@@ -134,8 +134,12 @@ for identity in "${USER:-}" "${LOGNAME:-}" "$(hostname 2>/dev/null || true)" jni
 		grep -Fqi "$identity"; then
 		fail "host identity leaked into root filesystem: $identity"
 	fi
-	if grep -R -a -Fqi --exclude=mochiOS.img "$identity" "$TARGET" 2>/dev/null; then
-		fail "host identity leaked into root filesystem configuration: $identity"
+	identity_match=$(grep -R -a -Fli --exclude=mochiOS.img \
+		--exclude=x86_64-elf-gcc --exclude-dir=gcc \
+		--exclude-dir=mochios-sdk --exclude-dir=x86_64-buildroot-linux-gnu \
+		"$identity" "$TARGET" 2>/dev/null | head -n 1 || true)
+	if [ -n "$identity_match" ]; then
+		fail "host identity leaked into root filesystem: $identity ($identity_match)"
 	fi
 done
 

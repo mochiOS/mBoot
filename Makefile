@@ -37,6 +37,7 @@ QEMU_CONFIG_STAMP := $(OUTPUT_DIR)/.mboot-qemu-config.sha256
 
 JOBS ?= $(shell nproc)
 HOST_CARGO := $(shell command -v cargo)
+HOST_CARGO_HOME := $(if $(CARGO_HOME),$(CARGO_HOME),$(HOME)/.cargo)
 HOST_RUSTC := $(shell command -v rustc)
 RUSTC_SYSROOT := $(shell $(HOST_RUSTC) --print sysroot 2>/dev/null)
 MBOOTD_TARGET := x86_64-unknown-linux-gnu
@@ -58,7 +59,7 @@ mbootd:
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
 	@test -n "$(RUSTC_SYSROOT)" || { echo "host rustc sysroot was not found" >&2; exit 1; }
 	SOURCE_DATE_EPOCH="$(MBOOT_SOURCE_DATE_EPOCH)" CARGO_INCREMENTAL=0 \
-	RUSTFLAGS='-C target-feature=+crt-static --remap-path-prefix=$(CURDIR)=/usr/src/mboot --remap-path-prefix=$(RUSTC_SYSROOT)=/usr/src/rust' \
+	RUSTFLAGS='-C target-feature=+crt-static --remap-path-prefix=$(abspath $(CURDIR)/..)=/usr/src/mochios --remap-path-prefix=$(RUSTC_SYSROOT)=/usr/src/rust --remap-path-prefix=$(HOST_CARGO_HOME)=/usr/src/cargo' \
 		$(HOST_CARGO) build --locked --release --target "$(MBOOTD_TARGET)" -p mbootd
 	@if readelf -l "$(MBOOTD_BINARY)" | grep -Fq 'INTERP'; then \
 		echo 'mbootd must not depend on the build host dynamic loader' >&2; \
@@ -209,8 +210,21 @@ prepare-qemu:
 		$(MAKE) -C "$(BUILDROOT_DIR)" O="$(OUTPUT_DIR)" sdl2-dirclean; \
 	fi
 
+.PHONY: prepare-xserver
+prepare-xserver: configure
+	@set -eu; \
+	if grep -Fqx 'BR2_PACKAGE_XSERVER_XORG_SERVER_XVFB=y' "$(OUTPUT_DIR)/.config" && \
+	   [ -d "$(OUTPUT_DIR)/build" ] && \
+	   find "$(OUTPUT_DIR)/build" -maxdepth 1 -type d \
+		-name 'xserver_xorg-server-*' | grep -q . && \
+	   [ ! -x "$(OUTPUT_DIR)/target/usr/bin/Xvfb" ]; then \
+		echo 'Xvfb is enabled but missing; rebuilding xserver_xorg-server'; \
+		$(MAKE) -C "$(BUILDROOT_DIR)" O="$(OUTPUT_DIR)" \
+			xserver_xorg-server-dirclean; \
+	fi
+
 .PHONY: build
-build: configure check check-mochios prepare-qemu mbootd
+build: configure check check-mochios prepare-qemu prepare-xserver mbootd
 	MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))" \
 	MBOOT_MOCHIOS_SDK_SYSROOT="$(MOCHIOS_SDK_SYSROOT)" \
 	MBOOT_MOCHIOS_SDK_CRT0="$(MOCHIOS_SDK_CRT0)" \
