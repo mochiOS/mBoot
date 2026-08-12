@@ -3,6 +3,7 @@ use std::env;
 use std::process::{Child, Command};
 
 use x11rb::connection::Connection;
+use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
 use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, ImageFormat,
     MapState, Window, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
@@ -68,9 +69,7 @@ impl Default for LinuxBridge {
         let display = env::var("MBOOT_LINUX_DISPLAY")
             .or_else(|_| env::var("DISPLAY"))
             .unwrap_or_else(|_| String::from(":0"));
-        let (connection, screen) = x11rb::connect(Some(&display))
-            .map(|(connection, screen)| (Some(connection), screen))
-            .unwrap_or((None, 0));
+        let (connection, screen) = connect_display(&display).unwrap_or((None, 0));
         Self {
             connection,
             screen,
@@ -135,15 +134,7 @@ impl LinuxBridge {
             if attributes.map_state == MapState::UNMAPPED {
                 continue;
             }
-            let property =
-                match connection.get_property(false, window, pid_atom, AtomEnum::CARDINAL, 0, 1) {
-                    Ok(cookie) => match cookie.reply() {
-                        Ok(property) => property,
-                        Err(_) => continue,
-                    },
-                    Err(_) => continue,
-                };
-            if property.value32().and_then(|mut values| values.next()) == Some(pid) {
+            if window_matches_instance(connection, window, instance, pid_atom, pid) {
                 windows.push(window);
             }
         }
@@ -168,10 +159,16 @@ impl LinuxBridge {
             if geometry.width == 0 || geometry.height == 0 {
                 return Err(LinuxError::InvalidState);
             }
+            let pixmap = connection.generate_id().map_err(|_| LinuxError::Internal)?;
+            connection
+                .composite_name_window_pixmap(window, pixmap)
+                .map_err(|_| LinuxError::Internal)?
+                .check()
+                .map_err(|_| LinuxError::Internal)?;
             let image = connection
                 .get_image(
                     ImageFormat::Z_PIXMAP,
-                    window,
+                    pixmap,
                     0,
                     0,
                     geometry.width,
@@ -180,7 +177,9 @@ impl LinuxBridge {
                 )
                 .map_err(|_| LinuxError::Internal)?
                 .reply()
-                .map_err(|_| LinuxError::Internal)?;
+                .map_err(|_| LinuxError::Internal);
+            let _ = connection.free_pixmap(pixmap);
+            let image = image?;
             (
                 geometry.width,
                 geometry.height,
@@ -427,6 +426,55 @@ impl LinuxBridge {
     }
 }
 
+fn connect_display(display: &str) -> Result<(Option<RustConnection>, usize), LinuxError> {
+    let (connection, screen) =
+        x11rb::connect(Some(display)).map_err(|_| LinuxError::InvalidState)?;
+    let root = connection
+        .setup()
+        .roots
+        .get(screen)
+        .ok_or(LinuxError::InvalidState)?
+        .root;
+    connection
+        .composite_redirect_subwindows(root, Redirect::AUTOMATIC)
+        .map_err(|_| LinuxError::InvalidState)?
+        .check()
+        .map_err(|_| LinuxError::InvalidState)?;
+    connection.flush().map_err(|_| LinuxError::InvalidState)?;
+    Ok((Some(connection), screen))
+}
+
+fn window_matches_instance(
+    connection: &RustConnection,
+    window: Window,
+    instance: u64,
+    pid_atom: u32,
+    pid: u32,
+) -> bool {
+    let expected_class = format!("mochios-linux-{instance}");
+    if connection
+        .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some_and(|property| {
+            wm_class_instance(&property.value) == Some(expected_class.as_bytes())
+        })
+    {
+        return true;
+    }
+    connection
+        .get_property(false, window, pid_atom, AtomEnum::CARDINAL, 0, 1)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .and_then(|property| property.value32().and_then(|mut values| values.next()))
+        == Some(pid)
+}
+
+fn wm_class_instance(value: &[u8]) -> Option<&[u8]> {
+    let end = value.iter().position(|byte| *byte == 0)?;
+    (end != 0).then_some(&value[..end])
+}
+
 fn application_executable(application: &str) -> Option<&'static str> {
     match application {
         "xterm" => Some("/usr/bin/xterm"),
@@ -489,6 +537,16 @@ mod tests {
         assert_eq!(application_executable("xclock"), Some("/usr/bin/xclock"));
         assert_eq!(application_executable("/bin/sh"), None);
         assert_eq!(application_executable("xterm;id"), None);
+    }
+
+    #[test]
+    fn wm_class_uses_the_instance_component() {
+        assert_eq!(
+            wm_class_instance(b"mochios-linux-12\0XTerm\0"),
+            Some(b"mochios-linux-12".as_slice())
+        );
+        assert_eq!(wm_class_instance(b"\0XTerm\0"), None);
+        assert_eq!(wm_class_instance(b"unterminated"), None);
     }
 
     #[test]
