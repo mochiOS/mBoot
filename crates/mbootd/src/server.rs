@@ -24,7 +24,7 @@ pub fn run(path: &Path) -> io::Result<()> {
     prepare_socket(path)?;
     let listener = UnixListener::bind(path)?;
     let _socket = SocketFile::new(path)?;
-    println!("mbootd listening: {}", path.display());
+    eprintln!("mbootd listening: {}", path.display());
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
@@ -81,7 +81,7 @@ pub fn serve_connection(
     let mut linux_portal = LinuxPortalState::default();
     let session = session_id();
     state.connected();
-    println!("guest connected");
+    eprintln!("guest connected");
 
     loop {
         let line = match read_line_limited(&mut reader) {
@@ -92,7 +92,7 @@ pub fn serve_connection(
                     Duration::from_millis(heartbeat_ms.saturating_mul(2)),
                     Instant::now(),
                 ) {
-                    println!("guest heartbeat timed out");
+                    eprintln!("guest heartbeat timed out");
                 }
                 continue;
             }
@@ -154,7 +154,7 @@ fn dispatch(
     match command {
         KnownCommand::ProtocolHello => match state.negotiate(message) {
             Ok(()) => {
-                println!("protocol negotiated: version=1");
+                eprintln!("protocol negotiated: version=1");
                 Some(Message::command(
                     Destination::Mochios,
                     MessageType::Response,
@@ -170,7 +170,7 @@ fn dispatch(
             Err(error) => request_error(message, state_error_code(error), state_error_field(error)),
         },
         KnownCommand::ProtocolSync => {
-            println!("protocol synchronized");
+            eprintln!("protocol synchronized");
             Some(Message::ok(
                 Destination::Mochios,
                 message.request_id,
@@ -184,7 +184,7 @@ fn dispatch(
         )),
         KnownCommand::GuestReady => match state.ready(message) {
             Ok(stage) => {
-                println!("guest boot stage: {}", stage.as_str());
+                eprintln!("guest boot stage: {}", stage.as_str());
                 None
             }
             Err(error) => {
@@ -194,7 +194,7 @@ fn dispatch(
         },
         KnownCommand::GuestHeartbeat => match state.heartbeat(message) {
             Ok(uptime_ms) => {
-                println!("guest heartbeat: uptime={uptime_ms}ms");
+                eprintln!("guest heartbeat: uptime={uptime_ms}ms");
                 None
             }
             Err(error) => {
