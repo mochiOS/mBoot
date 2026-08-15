@@ -24,8 +24,13 @@ require_line "$GENERATED/mboot_x86_64_defconfig" '# BR2_TARGET_GRUB2_X86_64_EFI 
 require_line board/mboot/rootfs-overlay/etc/mboot.conf 'MBOOT_VCPUS='
 require_line board/mboot/rootfs-overlay/etc/mboot.conf 'MBOOT_ACCELERATOR=auto'
 require_line "$GENERATED/grub-builtin.cfg" "search --no-floppy --fs-uuid --set=root $MBOOT_ROOT_FSUUID"
-require_line "$GENERATED/linux.config" 'CONFIG_CMDLINE_OVERRIDE=y'
+require_line "$GENERATED/linux.config" '# CONFIG_CMDLINE_OVERRIDE is not set'
 require_line "$GENERATED/linux.config" "CONFIG_CMDLINE=\"$MBOOT_KERNEL_CMDLINE\""
+require_line "$GENERATED/linux.config" 'CONFIG_BLK_DEV_INITRD=y'
+require_line "$GENERATED/linux.config" 'CONFIG_RD_GZIP=y'
+require_line "$GENERATED/linux.config" 'CONFIG_BLK_DEV_RAM=y'
+require_line "$GENERATED/linux.config" 'CONFIG_BLK_DEV_RAM_COUNT=1'
+require_line "$GENERATED/linux.config" 'CONFIG_BLK_DEV_RAM_SIZE=3145728'
 grep -Fq "linux /boot/bzImage $MBOOT_KERNEL_CMDLINE" "$GENERATED/grub-bios.cfg" ||
 	fail 'generated BIOS command line differs from boot-layout.conf'
 grep -Fq "partition-uuid = $MBOOT_ROOT_PARTUUID" "$GENERATED/genimage.cfg" ||
