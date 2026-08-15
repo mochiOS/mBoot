@@ -215,20 +215,28 @@ kvm_probe_pidfile=/run/mboot/kvm-probe.pid
 if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] &&
 	grep -Eq '^flags[[:space:]]*:.*[[:space:]](vmx|svm)([[:space:]]|$)' /proc/cpuinfo; then
 	rm -f "$kvm_probe_pidfile"
-	if "$QEMU" -name mboot-kvm-probe -nodefaults -machine q35 -accel kvm \
-		-display none -monitor none -serial none -S -daemonize \
-		-pidfile "$kvm_probe_pidfile"; then
-		probe_pid=$(cat "$kvm_probe_pidfile" 2>/dev/null || true)
-		if mboot_pid_is "$probe_pid" "$QEMU"; then
-			kvm_usable=1
-			kill -TERM "$probe_pid" 2>/dev/null || true
-			probe_wait=0
-			while kill -0 "$probe_pid" 2>/dev/null && [ "$probe_wait" -lt 20 ]; do
-				probe_wait=$((probe_wait + 1)); sleep 0.1
-			done
-			kill -KILL "$probe_pid" 2>/dev/null || true
-		fi
+	"$QEMU" -name mboot-kvm-probe -nodefaults -machine q35 -accel kvm \
+		-display none -monitor none -serial none -S \
+		-pidfile "$kvm_probe_pidfile" &
+	probe_process=$!
+	probe_wait=0
+	while [ ! -s "$kvm_probe_pidfile" ] && kill -0 "$probe_process" 2>/dev/null &&
+		[ "$probe_wait" -lt 20 ]; do
+		probe_wait=$((probe_wait + 1))
+		sleep 0.05
+	done
+	probe_pid=$(cat "$kvm_probe_pidfile" 2>/dev/null || true)
+	if mboot_pid_is "$probe_pid" "$QEMU"; then
+		kvm_usable=1
+		kill -TERM "$probe_pid" 2>/dev/null || true
 	fi
+	probe_wait=0
+	while kill -0 "$probe_process" 2>/dev/null && [ "$probe_wait" -lt 20 ]; do
+		probe_wait=$((probe_wait + 1))
+		sleep 0.05
+	done
+	kill -KILL "$probe_process" 2>/dev/null || true
+	wait "$probe_process" 2>/dev/null || true
 	rm -f "$kvm_probe_pidfile"
 fi
 accel_preference=$(config_get MBOOT_ACCELERATOR auto)
@@ -300,15 +308,6 @@ case "$network" in user|none) ;; *) fail CONFIG_INVALID "Unsupported network mod
 case "$audio" in auto|on|off) ;; *) fail CONFIG_INVALID "Unsupported audio mode: $audio"; exit 1;; esac
 case "$cache" in auto) cache=writethrough;; none|directsync|writethrough|writeback) :;; *) fail CONFIG_INVALID "Unsupported disk cache mode: $cache"; exit 1;; esac
 mboot_log INFO "guest graphics: device=$gpu resolution=${guest_width}x${guest_height} display=$display_backend gl=$display_gl"
-
-if [ "$cache" = writethrough ] || [ "$cache" = writeback ]; then
-	mboot_log INFO "warming embedded mochiOS image into host page cache"
-	if dd if="$MOCHIOS_IMAGE" of=/dev/null bs=4M 2>/dev/null; then
-		mboot_log INFO "embedded mochiOS image cache warmup complete"
-	else
-		mboot_log WARNING "embedded mochiOS image cache warmup failed; continuing"
-	fi
-fi
 
 export DISPLAY="$display"
 export SDL_VIDEODRIVER=x11

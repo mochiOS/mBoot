@@ -120,9 +120,10 @@ grep -Fq 'RUN_DISK_IMAGE := $(OUTPUT_DIR)/run/mboot.img' Makefile ||
 grep -Fq 'QEMU_FULLSCREEN ?= yes' Makefile || fail 'outer QEMU is not fullscreen by default'
 grep -Fq 'auto) cache=writethrough' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
 	fail 'embedded image auto cache mode does not use buffered reads'
-grep -Fq 'warming embedded mochiOS image into host page cache' \
-	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
-	fail 'embedded image cache warmup is missing'
+if grep -Fq 'warming embedded mochiOS image into host page cache' \
+	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher; then
+	fail 'inner QEMU startup must not read the complete embedded image'
+fi
 grep -Fq '|| gui_fullscreen)' board/mboot/patches/qemu/0001-sdl-keep-fullscreen-window-size.patch ||
 	fail 'inner QEMU fullscreen resize patch is missing'
 grep -Fq 'SDL_SetWindowInputFocus(scon->real_window)' board/mboot/patches/qemu/0001-sdl-keep-fullscreen-window-size.patch ||
