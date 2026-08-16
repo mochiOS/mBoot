@@ -11,6 +11,7 @@ BOOT_CONFIG_SOURCES := \
 	board/mboot/genimage.cfg.in \
 	board/mboot/grub-bios.cfg.in \
 	board/mboot/grub-builtin.cfg.in \
+	board/mboot/busybox.config \
 	board/mboot/linux.config.in \
 	configs/mboot_x86_64_defconfig.in \
 	scripts/generate-boot-config.sh
