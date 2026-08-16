@@ -137,7 +137,13 @@ if [ ! -r "$MOCHIOS_IMAGE" ] || [ ! -w "$MOCHIOS_IMAGE" ]; then
 	fail IMAGE_PERMISSION "The embedded mochiOS image is not readable and writable."
 	exit 1
 fi
-image_size=$(wc -c < "$MOCHIOS_IMAGE")
+image_size=$(stat -c %s "$MOCHIOS_IMAGE" 2>/dev/null || true)
+case "$image_size" in
+	''|*[!0-9]*)
+		fail IMAGE_INVALID "Could not determine the embedded mochiOS image size."
+		exit 1
+		;;
+esac
 if [ "$image_size" -lt 67108864 ]; then
 	fail IMAGE_SIZE "The embedded mochiOS image is too small: $image_size bytes."
 	exit 1
