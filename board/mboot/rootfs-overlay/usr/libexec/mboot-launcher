@@ -25,6 +25,17 @@ config_get() {
 
 unsigned() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
 
+file_size_bytes() {
+	size=$(stat -c %s "$1" 2>/dev/null || true)
+	if unsigned "$size"; then
+		printf '%s\n' "$size"
+		return 0
+	fi
+	set -- $(LC_ALL=C ls -ln "$1" 2>/dev/null) || return 1
+	[ "$#" -ge 5 ] && unsigned "$5" || return 1
+	printf '%s\n' "$5"
+}
+
 online_cpu_count() {
 	count=0
 	for cpu_path in /sys/devices/system/cpu/cpu[0-9]*; do
@@ -137,7 +148,7 @@ if [ ! -r "$MOCHIOS_IMAGE" ] || [ ! -w "$MOCHIOS_IMAGE" ]; then
 	fail IMAGE_PERMISSION "The embedded mochiOS image is not readable and writable."
 	exit 1
 fi
-image_size=$(stat -c %s "$MOCHIOS_IMAGE" 2>/dev/null || true)
+image_size=$(file_size_bytes "$MOCHIOS_IMAGE" || true)
 case "$image_size" in
 	''|*[!0-9]*)
 		fail IMAGE_INVALID "Could not determine the embedded mochiOS image size."

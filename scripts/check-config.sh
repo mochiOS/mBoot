@@ -114,6 +114,14 @@ grep -Fq 'cpu=qemu64,+x2apic' board/mboot/rootfs-overlay/usr/libexec/mboot-launc
 	fail 'guest CPU is not vendor-neutral with x2APIC enabled'
 grep -Fq 'host_cpus=$(online_cpu_count)' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
 	fail 'online host CPU discovery is missing'
+grep -Fq 'file_size_bytes()' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'portable embedded image size detection is missing'
+grep -Fq 'image_size=$(file_size_bytes "$MOCHIOS_IMAGE" || true)' \
+	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher ||
+	fail 'embedded image size does not use the portable metadata path'
+if grep -Fq 'image_size=$(wc -c' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher; then
+	fail 'embedded image size detection must not read the complete image'
+fi
 if grep -Eq -- 'virtio-(keyboard|mouse)-pci' board/mboot/rootfs-overlay/usr/libexec/mboot-launcher; then
 	fail 'inner QEMU must use the mochiOS-supported q35 i8042 input path'
 fi
