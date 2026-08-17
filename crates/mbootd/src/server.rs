@@ -2,6 +2,7 @@ use crate::developer::{DeveloperBuildState, DeveloperError, encode_hex};
 use crate::linux::{LinuxBridge, LinuxError};
 use crate::linux_portal::{ExportKind, LinuxPortalState, PortalError, decode_path};
 use crate::linux_stage::{LinuxStageState, StageError};
+use crate::wifi::{WifiError, WifiManager, decode_hex};
 use crate::{GuestState, StateError};
 use mboot_protocol::{
     Argument, Body, Command, ConnectionValidator, Destination, ErrorCode, KnownCommand,
@@ -79,6 +80,7 @@ pub fn serve_connection(
     let mut linux = LinuxBridge::default();
     let mut linux_stage = LinuxStageState::default();
     let mut linux_portal = LinuxPortalState::default();
+    let wifi = WifiManager;
     let session = session_id();
     state.connected();
     eprintln!("guest connected");
@@ -119,6 +121,7 @@ pub fn serve_connection(
             &mut linux,
             &mut linux_stage,
             &mut linux_portal,
+            &wifi,
             &message,
             &session,
             heartbeat_ms,
@@ -140,6 +143,7 @@ fn dispatch(
     linux: &mut LinuxBridge,
     linux_stage: &mut LinuxStageState,
     linux_portal: &mut LinuxPortalState,
+    wifi: &WifiManager,
     message: &Message,
     session: &str,
     heartbeat_ms: u64,
@@ -517,10 +521,105 @@ fn dispatch(
             linux.close(linux_u64(message, "instance")?, linux_window(message)?)?;
             Ok(Vec::new())
         }),
+        KnownCommand::WifiStatus => wifi_response(message, || {
+            let status = wifi.status()?;
+            Ok(vec![
+                Argument::new("available", u8::from(status.available).to_string()),
+                Argument::new("enabled", u8::from(status.enabled).to_string()),
+                Argument::new("connected", u8::from(status.connected).to_string()),
+                Argument::new(
+                    "interface",
+                    if status.interface.is_empty() {
+                        "none"
+                    } else {
+                        &status.interface
+                    },
+                ),
+                Argument::new(
+                    "ssid",
+                    if status.ssid.is_empty() {
+                        String::from("none")
+                    } else {
+                        encode_hex(&status.ssid)
+                    },
+                ),
+                Argument::new(
+                    "address",
+                    if status.address.is_empty() {
+                        "none"
+                    } else {
+                        &status.address
+                    },
+                ),
+            ])
+        }),
+        KnownCommand::WifiScan => wifi_response(message, || {
+            let networks = wifi.scan()?;
+            let encoded = if networks.is_empty() {
+                String::from("none")
+            } else {
+                networks
+                    .iter()
+                    .map(|network| {
+                        format!(
+                            "{}:{}:{}",
+                            encode_hex(&network.ssid),
+                            network.signal,
+                            u8::from(network.secured)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            Ok(vec![Argument::new("networks", encoded)])
+        }),
+        KnownCommand::WifiSetEnabled => wifi_response(message, || {
+            wifi.set_enabled(message.argument("enabled") == Some("1"))?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::WifiConnect => wifi_response(message, || {
+            let ssid = decode_hex(
+                message.argument("ssid").ok_or(WifiError::InvalidArgument)?,
+                32,
+            )?;
+            let credential = message
+                .argument("credential")
+                .map(|value| decode_hex(value, 63))
+                .transpose()?;
+            wifi.connect(&ssid, credential.as_deref())?;
+            Ok(Vec::new())
+        }),
+        KnownCommand::WifiDisconnect => wifi_response(message, || {
+            wifi.disconnect()?;
+            Ok(Vec::new())
+        }),
         KnownCommand::ProtocolWelcome
         | KnownCommand::GuestStatus
         | KnownCommand::GuestShutdown
         | KnownCommand::GuestReboot => request_error(message, ErrorCode::InvalidCommand, None),
+    }
+}
+
+fn wifi_response(
+    message: &Message,
+    operation: impl FnOnce() -> Result<Vec<Argument>, WifiError>,
+) -> Option<Message> {
+    match operation() {
+        Ok(arguments) => Some(Message::ok(
+            Destination::Mochios,
+            message.request_id,
+            arguments,
+        )),
+        Err(error) => request_error(message, wifi_error_code(error), None),
+    }
+}
+
+fn wifi_error_code(error: WifiError) -> ErrorCode {
+    match error {
+        WifiError::Unavailable => ErrorCode::InvalidState,
+        WifiError::InvalidArgument => ErrorCode::InvalidArgument,
+        WifiError::Rejected => ErrorCode::PermissionDenied,
+        WifiError::Internal => ErrorCode::Internal,
     }
 }
 
@@ -856,6 +955,7 @@ mod tests {
         let mut linux = LinuxBridge::default();
         let mut linux_stage = LinuxStageState::default();
         let mut linux_portal = LinuxPortalState::default();
+        let wifi = WifiManager;
         for command in [KnownCommand::HostPoweroff, KnownCommand::HostReboot] {
             let message = Message::command(
                 Destination::Mboot,
@@ -871,6 +971,7 @@ mod tests {
                     &mut linux,
                     &mut linux_stage,
                     &mut linux_portal,
+                    &wifi,
                     &message,
                     "session",
                     5000,

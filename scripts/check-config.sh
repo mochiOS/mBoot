@@ -19,8 +19,12 @@ require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_ROOTFS_POST_BUILD_SCRIPT="
 require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_MBOOT_PATH)/board/mboot/post-image.sh"'
 require_line "$GENERATED/mboot_x86_64_defconfig" '# BR2_TARGET_GENERIC_GETTY is not set'
 require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_MBOOT_PATH)/board/mboot/busybox.config"'
+require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_PACKAGE_WPA_SUPPLICANT=y'
+require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_PACKAGE_WPA_SUPPLICANT_CTRL_IFACE=y'
+require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_PACKAGE_LINUX_FIRMWARE_IWLWIFI_6E=y'
 require_line board/mboot/busybox.config 'CONFIG_STAT=y'
 require_line board/mboot/busybox.config 'CONFIG_FEATURE_STAT_FORMAT=y'
+require_line board/mboot/busybox.config 'CONFIG_RFKILL=y'
 require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="$(BR2_EXTERNAL_MBOOT_PATH)/output/generated/linux.config"'
 require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_TARGET_GRUB2_BUILTIN_CONFIG_PC="$(BR2_EXTERNAL_MBOOT_PATH)/output/generated/grub-builtin.cfg"'
 require_line "$GENERATED/mboot_x86_64_defconfig" '# BR2_TARGET_GRUB2_X86_64_EFI is not set'
@@ -76,6 +80,8 @@ for symbol in CONFIG_DRM_I915 CONFIG_DRM_AMDGPU CONFIG_DRM_NOUVEAU; do
 done
 require_line "$GENERATED/linux.config" 'CONFIG_KVM_INTEL=m'
 require_line "$GENERATED/linux.config" 'CONFIG_KVM_AMD=m'
+require_line "$GENERATED/linux.config" 'CONFIG_IWLMVM=m'
+require_line "$GENERATED/linux.config" 'CONFIG_RFKILL=y'
 
 root_uuid_sources=$(grep -R -l -F "$MBOOT_ROOT_PARTUUID" \
 	Makefile configs board scripts readme.md 2>/dev/null || true)

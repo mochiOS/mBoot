@@ -89,10 +89,15 @@ pub enum KnownCommand {
     LinuxInput,
     LinuxConfigure,
     LinuxClose,
+    WifiStatus,
+    WifiScan,
+    WifiSetEnabled,
+    WifiConnect,
+    WifiDisconnect,
 }
 
 impl KnownCommand {
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 48] = [
         Self::ProtocolSync,
         Self::ProtocolHello,
         Self::ProtocolWelcome,
@@ -136,6 +141,11 @@ impl KnownCommand {
         Self::LinuxInput,
         Self::LinuxConfigure,
         Self::LinuxClose,
+        Self::WifiStatus,
+        Self::WifiScan,
+        Self::WifiSetEnabled,
+        Self::WifiConnect,
+        Self::WifiDisconnect,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -183,6 +193,11 @@ impl KnownCommand {
             Self::LinuxInput => "LINUX.INPUT",
             Self::LinuxConfigure => "LINUX.CONFIGURE",
             Self::LinuxClose => "LINUX.CLOSE",
+            Self::WifiStatus => "WIFI.STATUS",
+            Self::WifiScan => "WIFI.SCAN",
+            Self::WifiSetEnabled => "WIFI.SET.ENABLED",
+            Self::WifiConnect => "WIFI.CONNECT",
+            Self::WifiDisconnect => "WIFI.DISCONNECT",
         }
     }
 
@@ -231,6 +246,11 @@ impl KnownCommand {
             "LINUX.INPUT" => Self::LinuxInput,
             "LINUX.CONFIGURE" => Self::LinuxConfigure,
             "LINUX.CLOSE" => Self::LinuxClose,
+            "WIFI.STATUS" => Self::WifiStatus,
+            "WIFI.SCAN" => Self::WifiScan,
+            "WIFI.SET.ENABLED" => Self::WifiSetEnabled,
+            "WIFI.CONNECT" => Self::WifiConnect,
+            "WIFI.DISCONNECT" => Self::WifiDisconnect,
             _ => return None,
         })
     }
@@ -748,9 +768,42 @@ fn validate_command_arguments(
                 return Err(ValidationError::InvalidArgument);
             }
         }
+        KnownCommand::WifiStatus | KnownCommand::WifiScan | KnownCommand::WifiDisconnect => {
+            if !message.arguments.is_empty() {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::WifiSetEnabled => {
+            if message.arguments.len() != 1
+                || !matches!(message.argument("enabled"), Some("0" | "1"))
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
+        KnownCommand::WifiConnect => {
+            let security = message.argument("security");
+            let credential = message.argument("credential");
+            if !matches!(security, Some("open" | "secured"))
+                || message
+                    .argument("ssid")
+                    .is_none_or(|ssid| !valid_hex(ssid, 1, 32))
+                || (security == Some("open") && credential.is_some())
+                || (security == Some("secured")
+                    && credential.is_none_or(|value| !valid_hex(value, 1, 63)))
+                || message.arguments.len() != if security == Some("open") { 2 } else { 3 }
+            {
+                return Err(ValidationError::InvalidArgument);
+            }
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn valid_hex(value: &str, minimum_bytes: usize, maximum_bytes: usize) -> bool {
+    value.len().is_multiple_of(2)
+        && (minimum_bytes * 2..=maximum_bytes * 2).contains(&value.len())
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn parse_u64_argument(message: &Message, key: &str) -> Option<u64> {
@@ -813,7 +866,12 @@ const fn command_contract(command: KnownCommand) -> (AllowedDestination, Message
         | LinuxFrame
         | LinuxInput
         | LinuxConfigure
-        | LinuxClose => (Mboot, MessageType::Request),
+        | LinuxClose
+        | WifiStatus
+        | WifiScan
+        | WifiSetEnabled
+        | WifiConnect
+        | WifiDisconnect => (Mboot, MessageType::Request),
     }
 }
 
@@ -1153,7 +1211,12 @@ mod tests {
             | KnownCommand::LinuxFrame
             | KnownCommand::LinuxInput
             | KnownCommand::LinuxConfigure
-            | KnownCommand::LinuxClose => (Destination::Mboot, MessageType::Request, 1),
+            | KnownCommand::LinuxClose
+            | KnownCommand::WifiStatus
+            | KnownCommand::WifiScan
+            | KnownCommand::WifiSetEnabled
+            | KnownCommand::WifiConnect
+            | KnownCommand::WifiDisconnect => (Destination::Mboot, MessageType::Request, 1),
         };
         let arguments = match command {
             KnownCommand::ProtocolHello => alloc::vec![
@@ -1287,6 +1350,12 @@ mod tests {
                 Argument::new("x", "40"),
                 Argument::new("y", "20"),
                 Argument::new("modifiers", "0"),
+            ],
+            KnownCommand::WifiSetEnabled => alloc::vec![Argument::new("enabled", "1")],
+            KnownCommand::WifiConnect => alloc::vec![
+                Argument::new("ssid", "6d6f6368694f53"),
+                Argument::new("security", "secured"),
+                Argument::new("credential", "70617373776f7264"),
             ],
             _ => Vec::new(),
         };

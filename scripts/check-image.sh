@@ -119,6 +119,11 @@ rootfs_hash=$(debugfs -R 'cat /var/lib/mboot/mochiOS.img' "$IMAGES/rootfs.ext2" 
 for path in usr/share/mboot/OVMF_CODE_4M.fd usr/share/mboot/OVMF_VARS_4M.fd; do
 	test -s "$TARGET/$path" || fail "missing firmware: /$path"
 done
+find "$TARGET/lib/firmware" -maxdepth 1 -type f -name 'iwlwifi-QuZ-*.ucode' |
+	grep -q . || fail 'Intel 22000/Tiger Lake Wi-Fi firmware is missing'
+test -x "$TARGET/usr/sbin/wpa_supplicant" || fail 'wpa_supplicant is missing'
+test -x "$TARGET/usr/sbin/iw" || fail 'iw is missing'
+test -x "$TARGET/usr/sbin/rfkill" || fail 'rfkill is missing'
 
 [ "$(cat "$TARGET/etc/hostname")" = "$MBOOT_HOSTNAME" ] || fail 'target hostname is not mboot'
 image_hostname=$(debugfs -R 'cat /etc/hostname' "$IMAGES/rootfs.ext2" 2>/dev/null)

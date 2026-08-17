@@ -1,0 +1,60 @@
+#!/bin/sh
+
+DAEMON=/usr/sbin/wpa_supplicant
+CONFIG=/var/lib/mboot/wpa_supplicant.conf
+CONTROL=/run/wpa_supplicant
+PIDFILE=/run/mboot/wpa_supplicant.pid
+
+interface() {
+	for wireless in /sys/class/net/*/wireless; do
+		[ -d "$wireless" ] || continue
+		device=${wireless%/wireless}
+		printf '%s\n' "${device##*/}"
+		return 0
+	done
+	return 1
+}
+
+start() {
+	printf 'Starting Wi-Fi service: '
+	[ -x "$DAEMON" ] || { echo 'missing'; return 1; }
+	install -d -m 0700 /var/lib/mboot
+	install -d -m 0750 /run/mboot "$CONTROL"
+	if [ ! -f "$CONFIG" ]; then
+		printf '%s\n' 'ctrl_interface=/run/wpa_supplicant' 'update_config=1' > "$CONFIG"
+	fi
+	chmod 0600 "$CONFIG"
+	modprobe iwlmvm 2>/dev/null || true
+	rfkill unblock wifi 2>/dev/null || true
+	count=0
+	while ! device=$(interface) && [ "$count" -lt 50 ]; do
+		count=$((count + 1))
+		sleep 0.1
+	done
+	[ -n "${device:-}" ] || { echo 'no wireless interface'; return 0; }
+	ip link set dev "$device" up 2>/dev/null || true
+	rm -f "$PIDFILE"
+	if ! "$DAEMON" -B -P "$PIDFILE" -D nl80211 -i "$device" -c "$CONFIG"; then
+		echo 'FAIL'
+		return 1
+	fi
+	udhcpc -b -q -i "$device" -p "/run/mboot/udhcpc-$device.pid" >/dev/null 2>&1 &
+	echo "OK ($device)"
+}
+
+stop() {
+	printf 'Stopping Wi-Fi service: '
+	if [ -f "$PIDFILE" ]; then
+		pid=$(cat "$PIDFILE" 2>/dev/null)
+		case "$pid" in ''|*[!0-9]*) :;; *) kill "$pid" 2>/dev/null || true;; esac
+	fi
+	rm -f "$PIDFILE"
+	echo 'OK'
+}
+
+case "$1" in
+	start) start ;;
+	stop) stop ;;
+	restart) stop; start ;;
+	*) echo "Usage: $0 {start|stop|restart}" >&2; exit 1 ;;
+esac

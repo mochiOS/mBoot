@@ -35,6 +35,7 @@ QEMU_CONFIG_INPUTS := \
 	$(CURDIR)/external.mk \
 	$(CURDIR)/package/virglrenderer/virglrenderer.mk
 QEMU_CONFIG_STAMP := $(OUTPUT_DIR)/.mboot-qemu-config.sha256
+LINUX_FIRMWARE_CONFIG_STAMP := $(OUTPUT_DIR)/.mboot-linux-firmware-config.sha256
 
 JOBS ?= $(shell nproc)
 HOST_CARGO := $(shell command -v cargo)
@@ -224,8 +225,27 @@ prepare-xserver: configure
 			xserver_xorg-server-dirclean; \
 	fi
 
+.PHONY: prepare-linux-firmware
+prepare-linux-firmware: configure
+	@set -eu; \
+	digest=$$({ grep '^BR2_PACKAGE_LINUX_FIRMWARE_' "$(BUILDROOT_DEFCONFIG)" || true; \
+		sha256sum "$(BUILDROOT_DIR)/package/linux-firmware/Config.in" \
+			"$(BUILDROOT_DIR)/package/linux-firmware/linux-firmware.mk"; \
+	} | sha256sum | awk '{print $$1}'); \
+	if [ -f "$(LINUX_FIRMWARE_CONFIG_STAMP)" ] && \
+	   [ "$$(cat "$(LINUX_FIRMWARE_CONFIG_STAMP)")" = "$$digest" ]; then \
+		exit 0; \
+	fi; \
+	for directory in "$(OUTPUT_DIR)"/build/linux-firmware-*; do \
+		[ ! -d "$$directory" ] || { \
+			echo 'Linux firmware selection changed; rebuilding linux-firmware'; \
+			$(MAKE) -C "$(BUILDROOT_DIR)" O="$(OUTPUT_DIR)" linux-firmware-dirclean; \
+			break; \
+		}; \
+	done
+
 .PHONY: build
-build: configure check check-mochios prepare-qemu prepare-xserver mbootd
+build: configure check check-mochios prepare-qemu prepare-xserver prepare-linux-firmware mbootd
 	MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))" \
 	MBOOT_MOCHIOS_SDK_SYSROOT="$(MOCHIOS_SDK_SYSROOT)" \
 	MBOOT_MOCHIOS_SDK_CRT0="$(MOCHIOS_SDK_CRT0)" \
@@ -240,6 +260,11 @@ build: configure check check-mochios prepare-qemu prepare-xserver mbootd
 	@sha256sum $(QEMU_CONFIG_INPUTS) | sha256sum | awk '{print $$1}' > \
 		"$(QEMU_CONFIG_STAMP).new"
 	@mv "$(QEMU_CONFIG_STAMP).new" "$(QEMU_CONFIG_STAMP)"
+	@{ grep '^BR2_PACKAGE_LINUX_FIRMWARE_' "$(BUILDROOT_DEFCONFIG)" || true; \
+		sha256sum "$(BUILDROOT_DIR)/package/linux-firmware/Config.in" \
+			"$(BUILDROOT_DIR)/package/linux-firmware/linux-firmware.mk"; \
+	} | sha256sum | awk '{print $$1}' > "$(LINUX_FIRMWARE_CONFIG_STAMP).new"
+	@mv "$(LINUX_FIRMWARE_CONFIG_STAMP).new" "$(LINUX_FIRMWARE_CONFIG_STAMP)"
 	MBOOT_MOCHIOS_IMAGE="$(abspath $(MOCHIOS))" \
 	MBOOT_OUTPUT_DIR="$(OUTPUT_DIR)" scripts/check-image.sh
 
