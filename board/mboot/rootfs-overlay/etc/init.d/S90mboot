@@ -4,12 +4,28 @@ DAEMON=/usr/libexec/mboot-launcher
 CONTROL_SERVICE=/etc/init.d/S80mbootd
 PIDFILE=/run/mboot/launcher.pid
 LOG=/var/log/mboot/launcher.log
+LOCKFILE=/run/mboot/mochios.lock
 
 valid_pid() {
 	[ -f "$PIDFILE" ] || return 1
 	pid=$(cat "$PIDFILE" 2>/dev/null)
 	case "$pid" in ''|*[!0-9]*) return 1;; esac
 	[ -r "/proc/$pid/cmdline" ] && tr '\000' ' ' < "/proc/$pid/cmdline" | grep -Fq "$DAEMON"
+}
+
+wait_image_lock() {
+	count=0
+	while [ "$count" -lt 150 ]; do
+		if (
+			exec 9>"$LOCKFILE"
+			flock -n 9
+		); then
+			return 0
+		fi
+		count=$((count + 1))
+		sleep 0.1
+	done
+	return 1
 }
 
 start() {
@@ -35,7 +51,12 @@ start() {
 
 stop() {
 	printf 'Stopping mBoot launcher: '
-	if ! valid_pid; then rm -f "$PIDFILE"; echo 'not running'; return 0; fi
+	if ! valid_pid; then
+		rm -f "$PIDFILE"
+		if wait_image_lock; then echo 'not running'; return 0; fi
+		echo 'image lock busy'
+		return 1
+	fi
 	pid=$(cat "$PIDFILE")
 	kill -TERM "$pid" 2>/dev/null || true
 	count=0
@@ -43,6 +64,10 @@ stop() {
 		count=$((count + 1)); sleep 0.1
 	done
 	if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+	if ! wait_image_lock; then
+		echo 'image lock timeout'
+		return 1
+	fi
 	rm -f "$PIDFILE" /run/mboot/qemu.pid
 	echo 'OK'
 }

@@ -7,6 +7,7 @@ IMAGE=/var/lib/mboot/mochiOS.img
 INCOMING=/var/lib/mboot/mochiOS.img.new
 PREVIOUS=/var/lib/mboot/mochiOS.img.previous
 QEMU_PIDFILE=/run/mboot/qemu.pid
+MIGRATION_ROOT=/run/mboot/deploy-migration
 
 fail() {
 	echo "mboot-deploy: $*" >&2
@@ -31,6 +32,72 @@ start_and_verify() {
 	return 1
 }
 
+validate_directory_path() {
+	root=$1
+	relative=$2
+	current=$root
+	old_ifs=$IFS
+	IFS=/
+	set -- $relative
+	IFS=$old_ifs
+	for component do
+		current=$current/$component
+		[ ! -L "$current" ] || return 1
+		[ -d "$current" ] || return 1
+	done
+}
+
+ensure_directory_path() {
+	root=$1
+	relative=$2
+	current=$root
+	old_ifs=$IFS
+	IFS=/
+	set -- $relative
+	IFS=$old_ifs
+	for component do
+		current=$current/$component
+		if [ -e "$current" ] || [ -L "$current" ]; then
+			[ ! -L "$current" ] && [ -d "$current" ] || return 1
+		else
+			mkdir "$current"
+		fi
+	done
+}
+
+migrate_persistent_state() (
+	old_mount=$MIGRATION_ROOT/old
+	new_mount=$MIGRATION_ROOT/new
+	old_loop=
+	new_loop=
+	mounted_old=0
+	mounted_new=0
+	cleanup() {
+		[ "$mounted_new" -eq 0 ] || umount "$new_mount" 2>/dev/null || true
+		[ "$mounted_old" -eq 0 ] || umount "$old_mount" 2>/dev/null || true
+		[ -z "$new_loop" ] || losetup -d "$new_loop" 2>/dev/null || true
+		[ -z "$old_loop" ] || losetup -d "$old_loop" 2>/dev/null || true
+	}
+	trap cleanup EXIT
+
+	mkdir -p "$old_mount" "$new_mount"
+	old_loop=$(losetup -fPr --show "$IMAGE")
+	new_loop=$(losetup -fP --show "$INCOMING")
+	mount -o ro "${old_loop}p2" "$old_mount"
+	mounted_old=1
+	mount "${new_loop}p2" "$new_mount"
+	mounted_new=1
+
+	for path in var/config system/users home libraries/users libraries/applications; do
+		if [ -e "$old_mount/$path" ] || [ -L "$old_mount/$path" ]; then
+			validate_directory_path "$old_mount" "$path" || return 1
+			ensure_directory_path "$new_mount" "$path" || return 1
+			cp -a "$old_mount/$path/." "$new_mount/$path/"
+		fi
+	done
+	sync
+)
+
 swap_images() {
 	temporary=/var/lib/mboot/mochiOS.img.swap
 	rm -f "$temporary"
@@ -52,6 +119,10 @@ install_image() {
 	[ "$actual" = "$expected" ] || fail "checksum mismatch: $actual"
 
 	"$SERVICE" stop
+	if ! migrate_persistent_state; then
+		"$SERVICE" start || true
+		fail 'persistent state migration failed'
+	fi
 	rm -f "$PREVIOUS"
 	ln "$IMAGE" "$PREVIOUS"
 	chmod 0600 "$INCOMING"
