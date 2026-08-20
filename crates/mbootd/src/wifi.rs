@@ -84,9 +84,10 @@ impl WifiManager {
         let interface = required_interface()?;
         if enabled {
             set_link(&interface, true)?;
-            expect_ok(&control(&interface, "REASSOCIATE")?)
+            expect_ok(&control(&interface, "REASSOCIATE")?)?;
+            restart_dhcp(&interface)
         } else {
-            expect_ok(&control(&interface, "DISCONNECT")?)?;
+            disconnect_interface(&interface)?;
             set_link(&interface, false)
         }
     }
@@ -97,6 +98,8 @@ impl WifiManager {
         }
         let interface = required_interface()?;
         set_link(&interface, true)?;
+        stop_dhcp(&interface);
+        clear_ipv4_address(&interface)?;
         let _ = control(&interface, "REMOVE_NETWORK all");
         let network = control(&interface, "ADD_NETWORK")?;
         let network = network.trim();
@@ -111,8 +114,7 @@ impl WifiManager {
             Some(credential) => {
                 let credential =
                     std::str::from_utf8(credential).map_err(|_| WifiError::InvalidArgument)?;
-                if !(8..=63).contains(&credential.len())
-                    || credential.chars().any(char::is_control)
+                if !(8..=63).contains(&credential.len()) || credential.chars().any(char::is_control)
                 {
                     return Err(WifiError::InvalidArgument);
                 }
@@ -141,7 +143,7 @@ impl WifiManager {
 
     pub(crate) fn disconnect(&self) -> Result<(), WifiError> {
         let interface = required_interface()?;
-        expect_ok(&control(&interface, "DISCONNECT")?)
+        disconnect_interface(&interface)
     }
 }
 
@@ -210,6 +212,7 @@ fn set_link(interface: &str, enabled: bool) -> Result<(), WifiError> {
 
 fn start_dhcp(interface: &str) -> Result<(), WifiError> {
     let pidfile = format!("/run/mboot/udhcpc-{interface}.pid");
+    let _ = fs::remove_file(&pidfile);
     Command::new("/sbin/udhcpc")
         .args(["-b", "-q", "-i", interface, "-p", &pidfile])
         .stdin(Stdio::null())
@@ -218,6 +221,86 @@ fn start_dhcp(interface: &str) -> Result<(), WifiError> {
         .spawn()
         .map(|_| ())
         .map_err(|_| WifiError::Internal)
+}
+
+fn restart_dhcp(interface: &str) -> Result<(), WifiError> {
+    stop_dhcp(interface);
+    clear_ipv4_address(interface)?;
+    start_dhcp(interface)
+}
+
+fn disconnect_interface(interface: &str) -> Result<(), WifiError> {
+    let disconnect = control(interface, "DISCONNECT").and_then(|response| expect_ok(&response));
+    stop_dhcp(interface);
+    let clear = clear_ipv4_address(interface);
+    disconnect.and(clear)
+}
+
+fn stop_dhcp(interface: &str) {
+    let pidfile = format!("/run/mboot/udhcpc-{interface}.pid");
+    let pid = fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|text| parse_dhcp_pid(&text));
+    if let Some(pid) = pid.filter(|pid| process_is_dhcp_client(*pid, interface)) {
+        let _ = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        for _ in 0..10 {
+            if !process_is_dhcp_client(pid, interface) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if process_is_dhcp_client(pid, interface) {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    let _ = fs::remove_file(pidfile);
+}
+
+fn parse_dhcp_pid(text: &str) -> Option<u32> {
+    let pid = text.trim().parse::<u32>().ok()?;
+    (pid > 1).then_some(pid)
+}
+
+fn process_is_dhcp_client(pid: u32, interface: &str) -> bool {
+    let Ok(command_line) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let fields = command_line
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let executable_matches = fields
+        .first()
+        .is_some_and(|field| field.ends_with(b"/udhcpc") || *field == b"udhcpc");
+    executable_matches
+        && fields
+            .windows(2)
+            .any(|pair| pair[0] == b"-i" && pair[1] == interface.as_bytes())
+}
+
+fn clear_ipv4_address(interface: &str) -> Result<(), WifiError> {
+    let status = Command::new("/sbin/ip")
+        .args(["-4", "addr", "flush", "dev", interface])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| WifiError::Internal)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(WifiError::Rejected)
+    }
 }
 
 fn control(interface: &str, command: &str) -> Result<String, WifiError> {
@@ -404,5 +487,12 @@ mod tests {
         assert_eq!(decode_hex("6d6f6368694f53", 32).unwrap(), b"mochiOS");
         assert_eq!(decode_hex("0", 32), Err(WifiError::InvalidArgument));
         assert_eq!(escape_quoted("a\\\"b"), "a\\\\\\\"b");
+    }
+
+    #[test]
+    fn dhcp_pid_parser_rejects_init_and_malformed_values() {
+        assert_eq!(parse_dhcp_pid("42\n"), Some(42));
+        assert_eq!(parse_dhcp_pid("1"), None);
+        assert_eq!(parse_dhcp_pid("not-a-pid"), None);
     }
 }
