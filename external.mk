@@ -17,4 +17,9 @@ endef
 QEMU_PRE_CONFIGURE_HOOKS += MBOOT_QEMU_INSTALL_CONFIGURE_WRAPPER
 QEMU_DEPENDENCIES += alsa-lib libegl libepoxy libgbm virglrenderer
 
+# external.mk is included after Buildroot has expanded qemu.mk's package
+# rules. Add the late dependency explicitly so virglrenderer is installed
+# into staging before Meson probes it.
+$(QEMU_TARGET_CONFIGURE): | virglrenderer
+
 include $(sort $(wildcard $(BR2_EXTERNAL_MBOOT_PATH)/package/*/*.mk))

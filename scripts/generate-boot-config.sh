@@ -4,8 +4,14 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 LAYOUT=$ROOT/board/mboot/boot-layout.conf
 OUTPUT=${1:-$ROOT/output/generated}
+DEVELOPMENT=${MBOOT_DEVELOPMENT:-0}
 
 fail() { echo "generate-boot-config: $*" >&2; exit 1; }
+
+case "$DEVELOPMENT" in
+	0|1) ;;
+	*) fail "MBOOT_DEVELOPMENT must be 0 or 1" ;;
+esac
 
 test -f "$LAYOUT" || fail "missing $LAYOUT"
 # This file intentionally assigns every value rather than inheriting host
@@ -67,6 +73,22 @@ render() {
 }
 
 render "$ROOT/configs/mboot_x86_64_defconfig.in" "$OUTPUT/mboot_x86_64_defconfig"
+if [ "$DEVELOPMENT" = 1 ]; then
+	sed -i \
+		-e 's/^BR2_TARGET_GENERIC_HOSTNAME=.*/BR2_TARGET_GENERIC_HOSTNAME="mboot-dev"/' \
+		-e 's/^BR2_TARGET_GENERIC_ISSUE=.*/BR2_TARGET_GENERIC_ISSUE="mBoot development appliance"/' \
+		-e 's/^BR2_TARGET_ROOTFS_EXT2_SIZE=.*/BR2_TARGET_ROOTFS_EXT2_SIZE="4G"/' \
+		"$OUTPUT/mboot_x86_64_defconfig"
+	cat >> "$OUTPUT/mboot_x86_64_defconfig" <<'EOF'
+BR2_PACKAGE_DROPBEAR=y
+BR2_PACKAGE_DROPBEAR_DISABLE_REVERSEDNS=y
+BR2_PACKAGE_AVAHI=y
+# BR2_PACKAGE_AVAHI_AUTOIPD is not set
+BR2_PACKAGE_AVAHI_DAEMON=y
+BR2_PACKAGE_AVAHI_DEFAULT_SERVICES=y
+BR2_PACKAGE_SOCAT=y
+EOF
+fi
 render "$ROOT/board/mboot/linux.config.in" "$OUTPUT/linux.config"
 render "$ROOT/board/mboot/grub-bios.cfg.in" "$OUTPUT/grub-bios.cfg"
 render "$ROOT/board/mboot/grub-builtin.cfg.in" "$OUTPUT/grub-builtin.cfg"

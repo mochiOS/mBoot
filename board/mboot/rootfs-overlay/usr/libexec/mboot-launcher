@@ -9,6 +9,7 @@ XORG_SERVICE=/etc/init.d/S40xorg
 QEMU_PIDFILE=/run/mboot/qemu.pid
 QEMU_LOG=$MBOOT_LOG_DIR/qemu.log
 SERIAL_LOG=$MBOOT_LOG_DIR/mochios.log
+QMP_SOCKET=/run/mboot/qmp.sock
 OVMF_CODE=/usr/share/mboot/OVMF_CODE_4M.fd
 OVMF_TEMPLATE=/usr/share/mboot/OVMF_VARS_4M.fd
 MOCHIOS_IMAGE=/var/lib/mboot/mochiOS.img
@@ -66,7 +67,7 @@ on_signal() {
 }
 
 cleanup() {
-	rm -f "$QEMU_PIDFILE"
+	rm -f "$QEMU_PIDFILE" "$QMP_SOCKET"
 	if [ -n "$qemu_pid" ] && kill -0 "$qemu_pid" 2>/dev/null; then
 		kill -TERM "$qemu_pid" 2>/dev/null || true
 	fi
@@ -340,6 +341,11 @@ set -- "$QEMU" -name mochiOS,process=mboot-qemu -nodefaults -no-reboot \
 	-object rng-random,id=rng0,filename=/dev/urandom -device virtio-rng-pci,rng=rng0 \
 	-display "sdl,gl=$display_gl,show-cursor=off,window-close=off" \
 	-monitor none -serial "file:$SERIAL_LOG"
+if [ -f /etc/mboot-development ]; then
+	rm -f "$QMP_SOCKET"
+	set -- "$@" -qmp "unix:$QMP_SOCKET,server=on,wait=off"
+	mboot_log WARNING "Development mode enabled: local QMP control is active"
+fi
 [ "$fullscreen" != yes ] || set -- "$@" -full-screen
 [ "$network" != user ] || set -- "$@" -netdev user,id=net0 -device virtio-net-pci,netdev=net0
 if [ "$audio" = on ] || { [ "$audio" = auto ] && grep -q '^[[:space:]]*[0-9]' /proc/asound/cards 2>/dev/null; }; then

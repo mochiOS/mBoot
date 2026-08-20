@@ -1,0 +1,85 @@
+#!/bin/sh
+set -eu
+
+MARKER=/etc/mboot-development
+SERVICE=/etc/init.d/S90mboot
+IMAGE=/var/lib/mboot/mochiOS.img
+INCOMING=/var/lib/mboot/mochiOS.img.new
+PREVIOUS=/var/lib/mboot/mochiOS.img.previous
+QEMU_PIDFILE=/run/mboot/qemu.pid
+
+fail() {
+	echo "mboot-deploy: $*" >&2
+	exit 1
+}
+
+qemu_started() {
+	[ -r "$QEMU_PIDFILE" ] || return 1
+	pid=$(cat "$QEMU_PIDFILE" 2>/dev/null || true)
+	case "$pid" in ''|*[!0-9]*) return 1;; esac
+	kill -0 "$pid" 2>/dev/null
+}
+
+start_and_verify() {
+	"$SERVICE" start
+	count=0
+	while [ "$count" -lt 100 ]; do
+		qemu_started && return 0
+		count=$((count + 1))
+		sleep 0.1
+	done
+	return 1
+}
+
+swap_images() {
+	temporary=/var/lib/mboot/mochiOS.img.swap
+	rm -f "$temporary"
+	mv "$IMAGE" "$temporary"
+	mv "$PREVIOUS" "$IMAGE"
+	mv "$temporary" "$PREVIOUS"
+	sync
+}
+
+install_image() {
+	expected=${1:-}
+	case "$expected" in *[!0-9a-f]*|'') fail 'invalid SHA-256';; esac
+	[ "${#expected}" -eq 64 ] || fail 'SHA-256 must contain 64 characters'
+	[ -f "$INCOMING" ] || fail "incoming image is missing: $INCOMING"
+	[ "$(wc -c < "$INCOMING")" -ge 67108864 ] || fail 'incoming image is too small'
+	[ "$(dd if="$INCOMING" bs=1 skip=512 count=8 2>/dev/null)" = 'EFI PART' ] ||
+		fail 'incoming image is not a raw GPT disk'
+	actual=$(sha256sum "$INCOMING" | awk '{print $1}')
+	[ "$actual" = "$expected" ] || fail "checksum mismatch: $actual"
+
+	"$SERVICE" stop
+	rm -f "$PREVIOUS"
+	ln "$IMAGE" "$PREVIOUS"
+	chmod 0600 "$INCOMING"
+	mv -f "$INCOMING" "$IMAGE"
+	sync
+	if start_and_verify; then
+		echo "mboot-deploy: installed $actual"
+		return 0
+	fi
+	echo 'mboot-deploy: new image failed to start; rolling back' >&2
+	"$SERVICE" stop || true
+	swap_images
+	start_and_verify || fail 'rollback image also failed to start'
+	fail 'new image was rolled back'
+}
+
+rollback() {
+	[ -f "$PREVIOUS" ] || fail 'previous image is unavailable'
+	"$SERVICE" stop
+	swap_images
+	start_and_verify || fail 'rolled-back image failed to start'
+	echo 'mboot-deploy: rollback complete'
+}
+
+[ -f "$MARKER" ] || fail 'development mode is disabled'
+case "${1:-}" in
+	install) install_image "${2:-}" ;;
+	rollback) rollback ;;
+	restart) "$SERVICE" restart ;;
+	*) fail 'usage: mboot-deploy {install SHA256|rollback|restart}' ;;
+esac

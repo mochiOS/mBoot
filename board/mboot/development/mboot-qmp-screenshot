@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+
+[ -f /etc/mboot-development ] || { echo 'development mode is disabled' >&2; exit 1; }
+socket=/run/mboot/qmp.sock
+output=${1:-/tmp/mochios.ppm}
+case "$output" in /tmp/*) :;; *) echo 'output must be below /tmp' >&2; exit 1;; esac
+[ -S "$socket" ] || { echo 'QMP socket is unavailable' >&2; exit 1; }
+
+escaped=$(printf '%s' "$output" | sed 's/\\/\\\\/g; s/"/\\"/g')
+{
+	printf '%s\r\n' '{"execute":"qmp_capabilities"}'
+	printf '%s\r\n' "{\"execute\":\"screendump\",\"arguments\":{\"filename\":\"$escaped\"}}"
+} | socat - "UNIX-CONNECT:$socket" >/tmp/mboot-qmp-response
+
+count=0
+while [ "$count" -lt 50 ]; do
+	[ -s "$output" ] && { chmod 0600 "$output"; printf '%s\n' "$output"; exit 0; }
+	count=$((count + 1))
+	sleep 0.1
+done
+echo 'QMP did not produce a screenshot' >&2
+exit 1

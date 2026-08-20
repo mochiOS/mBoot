@@ -14,7 +14,23 @@ scripts/generate-boot-config.sh "$GENERATED"
 require_line Makefile 'BUILDROOT_DEFCONFIG := $(BOOT_CONFIG_DIR)/mboot_x86_64_defconfig'
 require_line Makefile 'OUTPUT_COMPATIBILITY_VERSION := 2'
 require_line configs/mboot_x86_64_defconfig.in 'BR2_REPRODUCIBLE=y'
-require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_TARGET_GENERIC_HOSTNAME="mboot"'
+case "${MBOOT_DEVELOPMENT:-0}" in
+0)
+	require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_TARGET_GENERIC_HOSTNAME="mboot"'
+	if grep -Eq '^BR2_PACKAGE_(DROPBEAR|AVAHI|SOCAT)=y$' "$GENERATED/mboot_x86_64_defconfig"; then
+		fail 'release configuration contains remote development packages'
+	fi
+	;;
+1)
+	require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_TARGET_GENERIC_HOSTNAME="mboot-dev"'
+	require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_TARGET_ROOTFS_EXT2_SIZE="4G"'
+	for setting in BR2_PACKAGE_DROPBEAR=y BR2_PACKAGE_AVAHI=y \
+		BR2_PACKAGE_AVAHI_DAEMON=y BR2_PACKAGE_SOCAT=y; do
+		require_line "$GENERATED/mboot_x86_64_defconfig" "$setting"
+	done
+	;;
+*) fail 'MBOOT_DEVELOPMENT must be 0 or 1' ;;
+esac
 require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_MBOOT_PATH)/board/mboot/post-build.sh"'
 require_line "$GENERATED/mboot_x86_64_defconfig" 'BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_MBOOT_PATH)/board/mboot/post-image.sh"'
 require_line "$GENERATED/mboot_x86_64_defconfig" '# BR2_TARGET_GENERIC_GETTY is not set'
@@ -172,6 +188,8 @@ grep -Fq '$(CURDIR)/external.mk' Makefile ||
 	fail 'inner QEMU package configuration is not a cache invalidation input'
 grep -Fq '$(CURDIR)/package/virglrenderer/virglrenderer.mk' Makefile ||
 	fail 'VirGL renderer configuration is not a cache invalidation input'
+grep -Fq '$(QEMU_TARGET_CONFIGURE): | virglrenderer' external.mk ||
+	fail 'QEMU configure does not wait for VirGL renderer staging installation'
 grep -Fq -- '-Dplatforms=egl' package/virglrenderer/virglrenderer.mk ||
 	fail 'VirGL renderer EGL platform is missing'
 
@@ -181,6 +199,8 @@ for script in board/mboot/post-build.sh board/mboot/post-image.sh \
 	board/mboot/rootfs-overlay/etc/init.d/S80mbootd \
 	board/mboot/rootfs-overlay/etc/init.d/S90mboot \
 	board/mboot/rootfs-overlay/usr/libexec/mboot-launcher \
+	board/mboot/development/mboot-deploy \
+	board/mboot/development/mboot-qmp-screenshot \
 	scripts/generate-boot-config.sh scripts/update-config-template.sh \
 	scripts/check-image.sh; do
 	sh -n "$script" || fail "shell syntax: $script"
@@ -198,6 +218,8 @@ grep -Fq 'MBOOT_BOOT_CONFIG_DIR="$(BOOT_CONFIG_DIR)"' Makefile ||
 	fail 'Makefile does not pass generated boot configuration into Buildroot'
 grep -Fq 'MBOOT_SOURCE_DATE_EPOCH="$(MBOOT_SOURCE_DATE_EPOCH)"' Makefile ||
 	fail 'Makefile does not pass a reproducible timestamp into Buildroot hooks'
+grep -Fq 'MBOOT_DEVELOPMENT="$(MBOOT_DEVELOPMENT)"' Makefile ||
+	fail 'Makefile does not pass the development profile into Buildroot hooks'
 grep -Fq 'target-feature=+crt-static' Makefile ||
 	fail 'mbootd is not built independently of the host dynamic loader'
 grep -Fq 'BR2_PACKAGE_XTERM=y' configs/mboot_x86_64_defconfig.in ||

@@ -125,9 +125,30 @@ test -x "$TARGET/usr/sbin/wpa_supplicant" || fail 'wpa_supplicant is missing'
 test -x "$TARGET/usr/sbin/iw" || fail 'iw is missing'
 test -x "$TARGET/usr/sbin/rfkill" || fail 'rfkill is missing'
 
-[ "$(cat "$TARGET/etc/hostname")" = "$MBOOT_HOSTNAME" ] || fail 'target hostname is not mboot'
+if [ "${MBOOT_DEVELOPMENT:-0}" = 1 ]; then
+	expected_hostname=mboot-dev
+else
+	expected_hostname=$MBOOT_HOSTNAME
+fi
+[ "$(cat "$TARGET/etc/hostname")" = "$expected_hostname" ] || fail 'target hostname is incorrect'
 image_hostname=$(debugfs -R 'cat /etc/hostname' "$IMAGES/rootfs.ext2" 2>/dev/null)
-[ "$image_hostname" = "$MBOOT_HOSTNAME" ] || fail 'image hostname is not mboot'
+[ "$image_hostname" = "$expected_hostname" ] || fail 'image hostname is incorrect'
+
+if [ "${MBOOT_DEVELOPMENT:-0}" = 1 ]; then
+	test -f "$TARGET/etc/mboot-development" || fail 'development marker is missing'
+	test -s "$TARGET/root/.ssh/authorized_keys" || fail 'development authorized key is missing'
+	for path in usr/sbin/dropbear usr/bin/socat usr/libexec/mboot-deploy \
+		usr/libexec/mboot-qmp-screenshot; do
+		test -x "$TARGET/$path" || fail "development executable is missing: /$path"
+	done
+	test ! -e "$TARGET/usr/bin/procan" ||
+		fail 'socat diagnostic helper leaked into development image'
+else
+	test ! -e "$TARGET/etc/mboot-development" || fail 'release image contains development marker'
+	test ! -e "$TARGET/root/.ssh/authorized_keys" || fail 'release image contains development key'
+	test ! -e "$TARGET/usr/libexec/mboot-deploy" || fail 'release image contains deployment command'
+	test ! -e "$TARGET/usr/libexec/mboot-qmp-screenshot" || fail 'release image contains QMP command'
+fi
 image_passwd=$(debugfs -R 'cat /etc/passwd' "$IMAGES/rootfs.ext2" 2>/dev/null)
 image_group=$(debugfs -R 'cat /etc/group' "$IMAGES/rootfs.ext2" 2>/dev/null)
 printf '%s\n' "$image_passwd" | grep -Fq 'root:x:0:0:' ||

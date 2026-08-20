@@ -106,13 +106,51 @@ install -m 0600 "$MBOOT_MOCHIOS_IMAGE" "$TARGET_DIR/var/lib/mboot/mochiOS.img"
 find "$TARGET_DIR" -type f -name '*-gdb.py' -delete
 rm -rf "$TARGET_DIR/usr/libexec/libinput"
 rm -f "$TARGET_DIR/usr/bin/libinput"
+# socat's diagnostic helper embeds the build-time compiler path verbatim.
+# The appliance only uses socat itself for the development QMP socket.
+rm -f "$TARGET_DIR/usr/bin/procan"
 # Buildroot normally points /var/log at /tmp. Appliance diagnostics must
 # survive a reboot and be inspectable after an early display failure.
 if [ -L "$TARGET_DIR/var/log" ]; then rm "$TARGET_DIR/var/log"; fi
 install -d -m 0755 "$TARGET_DIR/var/log"
 install -d -m 0750 "$TARGET_DIR/var/log/mboot"
 
-# Buildroot's empty-password default is inappropriate even without a getty.
+case "${MBOOT_DEVELOPMENT:-0}" in
+0)
+	rm -f "$TARGET_DIR/etc/mboot-development"
+	rm -rf "$TARGET_DIR/root/.ssh"
+	rm -f "$TARGET_DIR/etc/default/dropbear" \
+		"$TARGET_DIR/usr/libexec/mboot-deploy" \
+		"$TARGET_DIR/usr/libexec/mboot-qmp-screenshot"
+	;;
+1)
+	key=${MBOOT_DEV_AUTHORIZED_KEY:-}
+	[ -n "$key" ] && [ -r "$key" ] || {
+		echo 'mBoot: development build requires MBOOT_DEV_AUTHORIZED_KEY' >&2
+		exit 1
+	}
+	set -- $(sed -n '1{s/[[:space:]][[:space:]]*/ /g;p;}' "$key")
+	[ "$#" -ge 2 ] || { echo 'mBoot: invalid development SSH public key' >&2; exit 1; }
+	case "$1" in ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) :;;
+		*) echo 'mBoot: unsupported development SSH public key' >&2; exit 1;;
+	esac
+	install -d -m 0700 "$TARGET_DIR/root/.ssh"
+	printf '%s %s\n' "$1" "$2" > "$TARGET_DIR/root/.ssh/authorized_keys"
+	chmod 0600 "$TARGET_DIR/root/.ssh/authorized_keys"
+	install -D -m 0644 /dev/null "$TARGET_DIR/etc/mboot-development"
+	install -d -m 0755 "$TARGET_DIR/etc/default"
+	printf '%s\n' 'DROPBEAR_ARGS="-s -g -j -k -p 22"' > \
+		"$TARGET_DIR/etc/default/dropbear"
+	install -D -m 0755 "$BR2_EXTERNAL_MBOOT_PATH/board/mboot/development/mboot-deploy" \
+		"$TARGET_DIR/usr/libexec/mboot-deploy"
+	install -D -m 0755 "$BR2_EXTERNAL_MBOOT_PATH/board/mboot/development/mboot-qmp-screenshot" \
+		"$TARGET_DIR/usr/libexec/mboot-qmp-screenshot"
+	;;
+*) echo 'mBoot: MBOOT_DEVELOPMENT must be 0 or 1' >&2; exit 1;;
+esac
+
+# Public-key authentication does not require an unlocked password entry.
+# Keep root password authentication locked in every image profile.
 sed -i 's/^root:[^:]*:/root:!:/' "$TARGET_DIR/etc/shadow"
 
 # Xorg 21.1's modular modesetting/fbdev drivers leave these runtime providers

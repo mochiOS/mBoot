@@ -114,6 +114,39 @@ mochiOS が正常終了すると mBoot も電源を切ります。初期化失�
 異常終了時はログインシェルを開かず、tty1 に短いエラーコードとログ位置を
 表示します。
 
+## 開発用リモートデバッグ
+
+mochiOSリポジトリの`make mboot-dev`は、通常版とは別の`mboot/output-dev/`へ
+開発専用イメージを生成します。SSH公開鍵を明示し、初回だけUSB全体へ書き込みます。
+
+```sh
+make mboot-dev MBOOT_DEV_AUTHORIZED_KEY="$HOME/.ssh/id_ed25519.pub"
+```
+
+開発版だけが鍵認証専用Dropbear、`mboot-dev.local`のmDNS広告、QMP Unix socket、
+検証付きイメージ交換コマンドを含みます。root password認証、SSH forwarding、
+QMPのTCP listenは無効で、rootのpassword entryもロック状態を維持します。
+通常の`make mboot`と`make release`にはこれらを
+収録しません。開発版root filesystemは現在と直前のmochiOSイメージを保持できる
+よう4 GiBで生成されるため、8 GiB以上のUSB媒体が必要です。
+
+最初の書き込み後は、同じLAN上の開発PCからmochiOSだけを更新できます。
+
+```sh
+make device-status DEVICE=mboot-dev.local
+make deploy-device DEVICE=mboot-dev.local
+make device-logs DEVICE=mboot-dev.local
+make device-screenshot DEVICE=mboot-dev.local
+make device-restart DEVICE=mboot-dev.local
+make device-rollback DEVICE=mboot-dev.local
+```
+
+`deploy-device`は転送完了後にGPT headerとSHA-256を実機側で検証し、QEMUを停止して
+イメージを同一filesystem内で切り替えます。新しいQEMUが起動しない場合は直前の
+イメージへ自動rollbackします。Wi-Fi設定とmBootログはmBoot root filesystemに
+残るため、この更新では消えません。Wi-Fi自体を試験して一時的に接続が切れた場合、
+再接続後に同じコマンドを再実行できます。
+
 ## mBoot Control Protocol
 
 通信デバイスに依存しないv1 codecは`crates/mboot-protocol`、Linux daemonは

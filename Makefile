@@ -1,6 +1,8 @@
 BUILDROOT_DIR := $(CURDIR)/buildroot
 BUILDROOT_VERSION := 2025.02.16
 OUTPUT_DIR := $(CURDIR)/output
+MBOOT_DEVELOPMENT ?= 0
+MBOOT_DEV_AUTHORIZED_KEY ?=
 BOOT_CONFIG_DIR := $(OUTPUT_DIR)/generated
 BUILDROOT_DEFCONFIG := $(BOOT_CONFIG_DIR)/mboot_x86_64_defconfig
 BOOT_CONFIG_STAMP := $(BOOT_CONFIG_DIR)/.buildroot-config.sha256
@@ -70,12 +72,13 @@ mbootd:
 
 .PHONY: prepare-boot-config
 prepare-boot-config:
-	scripts/generate-boot-config.sh "$(BOOT_CONFIG_DIR)"
+	MBOOT_DEVELOPMENT="$(MBOOT_DEVELOPMENT)" \
+		scripts/generate-boot-config.sh "$(BOOT_CONFIG_DIR)"
 
 .PHONY: check
 check: prepare-boot-config
 	MBOOT_BOOT_CONFIG_DIR="$(BOOT_CONFIG_DIR)" scripts/check-config.sh
-	scripts/test-boot-config.sh
+	MBOOT_DEVELOPMENT="$(MBOOT_DEVELOPMENT)" scripts/test-boot-config.sh
 
 .PHONY: check-image
 check-image: build
@@ -140,7 +143,9 @@ defconfig: setup prepare-boot-config
 		BR2_EXTERNAL="$(CURDIR)" \
 		BR2_DEFCONFIG="$(BUILDROOT_DEFCONFIG)" \
 		defconfig
-	@sha256sum $(BOOT_CONFIG_SOURCES) | sha256sum | awk '{print $$1}' > \
+	@{ sha256sum $(BOOT_CONFIG_SOURCES); \
+		printf '%s\n' 'development=$(MBOOT_DEVELOPMENT)'; \
+	} | sha256sum | awk '{print $$1}' > \
 		"$(BOOT_CONFIG_STAMP).new"
 	@mv "$(BOOT_CONFIG_STAMP).new" "$(BOOT_CONFIG_STAMP)"
 	@printf '%s\n' "$(OUTPUT_COMPATIBILITY_VERSION)" > \
@@ -150,7 +155,9 @@ defconfig: setup prepare-boot-config
 .PHONY: configure
 configure: setup prepare-boot-config
 	@set -eu; \
-	digest=$$(sha256sum $(BOOT_CONFIG_SOURCES) | sha256sum | awk '{print $$1}'); \
+		digest=$$({ sha256sum $(BOOT_CONFIG_SOURCES); \
+			printf '%s\n' 'development=$(MBOOT_DEVELOPMENT)'; \
+		} | sha256sum | awk '{print $$1}'); \
 	current=; \
 	output_version=; \
 	if [ -f "$(BOOT_CONFIG_STAMP)" ]; then current=$$(cat "$(BOOT_CONFIG_STAMP)"); fi; \
@@ -254,6 +261,8 @@ build: configure check check-mochios prepare-qemu prepare-xserver prepare-linux-
 	MBOOTD_BINARY="$(MBOOTD_BINARY)" \
 	MBOOT_BOOT_CONFIG_DIR="$(BOOT_CONFIG_DIR)" \
 	MBOOT_SOURCE_DATE_EPOCH="$(MBOOT_SOURCE_DATE_EPOCH)" \
+	MBOOT_DEVELOPMENT="$(MBOOT_DEVELOPMENT)" \
+	MBOOT_DEV_AUTHORIZED_KEY="$(MBOOT_DEV_AUTHORIZED_KEY)" \
 	$(MAKE) -C "$(BUILDROOT_DIR)" \
 		O="$(OUTPUT_DIR)" \
 		-j"$(JOBS)"
