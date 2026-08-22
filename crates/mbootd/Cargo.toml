@@ -8,3 +8,4 @@ license.workspace = true
 mboot-protocol = { path = "../mboot-protocol", features = ["std"] }
 x11rb = { version = "0.14.0", default-features = false, features = ["composite", "xtest"] }
 sha2 = { version = "0.10.9", default-features = false }
+libc = "0.2"

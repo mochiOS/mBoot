@@ -722,6 +722,7 @@ fn validate_command_arguments(
                 || message.argument("entry").is_none()
                 || message.argument("user").is_none()
                 || message.argument("writable").is_none()
+                || !matches!(message.argument("network"), Some("none" | "client"))
             {
                 return Err(ValidationError::InvalidArgument);
             }
@@ -1322,6 +1323,7 @@ mod tests {
                 Argument::new("entry", "/usr/bin/editor"),
                 Argument::new("user", "alice"),
                 Argument::new("writable", "/usr/share/editor,/var/lib/editor"),
+                Argument::new("network", "client"),
             ],
             KnownCommand::LinuxWindows => alloc::vec![Argument::new("instance", "9")],
             KnownCommand::LinuxWindowInfo | KnownCommand::LinuxClose => alloc::vec![

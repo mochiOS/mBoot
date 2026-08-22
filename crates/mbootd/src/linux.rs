@@ -138,6 +138,7 @@ impl LinuxBridge {
         entrypoint: &str,
         user: &str,
         writable: &str,
+        network: &str,
         portal_mounts: &[PortalMount],
     ) -> Result<u32, LinuxError> {
         if instance == 0 || self.instances.contains_key(&instance) {
@@ -147,7 +148,7 @@ impl LinuxBridge {
                 LinuxError::Busy
             });
         }
-        let mut sandbox = LinuxSandbox::prepare(instance, bundle, user, writable, portal_mounts)
+        let mut sandbox = LinuxSandbox::prepare(instance, bundle, user, writable, network, portal_mounts)
             .map_err(sandbox_error)?;
         let display_name = format!(":{}", 1000 + instance % 50_000);
         let display_number = display_name
@@ -175,12 +176,7 @@ impl LinuxBridge {
                 return Err(error);
             }
         };
-        if let Err(error) = sandbox.expose_x11(&socket) {
-            let _ = xvfb.kill();
-            let _ = xvfb.wait();
-            return Err(sandbox_error(error));
-        }
-        let child = match sandbox.launch(entrypoint, &display_name, instance) {
+        let child = match sandbox.launch(entrypoint, &display_name, instance, &socket, network) {
             Ok(child) => child,
             Err(error) => {
                 let _ = xvfb.kill();
@@ -207,6 +203,10 @@ impl LinuxBridge {
 
     pub(crate) fn windows(&mut self, instance: u64) -> Result<Vec<Window>, LinuxError> {
         let pid = self.live_pid(instance)?;
+        let dedicated_display = self
+            .instances
+            .get(&instance)
+            .is_some_and(|instance| instance.display.is_some());
         let (connection, screen_index) = self.connection_for(instance)?;
         let screen = connection
             .setup()
@@ -237,7 +237,14 @@ impl LinuxBridge {
             if attributes.map_state == MapState::UNMAPPED {
                 continue;
             }
-            if window_matches_instance(connection, window, instance, pid_atom, pid) {
+            // Bundle applications run on an Xvfb dedicated to this instance,
+            // so every mapped top-level window on that display is owned by it.
+            // PID matching remains necessary for legacy applications sharing
+            // the host display, but it rejects bundle apps whose UI is created
+            // by a child process.
+            if dedicated_display
+                || window_matches_instance(connection, window, instance, pid_atom, pid)
+            {
                 windows.push(window);
             }
         }

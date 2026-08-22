@@ -65,6 +65,22 @@ ensure_directory_path() {
 	done
 }
 
+migrate_missing_children() {
+	old_root=$1
+	new_root=$2
+	relative=$3
+	validate_directory_path "$old_root" "$relative" || return 1
+	ensure_directory_path "$new_root" "$relative" || return 1
+	for source in "$old_root/$relative"/*; do
+		[ -e "$source" ] || [ -L "$source" ] || continue
+		name=${source##*/}
+		destination=$new_root/$relative/$name
+		if [ ! -e "$destination" ] && [ ! -L "$destination" ]; then
+			cp -a "$source" "$destination"
+		fi
+	done
+}
+
 migrate_persistent_state() (
 	old_mount=$MIGRATION_ROOT/old
 	new_mount=$MIGRATION_ROOT/new
@@ -93,6 +109,14 @@ migrate_persistent_state() (
 			validate_directory_path "$old_mount" "$path" || return 1
 			ensure_directory_path "$new_mount" "$path" || return 1
 			cp -a "$old_mount/$path/." "$new_mount/$path/"
+		fi
+	done
+	# User-installed bundles and their package records live beside system-owned
+	# entries. Carry forward only names absent from the new image so an installed
+	# package cannot replace a newer system component during development deploys.
+	for path in applications system/packages; do
+		if [ -e "$old_mount/$path" ] || [ -L "$old_mount/$path" ]; then
+			migrate_missing_children "$old_mount" "$new_mount" "$path" || return 1
 		fi
 	done
 	sync

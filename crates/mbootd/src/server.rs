@@ -451,6 +451,9 @@ fn dispatch(
                 message
                     .argument("writable")
                     .ok_or(LinuxError::InvalidArgument)?,
+                message
+                    .argument("network")
+                    .ok_or(LinuxError::InvalidArgument)?,
                 &portal_mounts,
             )?;
             Ok(vec![Argument::new("process", process.to_string())])

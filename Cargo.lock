@@ -102,6 +102,7 @@ version = "0.1.0"
 name = "mbootd"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mboot-protocol",
  "sha2",
  "x11rb",
