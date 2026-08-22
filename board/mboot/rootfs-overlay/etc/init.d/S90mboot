@@ -13,6 +13,14 @@ valid_pid() {
 	[ -r "/proc/$pid/cmdline" ] && tr '\000' ' ' < "/proc/$pid/cmdline" | grep -Fq "$DAEMON"
 }
 
+valid_qemu_pid() {
+	[ -f /run/mboot/qemu.pid ] || return 1
+	qemu_pid=$(cat /run/mboot/qemu.pid 2>/dev/null)
+	case "$qemu_pid" in ''|*[!0-9]*) return 1;; esac
+	[ -r "/proc/$qemu_pid/cmdline" ] &&
+		tr '\000' ' ' < "/proc/$qemu_pid/cmdline" | grep -Fq qemu-system-x86_64
+}
+
 wait_image_lock() {
 	count=0
 	while [ "$count" -lt 150 ]; do
@@ -58,12 +66,26 @@ stop() {
 		return 1
 	fi
 	pid=$(cat "$PIDFILE")
+	qemu_pid=
+	valid_qemu_pid && qemu_pid=$(cat /run/mboot/qemu.pid)
 	kill -TERM "$pid" 2>/dev/null || true
+	[ -z "$qemu_pid" ] || kill -TERM "$qemu_pid" 2>/dev/null || true
 	count=0
-	while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 100 ]; do
+	while { kill -0 "$pid" 2>/dev/null || { [ -n "$qemu_pid" ] && kill -0 "$qemu_pid" 2>/dev/null; }; } &&
+		[ "$count" -lt 600 ]; do
 		count=$((count + 1)); sleep 0.1
 	done
-	if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+	[ -z "$qemu_pid" ] || kill -KILL "$qemu_pid" 2>/dev/null || true
+	kill -KILL "$pid" 2>/dev/null || true
+	count=0
+	while { kill -0 "$pid" 2>/dev/null || { [ -n "$qemu_pid" ] && kill -0 "$qemu_pid" 2>/dev/null; }; } &&
+		[ "$count" -lt 100 ]; do
+		count=$((count + 1)); sleep 0.1
+	done
+	if kill -0 "$pid" 2>/dev/null || { [ -n "$qemu_pid" ] && kill -0 "$qemu_pid" 2>/dev/null; }; then
+		echo 'process stop timeout'
+		return 1
+	fi
 	if ! wait_image_lock; then
 		echo 'image lock timeout'
 		return 1

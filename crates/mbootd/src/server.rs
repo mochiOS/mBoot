@@ -5,8 +5,9 @@ use crate::linux_stage::{LinuxStageState, StageError};
 use crate::wifi::{WifiError, WifiManager, decode_hex};
 use crate::{GuestState, StateError};
 use mboot_protocol::{
-    Argument, Body, Command, ConnectionValidator, Destination, ErrorCode, KnownCommand,
-    MAX_MESSAGE_LEN, Message, MessageType, ValidationError, decode_line, encode_to_string,
+    Argument, BULK_STAGE_HEADER_LEN, BULK_STAGE_MAGIC, Body, Command, ConnectionValidator,
+    Destination, ErrorCode, KnownCommand, MAX_BULK_STAGE_BYTES, MAX_MESSAGE_LEN, Message,
+    MessageType, ValidationError, decode_line, encode_to_string,
 };
 use std::fs;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
@@ -82,12 +83,13 @@ pub fn serve_connection(
     let mut linux_portal = LinuxPortalState::default();
     let wifi = WifiManager;
     let session = session_id();
+    let mut bulk_stage_enabled = false;
     state.connected();
     eprintln!("guest connected");
 
     loop {
-        let line = match read_line_limited(&mut reader) {
-            Ok(Some(line)) => line,
+        let inbound = match read_inbound(&mut reader) {
+            Ok(Some(inbound)) => inbound,
             Ok(None) => return Ok(()),
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 if state.check_heartbeat_timeout(
@@ -99,6 +101,26 @@ pub fn serve_connection(
                 continue;
             }
             Err(error) => return Err(error),
+        };
+
+        let line = match inbound {
+            Inbound::StageChunk {
+                instance,
+                offset,
+                bytes,
+            } => {
+                if !bulk_stage_enabled {
+                    return Err(io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        "bulk staging before protocol negotiation",
+                    ));
+                }
+                if let Err(error) = linux_stage.append_bytes(instance, offset, &bytes) {
+                    eprintln!("invalid bulk stage chunk: {error:?}");
+                }
+                continue;
+            }
+            Inbound::Line(line) => line,
         };
 
         let message = match decode_line(&line) {
@@ -127,6 +149,11 @@ pub fn serve_connection(
             heartbeat_ms,
         );
         if let Some(response) = response {
+            if response.known_command() == Some(KnownCommand::ProtocolWelcome)
+                && matches!(&response.body, Body::Command(_))
+            {
+                bulk_stage_enabled = true;
+            }
             send(&mut stream, &response)?;
             if message.message_type == MessageType::Request {
                 validator
@@ -135,6 +162,47 @@ pub fn serve_connection(
             }
         }
     }
+}
+
+enum Inbound {
+    Line(Vec<u8>),
+    StageChunk {
+        instance: u64,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+}
+
+fn read_inbound(reader: &mut impl BufRead) -> io::Result<Option<Inbound>> {
+    let prefix = reader.fill_buf()?;
+    if prefix.is_empty() {
+        return Ok(None);
+    }
+    if prefix[0] != BULK_STAGE_MAGIC[0] {
+        return read_line_limited(reader).map(|line| line.map(Inbound::Line));
+    }
+    let mut header = [0u8; BULK_STAGE_HEADER_LEN];
+    reader.read_exact(&mut header)?;
+    if header[..8] != BULK_STAGE_MAGIC {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid bulk stage magic",
+        ));
+    }
+    let instance = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    let offset = u64::from_le_bytes(header[16..24].try_into().unwrap());
+    let length = u64::from_le_bytes(header[24..32].try_into().unwrap());
+    let length = usize::try_from(length)
+        .ok()
+        .filter(|length| *length > 0 && *length <= MAX_BULK_STAGE_BYTES)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid bulk stage length"))?;
+    let mut bytes = vec![0u8; length];
+    reader.read_exact(&mut bytes)?;
+    Ok(Some(Inbound::StageChunk {
+        instance,
+        offset,
+        bytes,
+    }))
 }
 
 fn dispatch(
@@ -290,12 +358,18 @@ fn dispatch(
             Ok(vec![Argument::new("cached", u8::from(cached).to_string())])
         }),
         KnownCommand::LinuxStageChunk => stage_response(message, || {
+            let data = message
+                .argument("data")
+                .ok_or(StageError::InvalidArgument)?;
+            let data = match message.argument("encoding") {
+                Some("base64") => format!("base64:{data}"),
+                None => data.to_owned(),
+                Some(_) => return Err(StageError::InvalidArgument),
+            };
             linux_stage.append(
                 stage_u64(message, "instance")?,
                 stage_u64(message, "offset")?,
-                message
-                    .argument("data")
-                    .ok_or(StageError::InvalidArgument)?,
+                &data,
             )?;
             Ok(Vec::new())
         }),
@@ -631,12 +705,19 @@ fn stage_response(
     operation: impl FnOnce() -> Result<Vec<Argument>, StageError>,
 ) -> Option<Message> {
     match operation() {
-        Ok(arguments) => Some(Message::ok(
+        Ok(arguments) if message.message_type == MessageType::Request => Some(Message::ok(
             Destination::Mochios,
             message.request_id,
             arguments,
         )),
-        Err(error) => request_error(message, stage_error_code(error), None),
+        Ok(_) => None,
+        Err(error) => {
+            eprintln!(
+                "Linux staging command {:?} failed: {error:?}",
+                message.known_command()
+            );
+            request_error(message, stage_error_code(error), None)
+        }
     }
 }
 

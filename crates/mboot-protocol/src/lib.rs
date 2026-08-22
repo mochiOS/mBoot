@@ -9,7 +9,18 @@ use alloc::vec::Vec;
 use core::fmt;
 
 pub const VERSION: u16 = 1;
-pub const MAX_MESSAGE_LEN: usize = 4096;
+pub const MAX_IPC_MESSAGE_LEN: usize = 4096;
+pub const MAX_MESSAGE_LEN: usize = 512 * 1024;
+/// Binary guest-local IPC command used for zero-copy Linux staging. This is
+/// never placed on the mBoot wire; mboot-agent turns it into a validated
+/// `LINUX.STAGE.CHUNK` event.
+pub const STAGE_SHARED_CHUNK_MAGIC: [u8; 8] = *b"MBSTG001";
+pub const STAGE_SHARED_CHUNK_LEN: usize = 32;
+/// Framing for large, one-way stage payloads on the authenticated mBoot
+/// control stream. A NUL prefix keeps it unambiguous from text protocol lines.
+pub const BULK_STAGE_MAGIC: [u8; 8] = *b"\0MBULK01";
+pub const BULK_STAGE_HEADER_LEN: usize = 32;
+pub const MAX_BULK_STAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_PENDING_REQUESTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -547,7 +558,9 @@ pub fn validate_message(message: &Message) -> Result<(), ValidationError> {
     validate_command_arguments(command, message)?;
 
     let (destination, message_type) = command_contract(command);
-    if message_type != message.message_type {
+    let streaming_stage_chunk =
+        command == KnownCommand::LinuxStageChunk && message.message_type == MessageType::Event;
+    if message_type != message.message_type && !streaming_stage_chunk {
         return Err(ValidationError::InvalidMessageType);
     }
     if !destination.accepts(message.destination) {
@@ -1437,7 +1450,7 @@ mod tests {
     #[test]
     fn malformed_lines_are_rejected() {
         assert_eq!(
-            decode_line(&alloc::vec![b'a'; 4097]),
+            decode_line(&alloc::vec![b'a'; MAX_MESSAGE_LEN + 1]),
             Err(DecodeError::TooLong)
         );
         assert_eq!(
@@ -1522,6 +1535,24 @@ mod tests {
             decode_line(b"@MBOOT 1 REQ 1 GUEST.READY stage=kernel\n"),
             Err(DecodeError::InvalidMessageType)
         );
+    }
+
+    #[test]
+    fn linux_stage_chunks_may_use_ordered_stream_events() {
+        let message = Message::command(
+            Destination::Mboot,
+            MessageType::Event,
+            0,
+            KnownCommand::LinuxStageChunk,
+            alloc::vec![
+                Argument::new("instance", "9"),
+                Argument::new("offset", "0"),
+                Argument::new("encoding", "base64"),
+                Argument::new("data", "AAE"),
+            ],
+        );
+        assert_eq!(validate_message(&message), Ok(()));
+        assert!(encode_to_string(&message).is_ok());
     }
 
     #[test]

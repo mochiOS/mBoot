@@ -358,7 +358,13 @@ mboot_log INFO "QEMU arguments follow (one argument per field):"
 for argument in "$@"; do mboot_log INFO "qemu-arg: <$argument>"; done
 : > "$QEMU_LOG"
 qemu_started=$(date +%s)
-"$@" >>"$QEMU_LOG" 2>&1 &
+# The image lock belongs to the supervising launcher, not QEMU.  Letting QEMU
+# inherit fd 9 keeps the lock alive after the launcher exits and makes safe
+# development image replacement time out.
+(
+	exec 9>&-
+	exec "$@"
+) >>"$QEMU_LOG" 2>&1 &
 qemu_pid=$!
 printf '%s\n' "$qemu_pid" > "$QEMU_PIDFILE"
 mboot_log INFO "QEMU pid: $qemu_pid"

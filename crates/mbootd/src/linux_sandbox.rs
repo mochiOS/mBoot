@@ -179,14 +179,42 @@ impl LinuxSandbox {
     fn mount_resolver(&mut self, merged: &Path) -> Result<(), SandboxError> {
         let destination = merged.join("etc/resolv.conf");
         if !destination.is_file() {
-            return Err(SandboxError::NotFound);
+            let lower = self.root.join("lower/etc");
+            if !lower.is_dir() || !merged.join("etc").is_dir() {
+                return Err(SandboxError::NotFound);
+            }
+            let upper = self.root.join("resolver-etc-upper");
+            let work = self.root.join("resolver-etc-work");
+            fs::create_dir_all(&upper).map_err(|_| SandboxError::Internal)?;
+            fs::create_dir_all(&work).map_err(|_| SandboxError::Internal)?;
+            let options = format!(
+                "nodev,nosuid,lowerdir={},upperdir={},workdir={}",
+                lower.display(),
+                upper.display(),
+                work.display()
+            );
+            let target = merged.join("etc");
+            run_mount([
+                "-t",
+                "overlay",
+                "-o",
+                &options,
+                "overlay",
+                path_str(&target)?,
+            ])?;
+            self.mounts.push(target);
+            fs::write(&destination, []).map_err(|_| SandboxError::Internal)?;
         }
         let source = self.root.join("resolv.conf");
         fs::write(&source, b"nameserver 1.1.1.1\nnameserver 9.9.9.9\n")
             .map_err(|_| SandboxError::Internal)?;
         run_mount(["--bind", path_str(&source)?, path_str(&destination)?])?;
         self.mounts.push(destination.clone());
-        run_mount(["-o", "remount,bind,ro,nodev,nosuid,noexec", path_str(&destination)?])
+        run_mount([
+            "-o",
+            "remount,bind,ro,nodev,nosuid,noexec",
+            path_str(&destination)?,
+        ])
     }
 
     fn mount_writable_path(
@@ -333,36 +361,140 @@ impl NetworkLease {
         let guest_interface = format!("mg{suffix}");
         let slot = (instance % 16_384) as u32;
         let address = (100u32 << 24) | (64u32 << 16) | (slot * 4);
-        let octets = |value: u32| format!("{}.{}.{}.{}", value >> 24, (value >> 16) & 255, (value >> 8) & 255, value & 255);
+        let octets = |value: u32| {
+            format!(
+                "{}.{}.{}.{}",
+                value >> 24,
+                (value >> 16) & 255,
+                (value >> 8) & 255,
+                value & 255
+            )
+        };
         let subnet = format!("{}/30", octets(address));
         let host_address = format!("{}/30", octets(address + 1));
         let guest_address = format!("{}/30", octets(address + 2));
         let gateway = octets(address + 1);
-        let mut lease = Self { host_interface: host_interface.clone(), rules: Vec::new() };
+        let mut lease = Self {
+            host_interface: host_interface.clone(),
+            rules: Vec::new(),
+        };
 
-        run_command("ip", &["link", "add", &host_interface, "type", "veth", "peer", "name", &guest_interface])?;
+        run_command(
+            "ip",
+            &[
+                "link",
+                "add",
+                &host_interface,
+                "type",
+                "veth",
+                "peer",
+                "name",
+                &guest_interface,
+            ],
+        )?;
         if let Err(error) = (|| {
-            run_command("ip", &["link", "set", &guest_interface, "netns", &namespace_pid.to_string()])?;
-            run_command("ip", &["addr", "add", &host_address, "dev", &host_interface])?;
+            run_command(
+                "ip",
+                &[
+                    "link",
+                    "set",
+                    &guest_interface,
+                    "netns",
+                    &namespace_pid.to_string(),
+                ],
+            )?;
+            run_command(
+                "ip",
+                &["addr", "add", &host_address, "dev", &host_interface],
+            )?;
             run_command("ip", &["link", "set", &host_interface, "up"])?;
             let namespace = format!("/proc/{namespace_pid}/ns/net");
-            run_command("nsenter", &["--net", &namespace, "--", "ip", "link", "set", "lo", "up"])?;
-            run_command("nsenter", &["--net", &namespace, "--", "ip", "addr", "add", &guest_address, "dev", &guest_interface])?;
-            run_command("nsenter", &["--net", &namespace, "--", "ip", "link", "set", &guest_interface, "up"])?;
-            run_command("nsenter", &["--net", &namespace, "--", "ip", "route", "add", "default", "via", &gateway])?;
-            fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n").map_err(|_| SandboxError::Internal)?;
+            let namespace_argument = format!("--net={namespace}");
+            run_command(
+                "nsenter",
+                &[&namespace_argument, "--", "ip", "link", "set", "lo", "up"],
+            )?;
+            run_command(
+                "nsenter",
+                &[
+                    &namespace_argument,
+                    "--",
+                    "ip",
+                    "addr",
+                    "add",
+                    &guest_address,
+                    "dev",
+                    &guest_interface,
+                ],
+            )?;
+            run_command(
+                "nsenter",
+                &[
+                    &namespace_argument,
+                    "--",
+                    "ip",
+                    "link",
+                    "set",
+                    &guest_interface,
+                    "up",
+                ],
+            )?;
+            run_command(
+                "nsenter",
+                &[
+                    &namespace_argument,
+                    "--",
+                    "ip",
+                    "route",
+                    "add",
+                    "default",
+                    "via",
+                    &gateway,
+                ],
+            )?;
+            fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n")
+                .map_err(|_| SandboxError::Internal)?;
             for destination in [
-                "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
-                "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
-                "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+                "0.0.0.0/8",
+                "10.0.0.0/8",
+                "100.64.0.0/10",
+                "127.0.0.0/8",
+                "169.254.0.0/16",
+                "172.16.0.0/12",
+                "192.0.0.0/24",
+                "192.168.0.0/16",
+                "198.18.0.0/15",
+                "224.0.0.0/4",
+                "240.0.0.0/4",
             ] {
-                lease.add_rule(None, "FORWARD", &["-i", &host_interface, "-d", destination, "-j", "REJECT"])?;
+                lease.add_rule(
+                    None,
+                    "FORWARD",
+                    &["-i", &host_interface, "-d", destination, "-j", "REJECT"],
+                )?;
             }
             lease.add_rule(None, "INPUT", &["-i", &host_interface, "-j", "DROP"])?;
             lease.add_rule(None, "FORWARD", &["-i", &host_interface, "-j", "ACCEPT"])?;
-            lease.add_rule(None, "FORWARD", &["-o", &host_interface, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"])?;
+            lease.add_rule(
+                None,
+                "FORWARD",
+                &[
+                    "-o",
+                    &host_interface,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "RELATED,ESTABLISHED",
+                    "-j",
+                    "ACCEPT",
+                ],
+            )?;
             lease.add_rule(None, "FORWARD", &["-o", &host_interface, "-j", "DROP"])?;
-            lease.add_rule(Some("nat"), "POSTROUTING", &["-s", &subnet, "-j", "MASQUERADE"])?;
+            lease.add_rule(
+                Some("nat"),
+                "POSTROUTING",
+                &["-s", &subnet, "-j", "MASQUERADE"],
+            )?;
             Ok(())
         })() {
             drop(lease);
@@ -371,7 +503,12 @@ impl NetworkLease {
         Ok(lease)
     }
 
-    fn add_rule(&mut self, table: Option<&'static str>, chain: &'static str, specification: &[&str]) -> Result<(), SandboxError> {
+    fn add_rule(
+        &mut self,
+        table: Option<&'static str>,
+        chain: &'static str,
+        specification: &[&str],
+    ) -> Result<(), SandboxError> {
         let mut arguments = Vec::new();
         if let Some(table) = table {
             arguments.extend(["-t".to_owned(), table.to_owned()]);
@@ -379,7 +516,14 @@ impl NetworkLease {
         arguments.extend(["-A".to_owned(), chain.to_owned()]);
         arguments.extend(specification.iter().map(|value| (*value).to_owned()));
         run_owned_command("iptables", &arguments)?;
-        self.rules.push((table, chain, specification.iter().map(|value| (*value).to_owned()).collect()));
+        self.rules.push((
+            table,
+            chain,
+            specification
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        ));
         Ok(())
     }
 }

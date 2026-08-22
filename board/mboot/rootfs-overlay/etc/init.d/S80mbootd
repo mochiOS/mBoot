@@ -30,7 +30,7 @@ start() {
 	fi
 	[ -x "$DAEMON" ] || { echo 'missing'; return 1; }
 	MBOOT_LINUX_DISPLAY="$DISPLAY_NUMBER" \
-		start-stop-daemon -S -q -b -m -p "$PIDFILE" -x "$DAEMON" -- "$SOCKET" >>"$LOG" 2>&1
+		start-stop-daemon -S -q -b -m -O "$LOG" -p "$PIDFILE" -x "$DAEMON" -- "$SOCKET"
 	count=0
 	while [ "$count" -lt 50 ]; do
 		if valid_pid && [ -S "$SOCKET" ]; then echo 'OK'; return 0; fi

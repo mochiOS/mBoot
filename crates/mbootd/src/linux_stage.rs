@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 const MAX_ROOTFS_SIZE: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_CHUNK_SIZE: usize = 1536;
+const MAX_CHUNK_SIZE: usize = 256 * 1024;
 const STAGING_ROOT: &str = "/var/lib/mboot/staging";
 const PACKAGE_ROOT: &str = "/bin/mboot";
+const DIGEST_FILE: &str = "rootfs.sha256";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StageError {
@@ -24,6 +25,7 @@ struct Transaction {
     expected_size: u64,
     expected_digest: [u8; 32],
     written: u64,
+    digest: Sha256,
     temporary: PathBuf,
     file: File,
 }
@@ -48,14 +50,18 @@ impl LinuxStageState {
             return Err(StageError::InvalidArgument);
         }
         let expected_digest = parse_digest(digest)?;
-        let installed = Path::new(PACKAGE_ROOT).join(bundle).join("rootfs.squashfs");
+        let package = Path::new(PACKAGE_ROOT).join(bundle);
+        let installed = package.join("rootfs.squashfs");
         if installed.exists() {
-            let mut file = File::open(installed).map_err(|_| StageError::Internal)?;
-            return if hash_file(&mut file)? == expected_digest {
-                Ok(true)
-            } else {
-                Err(StageError::Integrity)
-            };
+            let metadata = fs::metadata(&installed).map_err(|_| StageError::Internal)?;
+            if metadata.len() == size && cached_digest(&package)? == Some(expected_digest) {
+                return Ok(true);
+            }
+            let mut file = File::open(&installed).map_err(|_| StageError::Internal)?;
+            if metadata.len() == size && hash_file(&mut file)? == expected_digest {
+                write_cached_digest(&package, expected_digest)?;
+                return Ok(true);
+            }
         }
         fs::create_dir_all(STAGING_ROOT).map_err(|_| StageError::Internal)?;
         let temporary = Path::new(STAGING_ROOT).join(format!("{instance}.squashfs.partial"));
@@ -77,6 +83,7 @@ impl LinuxStageState {
             expected_size: size,
             expected_digest,
             written: 0,
+            digest: Sha256::new(),
             temporary,
             file,
         });
@@ -93,7 +100,10 @@ impl LinuxStageState {
         if offset != transaction.written {
             return Err(StageError::InvalidArgument);
         }
-        let bytes = decode_hex(encoded)?;
+        let bytes = match encoded.strip_prefix("base64:") {
+            Some(encoded) => decode_base64(encoded)?,
+            None => decode_hex(encoded)?,
+        };
         if bytes.is_empty()
             || bytes.len() > MAX_CHUNK_SIZE
             || transaction.written.saturating_add(bytes.len() as u64) > transaction.expected_size
@@ -104,6 +114,30 @@ impl LinuxStageState {
             .file
             .write_all(&bytes)
             .map_err(|_| StageError::Internal)?;
+        transaction.digest.update(&bytes);
+        transaction.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    pub(crate) fn append_bytes(
+        &mut self,
+        instance: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), StageError> {
+        let transaction = self.transaction_mut(instance)?;
+        if offset != transaction.written
+            || bytes.is_empty()
+            || bytes.len() > mboot_protocol::MAX_BULK_STAGE_BYTES
+            || transaction.written.saturating_add(bytes.len() as u64) > transaction.expected_size
+        {
+            return Err(StageError::InvalidArgument);
+        }
+        transaction
+            .file
+            .write_all(bytes)
+            .map_err(|_| StageError::Internal)?;
+        transaction.digest.update(bytes);
         transaction.written += bytes.len() as u64;
         Ok(())
     }
@@ -114,27 +148,7 @@ impl LinuxStageState {
             let _ = fs::remove_file(&transaction.temporary);
             return Err(StageError::InvalidState);
         }
-        transaction
-            .file
-            .sync_all()
-            .map_err(|_| StageError::Internal)?;
-        transaction
-            .file
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| StageError::Internal)?;
-        let mut digest = Sha256::new();
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let read = transaction
-                .file
-                .read(&mut buffer)
-                .map_err(|_| StageError::Internal)?;
-            if read == 0 {
-                break;
-            }
-            digest.update(&buffer[..read]);
-        }
-        if digest.finalize().as_slice() != transaction.expected_digest {
+        if transaction.digest.finalize_reset().as_slice() != transaction.expected_digest {
             let _ = fs::remove_file(&transaction.temporary);
             return Err(StageError::Integrity);
         }
@@ -144,13 +158,20 @@ impl LinuxStageState {
         if destination.exists() {
             let mut existing = File::open(&destination).map_err(|_| StageError::Internal)?;
             if hash_file(&mut existing)? == transaction.expected_digest {
+                write_cached_digest(&package, transaction.expected_digest)?;
                 let _ = fs::remove_file(&transaction.temporary);
                 return Ok(destination);
             }
-            let _ = fs::remove_file(&transaction.temporary);
-            return Err(StageError::Integrity);
         }
         fs::rename(&transaction.temporary, &destination).map_err(|_| StageError::Internal)?;
+        write_cached_digest(&package, transaction.expected_digest)?;
+        // The verified bytes are immediately usable from the page cache. Persist
+        // them asynchronously so application launch is not serialized on slow
+        // removable flash media.
+        let file = transaction.file;
+        std::thread::spawn(move || {
+            let _ = file.sync_all();
+        });
         Ok(destination)
     }
 
@@ -169,6 +190,26 @@ impl LinuxStageState {
             .filter(|transaction| transaction.instance == instance)
             .ok_or(StageError::InvalidState)
     }
+}
+
+fn cached_digest(package: &Path) -> Result<Option<[u8; 32]>, StageError> {
+    let value = match fs::read_to_string(package.join(DIGEST_FILE)) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(StageError::Internal),
+    };
+    Ok(parse_digest(value.trim()).ok())
+}
+
+fn write_cached_digest(package: &Path, digest: [u8; 32]) -> Result<(), StageError> {
+    let mut encoded = String::with_capacity(65);
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded.push('\n');
+    fs::write(package.join(DIGEST_FILE), encoded).map_err(|_| StageError::Internal)
 }
 
 impl Drop for LinuxStageState {
@@ -214,6 +255,53 @@ fn decode_hex(encoded: &str) -> Result<Vec<u8>, StageError> {
         .collect()
 }
 
+fn decode_base64(encoded: &str) -> Result<Vec<u8>, StageError> {
+    if encoded.is_empty() || encoded.len() % 4 == 1 {
+        return Err(StageError::InvalidArgument);
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 4 * 3 + 2);
+    let chunks = encoded.as_bytes().chunks(4);
+    for chunk in chunks {
+        if chunk.len() < 2 {
+            return Err(StageError::InvalidArgument);
+        }
+        let a = base64_digit(chunk[0])?;
+        let b = base64_digit(chunk[1])?;
+        let c = chunk
+            .get(2)
+            .copied()
+            .map(base64_digit)
+            .transpose()?
+            .unwrap_or(0);
+        let d = chunk
+            .get(3)
+            .copied()
+            .map(base64_digit)
+            .transpose()?
+            .unwrap_or(0);
+        let bits = (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
+        decoded.push((bits >> 16) as u8);
+        if chunk.len() > 2 {
+            decoded.push((bits >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            decoded.push(bits as u8);
+        }
+    }
+    Ok(decoded)
+}
+
+fn base64_digit(byte: u8) -> Result<u8, StageError> {
+    match byte {
+        b'A'..=b'Z' => Ok(byte - b'A'),
+        b'a'..=b'z' => Ok(byte - b'a' + 26),
+        b'0'..=b'9' => Ok(byte - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err(StageError::InvalidArgument),
+    }
+}
+
 fn hex_digit(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
@@ -251,5 +339,13 @@ mod tests {
             parse_digest(&"GG".repeat(32)),
             Err(StageError::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn base64_chunks_are_strict_and_bounded() {
+        assert_eq!(decode_base64("AAE").unwrap(), vec![0, 1]);
+        assert_eq!(decode_base64("YWJj").unwrap(), b"abc");
+        assert_eq!(decode_base64("A"), Err(StageError::InvalidArgument));
+        assert_eq!(decode_base64("AA="), Err(StageError::InvalidArgument));
     }
 }
