@@ -5,6 +5,7 @@ pub mod domain;
 pub mod event;
 pub mod grant;
 pub mod image;
+pub mod interrupt;
 pub mod manifest;
 pub mod memory;
 pub mod scheduler;
@@ -55,6 +56,7 @@ pub enum VmExitReason {
     Halt,
     Hypercall,
     Preempted,
+    InterruptWindow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,6 +187,30 @@ impl Virtualization {
         match self {
             Virtualization::Intel(vmx) => unsafe { vmx.inject_interrupt(vector) },
             Virtualization::Amd(svm) => unsafe { svm.inject_interrupt(vector) },
+        }
+    }
+
+    /// Reports whether the stopped guest can accept an external interrupt on
+    /// its next entry.
+    ///
+    /// # Safety
+    /// The vCPU must have entered at least once and be stopped on its owner CPU.
+    pub unsafe fn can_inject_interrupt(&mut self) -> Result<bool, Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.can_inject_interrupt() },
+            Virtualization::Amd(svm) => unsafe { svm.can_inject_interrupt() },
+        }
+    }
+
+    /// Enables or disables an exit when the guest next becomes interruptible.
+    /// AMD SVM keeps a queued VINTR in hardware and therefore needs no exit.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped on its owner CPU.
+    pub unsafe fn set_interrupt_window(&mut self, enabled: bool) -> Result<(), Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.set_interrupt_window(enabled) },
+            Virtualization::Amd(_) => Ok(()),
         }
     }
 

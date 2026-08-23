@@ -289,6 +289,15 @@ impl Svm {
         Ok(())
     }
 
+    pub unsafe fn can_inject_interrupt(&mut self) -> Result<bool, Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        // V_IRQ remains pending in the VMCB until IF, GIF and the interrupt
+        // shadow permit delivery, so SVM can accept it immediately.
+        Ok(true)
+    }
+
     /// Requests an ASID translation flush before the next VMRUN.
     ///
     /// # Safety

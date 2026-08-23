@@ -15,6 +15,7 @@ use mboot_hv::arch::x86_64::{cpu, descriptor, timer};
 use mboot_hv::domain::{Domain, DomainId, DomainRole, DomainState};
 use mboot_hv::event::EventChannelTable;
 use mboot_hv::grant::{GrantRef, GrantTable};
+use mboot_hv::interrupt::VirtualLocalApic;
 use mboot_hv::manifest::{LaunchManifest, ManifestDomainRole};
 use mboot_hv::memory::{NestedPageResources, NestedPageTable};
 use mboot_hv::scheduler::CooperativeScheduler;
@@ -88,7 +89,7 @@ struct RuntimeDomain {
     waiting: bool,
     resume_preempted: bool,
     event_irq_enabled: bool,
-    event_irq_pending: bool,
+    interrupts: VirtualLocalApic,
     _image: Vec<u8>,
 }
 
@@ -414,7 +415,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             waiting: false,
             resume_preempted: false,
             event_irq_enabled: false,
-            event_irq_pending: false,
+            interrupts: VirtualLocalApic::new(),
             _image: prepared.image,
         });
     }
@@ -449,15 +450,25 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     let mut scheduler = CooperativeScheduler::new();
     while let Some(index) = scheduler.next(&runnable) {
         let runtime = &mut runtime_domains[index];
-        if runtime.event_irq_pending {
-            if let Err(error) = unsafe {
-                runtime
-                    .virtualization
-                    .inject_interrupt(EVENT_CHANNEL_VECTOR)
-            } {
-                halt_with_error("Event IRQ injection", error)
+        if let Some(vector) = runtime.interrupts.next_pending() {
+            let can_inject = match unsafe { runtime.virtualization.can_inject_interrupt() } {
+                Ok(can_inject) => can_inject,
+                Err(error) => halt_with_error("Event IRQ readiness", error),
+            };
+            if can_inject {
+                if let Err(error) = unsafe { runtime.virtualization.set_interrupt_window(false) } {
+                    halt_with_error("Interrupt window disable", error)
+                }
+                if let Err(error) = unsafe { runtime.virtualization.inject_interrupt(vector) } {
+                    halt_with_error("Event IRQ injection", error)
+                }
+                if runtime.interrupts.accept(vector).is_err() {
+                    halt_with_error("Virtual APIC accept", mboot_hv::Error::InvalidState)
+                }
+            } else if let Err(error) = unsafe { runtime.virtualization.set_interrupt_window(true) }
+            {
+                halt_with_error("Interrupt window enable", error)
             }
-            runtime.event_irq_pending = false;
         }
         // SAFETY: The selected vCPU is stopped and owns all guest and control state.
         let vm_exit = if runtime.resume_preempted {
@@ -488,6 +499,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     runtime.preemption_count
                 );
             }
+            runtime.resume_preempted = true;
+            continue;
+        }
+        if vm_exit.reason == VmExitReason::InterruptWindow {
             runtime.resume_preempted = true;
             continue;
         }
@@ -714,7 +729,13 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                         runtime_domains[target_index].waiting = false;
                         runnable[target_index] = true;
                     } else if runtime_domains[target_index].event_irq_enabled {
-                        runtime_domains[target_index].event_irq_pending = true;
+                        if runtime_domains[target_index]
+                            .interrupts
+                            .raise(EVENT_CHANNEL_VECTOR)
+                            .is_err()
+                        {
+                            halt_with_error("Virtual APIC raise", mboot_hv::Error::InvalidState)
+                        }
                     }
                 }
             }
@@ -730,13 +751,75 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 runtime_domains[index].pending_result = HYPERCALL_INVALID_ARGUMENT;
             } else {
                 runtime_domains[index].event_irq_enabled = true;
-                runtime_domains[index].event_irq_pending = event_channels.has_pending(receiver);
+                if event_channels.has_pending(receiver)
+                    && runtime_domains[index]
+                        .interrupts
+                        .raise(EVENT_CHANNEL_VECTOR)
+                        .is_err()
+                {
+                    halt_with_error("Virtual APIC raise", mboot_hv::Error::InvalidState)
+                }
                 runtime_domains[index].pending_result = HYPERCALL_SUCCESS;
                 log!(
                     "Domain {} enabled Event Channel IRQ vector {:#x}",
                     receiver.get(),
                     EVENT_CHANNEL_VECTOR
                 );
+            }
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::IrqEoi as u64 {
+            let receiver = runtime_domains[index].domain.id();
+            let valid = vm_exit.arg0 == 0
+                && vm_exit.arg1 == 0
+                && vm_exit.arg2 == 0
+                && runtime_domains[index].event_irq_enabled;
+            let completed = if valid {
+                runtime_domains[index].interrupts.eoi().ok()
+            } else {
+                None
+            };
+            runtime_domains[index].pending_result = if let Some(vector) = completed {
+                if vector == EVENT_CHANNEL_VECTOR && event_channels.has_pending(receiver) {
+                    if runtime_domains[index].interrupts.raise(vector).is_err() {
+                        halt_with_error("Virtual APIC raise", mboot_hv::Error::InvalidState)
+                    }
+                }
+                HYPERCALL_SUCCESS
+            } else {
+                HYPERCALL_INVALID_ARGUMENT
+            };
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::IrqMask as u64 {
+            let vector = u8::try_from(vm_exit.arg0).ok();
+            let masked = match vm_exit.arg1 {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            };
+            runtime_domains[index].pending_result = match (vector, masked) {
+                (Some(vector), Some(masked))
+                    if vm_exit.arg2 == 0
+                        && runtime_domains[index]
+                            .interrupts
+                            .set_masked(vector, masked)
+                            .is_ok() =>
+                {
+                    HYPERCALL_SUCCESS
+                }
+                _ => HYPERCALL_INVALID_ARGUMENT,
+            };
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::IrqSetTpr as u64 {
+            if vm_exit.arg0 <= u64::from(u8::MAX) && vm_exit.arg1 == 0 && vm_exit.arg2 == 0 {
+                runtime_domains[index]
+                    .interrupts
+                    .set_task_priority(vm_exit.arg0 as u8);
+                runtime_domains[index].pending_result = HYPERCALL_SUCCESS;
+            } else {
+                runtime_domains[index].pending_result = HYPERCALL_INVALID_ARGUMENT;
             }
             continue;
         }
@@ -747,6 +830,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             }
             let receiver = runtime_domains[index].domain.id();
             if let Some(port) = event_channels.receive(receiver) {
+                let _ = runtime_domains[index]
+                    .interrupts
+                    .cancel_pending(EVENT_CHANNEL_VECTOR);
                 runtime_domains[index].pending_result = u64::from(port);
             } else {
                 runtime_domains[index].waiting = true;

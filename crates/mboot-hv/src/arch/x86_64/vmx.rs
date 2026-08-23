@@ -121,6 +121,7 @@ const VM_INSTRUCTION_ERROR: u64 = 0x4400;
 const EXIT_INSTRUCTION_LENGTH: u64 = 0x440c;
 const EXIT_INTERRUPTION_INFO: u64 = 0x4404;
 const EXTERNAL_INTERRUPT_EXIT_REASON: u64 = 1;
+const INTERRUPT_WINDOW_EXIT_REASON: u64 = 7;
 const HLT_EXIT_REASON: u64 = 12;
 const VMCALL_EXIT_REASON: u64 = 18;
 
@@ -467,6 +468,30 @@ impl Vmx {
         }
     }
 
+    pub unsafe fn can_inject_interrupt(&mut self) -> Result<bool, Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
+        let flags = unsafe { vmread(GUEST_RFLAGS) };
+        let interruptibility = unsafe { vmread(GUEST_INTERRUPTIBILITY) };
+        Ok(flags & (1 << 9) != 0 && interruptibility & 0b11 == 0)
+    }
+
+    pub unsafe fn set_interrupt_window(&mut self, enabled: bool) -> Result<(), Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
+        let mut controls = unsafe { vmread(PRIMARY_CONTROLS) };
+        if enabled {
+            controls |= 1 << 2;
+        } else {
+            controls &= !(1 << 2);
+        }
+        unsafe { vmwrite(PRIMARY_CONTROLS, controls) }
+    }
+
     /// Invalidates cached translations for one EPT hierarchy.
     ///
     /// # Safety
@@ -505,6 +530,14 @@ impl Vmx {
         // SAFETY: A VM exit returned through the configured host trampoline.
         let reason = unsafe { vmread(EXIT_REASON) } & 0xffff;
         match reason {
+            INTERRUPT_WINDOW_EXIT_REASON => Ok(VmExit {
+                reason: VmExitReason::InterruptWindow,
+                raw_reason: reason,
+                hypercall_number: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+            }),
             EXTERNAL_INTERRUPT_EXIT_REASON => {
                 let info = unsafe { vmread(EXIT_INTERRUPTION_INFO) };
                 if info & (1 << 31) != 0 && info as u8 == super::timer::VECTOR {
@@ -627,6 +660,9 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
     } else {
         IA32_VMX_ENTRY_CTLS
     };
+    if unsafe { read_msr(primary_msr) } >> 32 & (1 << 2) == 0 {
+        return Err(Error::InterruptVirtualizationUnavailable);
+    }
     // SAFETY: Capability MSRs are available after VMX CPUID detection.
     let (pin, primary, secondary, exit, entry) = unsafe {
         (
