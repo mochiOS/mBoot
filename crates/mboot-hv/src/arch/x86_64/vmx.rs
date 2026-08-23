@@ -236,6 +236,7 @@ pub struct Vmx {
     revision_id: u32,
     vmcs_phys: u64,
     active: bool,
+    owns_vmx_operation: bool,
     run_context: VmxRunContext,
 }
 
@@ -325,6 +326,40 @@ impl Vmx {
             revision_id,
             vmcs_phys,
             active: true,
+            owns_vmx_operation: true,
+            run_context: VmxRunContext::default(),
+        })
+    }
+
+    /// Creates another vCPU while VMX operation is already active.
+    ///
+    /// # Safety
+    /// `vmcs_phys` must be a writable, page-aligned physical page exclusively
+    /// owned by mBoot. `self` must belong to the current logical CPU.
+    pub unsafe fn create_vcpu(
+        &self,
+        vmcs_phys: u64,
+        _address_space_id: u32,
+    ) -> Result<Self, Error> {
+        validate_page(vmcs_phys)?;
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        // SAFETY: VMX operation being active makes IA32_VMX_BASIC available.
+        let supports_64_bit_phys = unsafe { read_msr(IA32_VMX_BASIC) } & (1 << 48) != 0;
+        if !supports_64_bit_phys && vmcs_phys > u32::MAX as u64 {
+            return Err(Error::InvalidPage);
+        }
+        // SAFETY: VMX operation is active and this page has exclusive ownership.
+        unsafe {
+            initialize_control_region(vmcs_phys, self.revision_id);
+            vmclear(vmcs_phys).map_err(|()| Error::ControlInstructionFailed)?;
+        }
+        Ok(Self {
+            revision_id: self.revision_id,
+            vmcs_phys,
+            active: true,
+            owns_vmx_operation: false,
             run_context: VmxRunContext::default(),
         })
     }
@@ -346,6 +381,8 @@ impl Vmx {
         if !self.active {
             return Err(Error::InvalidState);
         }
+        // SAFETY: This vCPU owns the VMCS and VMX operation is active.
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::ControlInstructionFailed)? };
         // SAFETY: VMX is active and all VMCS host/guest values are supplied here.
         unsafe { initialize_vmcs(config)? };
         self.run_context = VmxRunContext {
@@ -369,6 +406,8 @@ impl Vmx {
         if !self.active {
             return Err(Error::InvalidState);
         }
+        // SAFETY: This reloads the stopped VMCS after another vCPU may have run.
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::ControlInstructionFailed)? };
         // SAFETY: VMEXIT left a current, stopped VMCS with readable exit fields.
         let (rip, instruction_len) =
             unsafe { (vmread(GUEST_RIP), vmread(EXIT_INSTRUCTION_LENGTH)) };
@@ -414,14 +453,17 @@ impl Vmx {
     /// Must run on the same logical CPU that called `enable`, with no vCPU
     /// currently executing and no code relying on the current VMCS.
     pub unsafe fn disable(&mut self) {
-        if self.active {
+        if !self.active {
+            return;
+        }
+        if self.owns_vmx_operation {
             // SAFETY: The caller guarantees the enabling CPU and no active vCPU.
             unsafe {
                 vmxoff();
                 write_cr4(read_cr4() & !CR4_VMXE);
             }
-            self.active = false;
         }
+        self.active = false;
     }
 }
 

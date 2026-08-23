@@ -5,6 +5,7 @@ pub mod domain;
 pub mod image;
 pub mod manifest;
 pub mod memory;
+pub mod scheduler;
 
 use arch::x86_64::{cpu, svm, vmx};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +25,7 @@ pub enum Error {
     ManifestDigestMismatch,
     ImageDigestMismatch,
     UnsupportedDomainConfig,
+    AddressSpaceIdUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +100,31 @@ impl Virtualization {
         match self {
             Self::Intel(_) => BackendKind::IntelVmx,
             Self::Amd(_) => BackendKind::AmdSvm,
+        }
+    }
+
+    /// Creates another vCPU under the virtualization state enabled by `self`.
+    ///
+    /// # Safety
+    /// `vcpu_control_page` must be writable, page aligned, and exclusively owned
+    /// by mBoot. `address_space_id` must be unique among live vCPUs on this CPU.
+    /// The caller must remain on the CPU that enabled `self`.
+    pub unsafe fn create_vcpu(
+        &self,
+        vcpu_control_page: u64,
+        address_space_id: u32,
+    ) -> Result<Self, Error> {
+        match self {
+            // SAFETY: The public function contract is forwarded unchanged.
+            Self::Intel(vmx) => unsafe {
+                vmx.create_vcpu(vcpu_control_page, address_space_id)
+                    .map(Self::Intel)
+            },
+            // SAFETY: The public function contract is forwarded unchanged.
+            Self::Amd(svm) => unsafe {
+                svm.create_vcpu(vcpu_control_page, address_space_id)
+                    .map(Self::Amd)
+            },
         }
     }
 

@@ -77,7 +77,7 @@ QEMU_PID=$!
 
 BOOTSTRAPPED=0
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
-    if grep -Fq '[mBoot-HV] bootstrap complete; mnu Domain entry and Hypercall verified' "$SERIAL" 2>/dev/null; then
+    if grep -Fq '[mBoot-HV] bootstrap complete; 2 Domains entered and stopped cleanly' "$SERIAL" 2>/dev/null; then
         BOOTSTRAPPED=1
         break
     fi
@@ -99,16 +99,26 @@ if [[ -n $EXPECT_BACKEND ]]; then
         exit 1
     }
 fi
-grep -Fq 'mnu requested Domain shutdown: reason=0' "$SERIAL" || {
+grep -Fq 'Domain 1 stopped: reason=0 yields=1' "$SERIAL" || {
     sed -n '1,200p' "$SERIAL" >&2
-    echo 'test-hv-qemu: mnu did not request a clean Domain shutdown' >&2
+    echo 'test-hv-qemu: System Domain did not stop cleanly' >&2
     exit 1
 }
-grep -Fq '[mnu] mnu entered its mBoot Domain' "$SERIAL" || {
+grep -Fq 'Domain 2 stopped: reason=0 yields=1' "$SERIAL" || {
     sed -n '1,200p' "$SERIAL" >&2
-    echo 'test-hv-qemu: mnu ConsoleWrite Hypercall was not handled' >&2
+    echo 'test-hv-qemu: Hardware Domain did not stop cleanly' >&2
+    exit 1
+}
+grep -Fq '[mnu Domain 1] mnu entered its mBoot Domain' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: System Domain ConsoleWrite was not handled' >&2
+    exit 1
+}
+grep -Fq '[mnu Domain 2] mnu entered its mBoot Domain' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: Hardware Domain ConsoleWrite was not handled' >&2
     exit 1
 }
 
-grep -E '\[mBoot-HV\]|\[mnu\]' "$SERIAL"
+grep -E '\[mBoot-HV\]|\[mnu Domain' "$SERIAL"
 echo 'test-hv-qemu: PASS'

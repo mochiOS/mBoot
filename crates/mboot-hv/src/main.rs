@@ -14,6 +14,7 @@ use mboot_hv::arch::x86_64::{cpu, descriptor};
 use mboot_hv::domain::{Domain, DomainId, DomainRole};
 use mboot_hv::manifest::{LaunchManifest, ManifestDomainRole};
 use mboot_hv::memory::{NestedPageResources, NestedPageTable};
+use mboot_hv::scheduler::CooperativeScheduler;
 use mboot_hv::{
     image, BackendKind, GuestConfig, Virtualization, VirtualizationResources, VmExitReason,
 };
@@ -58,6 +59,26 @@ impl MemoryRegion {
 struct BootMemoryMap {
     regions: [MemoryRegion; MAX_MEMORY_REGIONS],
     len: usize,
+}
+
+struct PreparedDomain {
+    id: u32,
+    role: DomainRole,
+    capabilities: u64,
+    memory_size: u64,
+    image: Vec<u8>,
+    nested_pages: NestedPageResources,
+    vcpu_control_page: u64,
+}
+
+struct RuntimeDomain {
+    domain: Domain,
+    virtualization: Virtualization,
+    guest: GuestConfig,
+    started: bool,
+    pending_result: u64,
+    yield_count: u64,
+    _image: Vec<u8>,
 }
 
 impl BootMemoryMap {
@@ -130,55 +151,93 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             return Status::SECURITY_VIOLATION;
         }
     };
-    if manifest.domain_count() != 1 {
-        log!("this bootstrap supports exactly one Domain");
-        return Status::UNSUPPORTED;
-    }
-    let config = match manifest.domain(0) {
-        Ok(config) => config,
-        Err(error) => {
-            log!("invalid Domain entry: {:?}", error);
-            return Status::LOAD_ERROR;
-        }
-    };
-    let guest_pages = (config.memory_size / 4096) as usize;
-    if config.role != ManifestDomainRole::System
-        || !config.auto_starts()
-        || !config.is_required()
-        || config.vcpu_count != 1
-        || guest_pages < 16
-        || guest_pages > MAX_GUEST_MEMORY_PAGES
+    if backend == BackendKind::AmdSvm
+        && manifest.domain_count() >= features.address_space_ids as usize
     {
-        log!("unsupported bootstrap Domain configuration");
+        log!(
+            "{} Domains exceed the {} usable AMD ASID slots",
+            manifest.domain_count(),
+            features.address_space_ids.saturating_sub(1)
+        );
         return Status::UNSUPPORTED;
-    }
-    let guest_elf = match load_file(boot_services, image_handle, config.image_path) {
-        Ok(image) => image,
-        Err(status) => {
-            log!(
-                "failed to load Domain image {}: {:?}",
-                config.image_path,
-                status
-            );
-            return status;
-        }
-    };
-    if let Err(error) = config.verify_image(&guest_elf) {
-        log!("Domain image verification failed: {:?}", error);
-        return Status::SECURITY_VIOLATION;
     }
     let host_control_page = match allocate_page(boot_services) {
         Ok(page) => page,
         Err(status) => return status,
     };
-    let vcpu_control_page = match allocate_page(boot_services) {
-        Ok(page) => page,
-        Err(status) => return status,
-    };
-    let nested_pages = match allocate_nested_pages(boot_services, guest_pages) {
-        Ok(pages) => pages,
-        Err(status) => return status,
-    };
+    let mut prepared_domains = Vec::with_capacity(manifest.domain_count());
+    let mut runtime_domains: Vec<RuntimeDomain> = Vec::with_capacity(manifest.domain_count());
+    let mut runnable = Vec::with_capacity(manifest.domain_count());
+    let mut system_domains = 0;
+    for index in 0..manifest.domain_count() {
+        let config = match manifest.domain(index) {
+            Ok(config) => config,
+            Err(error) => {
+                log!("invalid Domain entry {}: {:?}", index, error);
+                return Status::LOAD_ERROR;
+            }
+        };
+        let role = match config.role {
+            ManifestDomainRole::System => {
+                system_domains += 1;
+                DomainRole::System
+            }
+            ManifestDomainRole::Hardware => DomainRole::Hardware,
+            ManifestDomainRole::Application => DomainRole::Application,
+        };
+        let guest_pages = (config.memory_size / 4096) as usize;
+        if !config.auto_starts()
+            || !config.is_required()
+            || config.vcpu_count != 1
+            || guest_pages < 16
+            || guest_pages > MAX_GUEST_MEMORY_PAGES
+        {
+            log!("unsupported configuration for Domain {}", config.id);
+            return Status::UNSUPPORTED;
+        }
+        let image = match load_file(boot_services, image_handle, config.image_path) {
+            Ok(image) => image,
+            Err(status) => {
+                log!(
+                    "failed to load Domain {} image {}: {:?}",
+                    config.id,
+                    config.image_path,
+                    status
+                );
+                return status;
+            }
+        };
+        if let Err(error) = config.verify_image(&image) {
+            log!(
+                "Domain {} image verification failed: {:?}",
+                config.id,
+                error
+            );
+            return Status::SECURITY_VIOLATION;
+        }
+        let vcpu_control_page = match allocate_page(boot_services) {
+            Ok(page) => page,
+            Err(status) => return status,
+        };
+        let nested_pages = match allocate_nested_pages(boot_services, guest_pages) {
+            Ok(pages) => pages,
+            Err(status) => return status,
+        };
+        prepared_domains.push(PreparedDomain {
+            id: config.id,
+            role,
+            capabilities: config.capabilities,
+            memory_size: config.memory_size,
+            image,
+            nested_pages,
+            vcpu_control_page,
+        });
+        runnable.push(true);
+    }
+    if system_domains != 1 {
+        log!("Launch Manifest must contain exactly one System Domain");
+        return Status::UNSUPPORTED;
+    }
 
     // SAFETY: All required firmware allocations are complete and no boot service
     // is used after this call.
@@ -206,143 +265,178 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         memory_map.lowest_address()
     );
 
-    // SAFETY: Every page was allocated from UEFI for exclusive mBoot use and is
-    // still identity-mapped at this stage.
-    let nested = match unsafe { NestedPageTable::initialize(backend, nested_pages) } {
-        Ok(table) => table,
-        Err(error) => halt_with_error("nested page table", error),
-    };
-    // SAFETY: The Domain is stopped and all guest pages belong to this table.
-    let guest_cr3 = match unsafe { nested.initialize_guest_page_tables() } {
-        Ok(root) => root,
-        Err(error) => halt_with_error("guest page tables", error),
-    };
-    // SAFETY: The Domain is stopped and its RAM is exclusively owned by mBoot.
-    let guest_image = match unsafe { image::load_elf(&guest_elf, &nested) } {
-        Ok(image) => image,
-        Err(error) => halt_with_error("mnu image", error),
-    };
-
-    // SAFETY: The control pages are exclusively owned, execution is pinned to
-    // the BSP, interrupts are disabled, and the code is running at CPL0.
-    let mut virtualization = match unsafe {
-        Virtualization::enable(VirtualizationResources {
-            host_control_page,
-            vcpu_control_page,
-        })
-    } {
-        Ok(virtualization) => virtualization,
-        Err(error) => halt_with_error("virtualization", error),
-    };
-
-    let mut domain = Domain::new(
-        DomainId::new(config.id),
-        DomainRole::System,
-        config.capabilities,
-        virtualization.kind(),
-        nested,
-    );
-    if let Err(error) = domain.mark_ready() {
-        halt_with_error("domain", error);
-    }
-    log!(
-        "Domain {} ready: role={:?} capabilities={:#x} backend={:?} nested-root={:#x} guest-memory={:#x}+{} KiB",
-        domain.id().get(),
-        domain.role(),
-        domain.capabilities(),
-        domain.backend(),
-        domain.nested_pages().hardware_root(),
-        domain.nested_pages().guest_base(),
-        domain.nested_pages().guest_memory_size() / 1024
-    );
-    let backend = match domain.backend() {
-        BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
-        BackendKind::AmdSvm => HYPERVISOR_BACKEND_AMD_SVM,
-    };
-    let boot_info = DomainBootInfo::new(
-        domain.id().get(),
-        0,
-        backend,
-        domain.nested_pages().guest_memory_size(),
-    );
-    let Some(boot_info_host) = domain
-        .nested_pages()
-        .guest_host_address(DOMAIN_BOOT_INFO_GPA, size_of::<DomainBootInfo>() as u64)
-    else {
-        halt_with_error("Domain boot info", mboot_hv::Error::InvalidPage)
-    };
-    // SAFETY: The destination is an aligned, in-bounds part of stopped guest RAM.
-    unsafe {
-        copy_nonoverlapping(
-            &boot_info as *const DomainBootInfo,
-            boot_info_host as *mut DomainBootInfo,
-            1,
-        )
-    };
-    if let Err(error) = domain.start() {
-        halt_with_error("domain start", error);
-    }
-    // SAFETY: The image, stack, and page tables are in live Domain RAM, and this
-    // is still the pinned BSP with interrupts disabled.
-    let mut vm_exit = match unsafe {
-        virtualization.run(GuestConfig {
-            nested_root: domain.nested_pages().hardware_root(),
-            page_table_root: guest_cr3,
-            entry: guest_image.entry(),
-            stack: config.memory_size - 16,
-            boot_info: DOMAIN_BOOT_INFO_GPA,
-        })
-    } {
-        Ok(vm_exit) => vm_exit,
-        Err(error) => {
-            let _ = domain.mark_crashed();
-            halt_with_error("guest entry", error)
+    for (index, prepared) in prepared_domains.drain(..).enumerate() {
+        // SAFETY: Every page was allocated from UEFI for exclusive mBoot use and
+        // remains identity-mapped.
+        let nested = match unsafe { NestedPageTable::initialize(backend, prepared.nested_pages) } {
+            Ok(table) => table,
+            Err(error) => halt_with_error("nested page table", error),
+        };
+        // SAFETY: This stopped Domain exclusively owns its guest pages.
+        let guest_cr3 = match unsafe { nested.initialize_guest_page_tables() } {
+            Ok(root) => root,
+            Err(error) => halt_with_error("guest page tables", error),
+        };
+        // SAFETY: The Domain is stopped and its RAM is exclusively owned by mBoot.
+        let guest_image = match unsafe { image::load_elf(&prepared.image, &nested) } {
+            Ok(image) => image,
+            Err(error) => halt_with_error("Domain image", error),
+        };
+        // SAFETY: Control pages are exclusive, execution is pinned to the BSP,
+        // interrupts are disabled, and this code runs at CPL0.
+        let virtualization = if index == 0 {
+            match unsafe {
+                Virtualization::enable(VirtualizationResources {
+                    host_control_page,
+                    vcpu_control_page: prepared.vcpu_control_page,
+                })
+            } {
+                Ok(virtualization) => virtualization,
+                Err(error) => halt_with_error("virtualization", error),
+            }
+        } else {
+            match unsafe {
+                runtime_domains[0]
+                    .virtualization
+                    .create_vcpu(prepared.vcpu_control_page, index as u32 + 1)
+            } {
+                Ok(virtualization) => virtualization,
+                Err(error) => halt_with_error("vCPU creation", error),
+            }
+        };
+        let mut domain = Domain::new(
+            DomainId::new(prepared.id),
+            prepared.role,
+            prepared.capabilities,
+            virtualization.kind(),
+            nested,
+        );
+        if let Err(error) = domain.mark_ready() {
+            halt_with_error("Domain", error);
         }
-    };
-    loop {
+        let backend_id = match domain.backend() {
+            BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
+            BackendKind::AmdSvm => HYPERVISOR_BACKEND_AMD_SVM,
+        };
+        let boot_info = DomainBootInfo::new(
+            domain.id().get(),
+            0,
+            backend_id,
+            domain.nested_pages().guest_memory_size(),
+        );
+        let Some(boot_info_host) = domain
+            .nested_pages()
+            .guest_host_address(DOMAIN_BOOT_INFO_GPA, size_of::<DomainBootInfo>() as u64)
+        else {
+            halt_with_error("Domain boot info", mboot_hv::Error::InvalidPage)
+        };
+        // SAFETY: The destination is aligned, in bounds, and the Domain is stopped.
+        unsafe {
+            copy_nonoverlapping(
+                &boot_info as *const DomainBootInfo,
+                boot_info_host as *mut DomainBootInfo,
+                1,
+            )
+        };
+        if let Err(error) = domain.start() {
+            halt_with_error("Domain start", error);
+        }
+        log!(
+            "Domain {} ready: role={:?} capabilities={:#x} backend={:?} nested-root={:#x} guest-memory={:#x}+{} KiB",
+            domain.id().get(),
+            domain.role(),
+            domain.capabilities(),
+            domain.backend(),
+            domain.nested_pages().hardware_root(),
+            domain.nested_pages().guest_base(),
+            domain.nested_pages().guest_memory_size() / 1024
+        );
+        runtime_domains.push(RuntimeDomain {
+            guest: GuestConfig {
+                nested_root: domain.nested_pages().hardware_root(),
+                page_table_root: guest_cr3,
+                entry: guest_image.entry(),
+                stack: prepared.memory_size - 16,
+                boot_info: DOMAIN_BOOT_INFO_GPA,
+            },
+            domain,
+            virtualization,
+            started: false,
+            pending_result: HYPERCALL_SUCCESS,
+            yield_count: 0,
+            _image: prepared.image,
+        });
+    }
+
+    let mut scheduler = CooperativeScheduler::new();
+    while let Some(index) = scheduler.next(&runnable) {
+        let runtime = &mut runtime_domains[index];
+        // SAFETY: The selected vCPU is stopped and owns all guest and control state.
+        let vm_exit = if runtime.started {
+            unsafe { runtime.virtualization.resume(runtime.pending_result) }
+        } else {
+            runtime.started = true;
+            unsafe { runtime.virtualization.run(runtime.guest) }
+        };
+        let vm_exit = match vm_exit {
+            Ok(exit) => exit,
+            Err(error) => {
+                let _ = runtime.domain.mark_crashed();
+                halt_with_error("vCPU entry", error)
+            }
+        };
         if vm_exit.reason != VmExitReason::Hypercall {
-            let _ = domain.mark_crashed();
+            let _ = runtime.domain.mark_crashed();
             halt_with_error(
-                "mnu Hypercall",
+                "Domain Hypercall",
                 mboot_hv::Error::UnexpectedVmExit(vm_exit.raw_reason),
             );
         }
         if vm_exit.hypercall_number == HypercallNumber::Shutdown as u64 {
-            break;
-        }
-        let result = match vm_exit.hypercall_number {
-            number if number == HypercallNumber::ConsoleWrite as u64 => {
-                handle_console_write(domain.nested_pages(), vm_exit.arg0, vm_exit.arg1)
+            if let Err(error) = runtime.domain.stop() {
+                halt_with_error("Domain stop", error);
             }
-            number if number == HypercallNumber::Yield as u64 => HYPERCALL_SUCCESS,
+            runnable[index] = false;
+            log!(
+                "Domain {} stopped: reason={} yields={} raw={:#x}",
+                runtime.domain.id().get(),
+                vm_exit.arg0,
+                runtime.yield_count,
+                vm_exit.raw_reason
+            );
+            continue;
+        }
+        runtime.pending_result = match vm_exit.hypercall_number {
+            number if number == HypercallNumber::ConsoleWrite as u64 => handle_console_write(
+                runtime.domain.id(),
+                runtime.domain.nested_pages(),
+                vm_exit.arg0,
+                vm_exit.arg1,
+            ),
+            number if number == HypercallNumber::Yield as u64 => {
+                runtime.yield_count += 1;
+                HYPERCALL_SUCCESS
+            }
             _ => HYPERCALL_UNSUPPORTED,
         };
-        // SAFETY: The previous exit was a Hypercall from this stopped vCPU.
-        vm_exit = match unsafe { virtualization.resume(result) } {
-            Ok(exit) => exit,
-            Err(error) => {
-                let _ = domain.mark_crashed();
-                halt_with_error("mnu Hypercall resume", error)
-            }
-        };
-    }
-    if let Err(error) = domain.stop() {
-        halt_with_error("domain stop", error);
     }
     log!(
-        "Domain {} exited: reason={:?} raw={:#x}",
-        domain.id().get(),
-        vm_exit.reason,
-        vm_exit.raw_reason
+        "bootstrap complete; {} Domains entered and stopped cleanly",
+        runtime_domains.len()
     );
-    log!("mnu requested Domain shutdown: reason={}", vm_exit.arg0);
-    log!("bootstrap complete; mnu Domain entry and Hypercall verified");
 
-    let _keep_virtualization_active = virtualization;
+    let _keep_domains_alive = runtime_domains;
+    let _keep_prepared_storage = prepared_domains;
+    let _keep_manifest_alive = manifest_bytes;
     halt()
 }
 
-fn handle_console_write(memory: &NestedPageTable, address: u64, len: u64) -> u64 {
+fn handle_console_write(
+    domain_id: DomainId,
+    memory: &NestedPageTable,
+    address: u64,
+    len: u64,
+) -> u64 {
     if len > MAX_CONSOLE_WRITE {
         return HYPERCALL_INVALID_ARGUMENT;
     }
@@ -355,7 +449,7 @@ fn handle_console_write(memory: &NestedPageTable, address: u64, len: u64) -> u64
     let Ok(message) = core::str::from_utf8(bytes) else {
         return HYPERCALL_INVALID_ARGUMENT;
     };
-    crate::serial::print(format_args!("[mnu] {}", message));
+    crate::serial::print(format_args!("[mnu Domain {}] {}", domain_id.get(), message));
     HYPERCALL_SUCCESS
 }
 

@@ -15,16 +15,21 @@ close $image_fh or die "cannot close $image_file: $!\n";
 my $path = '\\EFI\\MBOOT\\MNU.ELF';
 my $header_size = 32;
 my $entry_size = 160;
+my $domain_count = 2;
 my $header = pack(
     'a8 v v v v V V Q<',
-    "MBLHV1\0\0", 1, $header_size, $entry_size, 1,
-    $header_size + $entry_size, 0, 0,
+    "MBLHV1\0\0", 1, $header_size, $entry_size, $domain_count,
+    $header_size + $entry_size * $domain_count, 0, 0,
 );
-my $entry = pack(
+my $system = pack(
     'V v v Q< v a14 Q< a32 v a6 a80',
     1, 1, 3, 2 * 1024 * 1024, 1, '', 0, sha256($image), length($path), '', $path,
 );
+my $hardware = pack(
+    'V v v Q< v a14 Q< a32 v a6 a80',
+    2, 2, 3, 2 * 1024 * 1024, 1, '', 0, sha256($image), length($path), '', $path,
+);
 
 open my $output_fh, '>:raw', $output_file or die "cannot write $output_file: $!\n";
-print {$output_fh} $header, $entry or die "cannot write $output_file: $!\n";
+print {$output_fh} $header, $system, $hardware or die "cannot write $output_file: $!\n";
 close $output_fh or die "cannot close $output_file: $!\n";

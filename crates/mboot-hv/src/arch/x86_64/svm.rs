@@ -13,6 +13,7 @@ const VM_CR_SVMDIS: u64 = 1 << 4;
 const VMCB_INTERCEPT_MISC1: usize = 0x00c;
 const VMCB_INTERCEPT_MISC2: usize = 0x010;
 const VMCB_GUEST_ASID: usize = 0x058;
+const VMCB_TLB_CONTROL: usize = 0x05c;
 const VMCB_EXIT_CODE: usize = 0x070;
 const VMCB_NP_ENABLE: usize = 0x090;
 const VMCB_NCR3: usize = 0x0b0;
@@ -40,6 +41,7 @@ const VMCB_RAX: usize = 0x5f8;
 const INTERCEPT_HLT: u32 = 1 << 24;
 const INTERCEPT_VMRUN: u32 = 1;
 const INTERCEPT_VMMCALL: u32 = 1 << 1;
+const TLB_CONTROL_FLUSH_ALL: u8 = 1;
 const SVM_EXIT_HLT: u64 = 0x78;
 const SVM_EXIT_VMMCALL: u64 = 0x81;
 const SEGMENT_CODE_LONG_MODE: u16 = 0x0a9b;
@@ -129,7 +131,9 @@ unsafe extern "sysv64" {
 pub struct Svm {
     hsave_phys: u64,
     vmcb_phys: u64,
+    guest_asid: u32,
     active: bool,
+    owns_svm_operation: bool,
     started: bool,
     run_context: SvmRunContext,
 }
@@ -151,6 +155,9 @@ impl Svm {
         if features.nested_paging != Some(true) {
             return Err(Error::NestedPagingUnavailable);
         }
+        if !valid_guest_asid(1, features.address_space_ids) {
+            return Err(Error::AddressSpaceIdUnavailable);
+        }
         // SAFETY: CPUID confirmed AMD SVM and the caller guarantees CPL0.
         if unsafe { read_msr(VM_CR) } & VM_CR_SVMDIS != 0 {
             return Err(Error::VirtualizationDisabled);
@@ -167,7 +174,36 @@ impl Svm {
         Ok(Self {
             hsave_phys,
             vmcb_phys,
+            guest_asid: 1,
             active: true,
+            owns_svm_operation: true,
+            started: false,
+            run_context: SvmRunContext::default(),
+        })
+    }
+
+    /// Creates another vCPU while SVM is already active on this CPU.
+    ///
+    /// # Safety
+    /// `vmcb_phys` must be a writable, page-aligned physical page exclusively
+    /// owned by mBoot. `guest_asid` must be unused by every other live Domain on
+    /// this CPU. `self` must belong to the current logical CPU.
+    pub unsafe fn create_vcpu(&self, vmcb_phys: u64, guest_asid: u32) -> Result<Self, Error> {
+        validate_page(vmcb_phys)?;
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        if !valid_guest_asid(guest_asid, cpu::detect().address_space_ids) {
+            return Err(Error::AddressSpaceIdUnavailable);
+        }
+        // SAFETY: The new VMCB page is exclusively owned and writable.
+        unsafe { write_bytes(vmcb_phys as *mut u8, 0, 4096) };
+        Ok(Self {
+            hsave_phys: self.hsave_phys,
+            vmcb_phys,
+            guest_asid,
+            active: true,
+            owns_svm_operation: false,
             started: false,
             run_context: SvmRunContext::default(),
         })
@@ -193,7 +229,7 @@ impl Svm {
         }
 
         // SAFETY: `enable` established exclusive ownership of this mapped VMCB.
-        unsafe { initialize_guest(self.vmcb_phys, config) };
+        unsafe { initialize_guest(self.vmcb_phys, self.guest_asid, config) };
 
         self.run_context = SvmRunContext {
             rdi: config.boot_info,
@@ -230,6 +266,9 @@ impl Svm {
 
         // SAFETY: VMEXIT completed and the processor wrote the control area.
         let exit_code = unsafe { read_u64(self.vmcb_phys, VMCB_EXIT_CODE) };
+        // SAFETY: The initial flush has completed; later mapping changes must
+        // request another flush explicitly before entering this vCPU.
+        unsafe { write_u8(self.vmcb_phys, VMCB_TLB_CONTROL, 0) };
         // SAFETY: VMEXIT saved guest RAX in the VMCB state area.
         self.run_context.rax = unsafe { read_u64(self.vmcb_phys, VMCB_RAX) };
         match exit_code {
@@ -259,15 +298,18 @@ impl Svm {
     /// Must run on the same logical CPU that called `enable`, with no guest
     /// executing and no code relying on the configured host-save area.
     pub unsafe fn disable(&mut self) {
-        if self.active {
+        if !self.active {
+            return;
+        }
+        if self.owns_svm_operation {
             // SAFETY: The caller guarantees the enabling CPU and no active guest.
             unsafe { write_msr(EFER, read_msr(EFER) & !EFER_SVME) };
-            self.active = false;
         }
+        self.active = false;
     }
 }
 
-unsafe fn initialize_guest(vmcb: u64, config: GuestConfig) {
+unsafe fn initialize_guest(vmcb: u64, guest_asid: u32, config: GuestConfig) {
     // SAFETY: The caller owns the complete VMCB page.
     unsafe {
         write_bytes(vmcb as *mut u8, 0, 4096);
@@ -279,7 +321,8 @@ unsafe fn initialize_guest(vmcb: u64, config: GuestConfig) {
             VMCB_INTERCEPT_MISC2,
             INTERCEPT_VMRUN | INTERCEPT_VMMCALL,
         );
-        write_u32(vmcb, VMCB_GUEST_ASID, 1);
+        write_u32(vmcb, VMCB_GUEST_ASID, guest_asid);
+        write_u8(vmcb, VMCB_TLB_CONTROL, TLB_CONTROL_FLUSH_ALL);
         write_u64(vmcb, VMCB_NP_ENABLE, 1);
         write_u64(vmcb, VMCB_NCR3, config.nested_root);
 
@@ -329,6 +372,11 @@ unsafe fn write_u16(base: u64, offset: usize, value: u16) {
     unsafe { ((base as *mut u8).add(offset).cast::<u16>()).write_volatile(value) };
 }
 
+unsafe fn write_u8(base: u64, offset: usize, value: u8) {
+    // SAFETY: The caller provides an in-bounds VMCB field.
+    unsafe { ((base as *mut u8).add(offset)).write_volatile(value) };
+}
+
 unsafe fn write_u32(base: u64, offset: usize, value: u32) {
     // SAFETY: The caller provides an in-bounds, suitably aligned VMCB field.
     unsafe { ((base as *mut u8).add(offset).cast::<u32>()).write_volatile(value) };
@@ -352,6 +400,10 @@ fn validate_page(phys: u64) -> Result<(), Error> {
     }
 }
 
+const fn valid_guest_asid(asid: u32, address_space_ids: u32) -> bool {
+    asid != 0 && asid < address_space_ids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +412,13 @@ mod tests {
     fn svm_control_pages_must_be_aligned() {
         assert_eq!(validate_page(0x1234), Err(Error::InvalidPage));
         assert_eq!(validate_page(0x4000), Ok(()));
+    }
+
+    #[test]
+    fn svm_guest_asids_exclude_zero_and_the_reported_limit() {
+        assert!(!valid_guest_asid(0, 16));
+        assert!(valid_guest_asid(1, 16));
+        assert!(valid_guest_asid(15, 16));
+        assert!(!valid_guest_asid(16, 16));
     }
 }
