@@ -10,7 +10,7 @@ mod serial;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::mem::size_of;
-use core::ptr::copy_nonoverlapping;
+use core::ptr::{copy_nonoverlapping, write_bytes};
 use mboot_hv::arch::x86_64::{cpu, descriptor, timer};
 use mboot_hv::domain::{Domain, DomainId, DomainRole, DomainState};
 use mboot_hv::event::EventChannelTable;
@@ -75,6 +75,15 @@ struct PreparedDomain {
     image: Vec<u8>,
     nested_pages: NestedPageResources,
     vcpu_control_page: u64,
+    msr_permission_map: u64,
+}
+
+#[derive(Clone, Copy)]
+enum ResumeKind {
+    Hypercall,
+    WithoutAdvance,
+    MsrRead(u64),
+    MsrWrite,
 }
 
 struct RuntimeDomain {
@@ -87,7 +96,7 @@ struct RuntimeDomain {
     preemption_count: u64,
     ready: bool,
     waiting: bool,
-    resume_preempted: bool,
+    resume_kind: ResumeKind,
     event_irq_enabled: bool,
     interrupts: VirtualLocalApic,
     _image: Vec<u8>,
@@ -247,6 +256,13 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 return status;
             }
         };
+        let msr_permission_map = match allocate_msr_permission_map(boot_services) {
+            Ok(map) => map,
+            Err(status) => {
+                display::failure(14);
+                return status;
+            }
+        };
         let nested_pages = match allocate_nested_pages(boot_services, guest_pages) {
             Ok(pages) => pages,
             Err(status) => {
@@ -261,6 +277,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             image,
             nested_pages,
             vcpu_control_page,
+            msr_permission_map,
         });
         runnable.push(true);
     }
@@ -404,6 +421,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 entry: guest_image.entry(),
                 stack: grant_window_start(domain.nested_pages()) - 16,
                 boot_info: DOMAIN_BOOT_INFO_GPA,
+                msr_permission_map: prepared.msr_permission_map,
             },
             domain,
             virtualization,
@@ -413,7 +431,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             preemption_count: 0,
             ready: false,
             waiting: false,
-            resume_preempted: false,
+            resume_kind: ResumeKind::Hypercall,
             event_irq_enabled: false,
             interrupts: VirtualLocalApic::new(),
             _image: prepared.image,
@@ -471,13 +489,25 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             }
         }
         // SAFETY: The selected vCPU is stopped and owns all guest and control state.
-        let vm_exit = if runtime.resume_preempted {
-            runtime.resume_preempted = false;
-            // SAFETY: The timer stopped this vCPU without completing a guest instruction.
-            unsafe { runtime.virtualization.resume_preempted() }
-        } else if runtime.started {
-            // SAFETY: This vCPU stopped at the previous VM exit and remains selected.
-            unsafe { runtime.virtualization.resume(runtime.pending_result) }
+        let vm_exit = if runtime.started {
+            match runtime.resume_kind {
+                ResumeKind::Hypercall => {
+                    // SAFETY: This vCPU stopped at a Hypercall and remains selected.
+                    unsafe { runtime.virtualization.resume(runtime.pending_result) }
+                }
+                ResumeKind::WithoutAdvance => {
+                    // SAFETY: No guest instruction completed at the previous exit.
+                    unsafe { runtime.virtualization.resume_preempted() }
+                }
+                ResumeKind::MsrRead(value) => {
+                    // SAFETY: The value completes the preceding intercepted RDMSR.
+                    unsafe { runtime.virtualization.resume_msr_read(value) }
+                }
+                ResumeKind::MsrWrite => {
+                    // SAFETY: The preceding intercepted WRMSR was emulated.
+                    unsafe { runtime.virtualization.resume_msr_write() }
+                }
+            }
         } else {
             runtime.started = true;
             // SAFETY: This is the first entry into the stopped, fully prepared vCPU.
@@ -499,11 +529,33 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     runtime.preemption_count
                 );
             }
-            runtime.resume_preempted = true;
+            runtime.resume_kind = ResumeKind::WithoutAdvance;
             continue;
         }
         if vm_exit.reason == VmExitReason::InterruptWindow {
-            runtime.resume_preempted = true;
+            runtime.resume_kind = ResumeKind::WithoutAdvance;
+            continue;
+        }
+        if vm_exit.reason == VmExitReason::MsrRead {
+            runtime.resume_kind = match runtime.interrupts.read_msr(vm_exit.msr) {
+                Ok(value) => ResumeKind::MsrRead(value),
+                Err(_) => {
+                    let _ = runtime.domain.mark_crashed();
+                    halt_with_error("Domain MSR read", mboot_hv::Error::InvalidState)
+                }
+            };
+            continue;
+        }
+        if vm_exit.reason == VmExitReason::MsrWrite {
+            if runtime
+                .interrupts
+                .write_msr(vm_exit.msr, vm_exit.msr_value)
+                .is_err()
+            {
+                let _ = runtime.domain.mark_crashed();
+                halt_with_error("Domain MSR write", mboot_hv::Error::InvalidState)
+            }
+            runtime.resume_kind = ResumeKind::MsrWrite;
             continue;
         }
         if vm_exit.reason != VmExitReason::Hypercall {
@@ -513,6 +565,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 mboot_hv::Error::UnexpectedVmExit(vm_exit.raw_reason),
             );
         }
+        runtime.resume_kind = ResumeKind::Hypercall;
         if vm_exit.hypercall_number == HypercallNumber::Shutdown as u64 {
             let stopping_domain = runtime_domains[index].domain.id();
             for mapping in grants.cleanup_domain(stopping_domain).into_iter().flatten() {
@@ -939,6 +992,16 @@ fn allocate_page(boot_services: &BootServices) -> Result<u64, Status> {
     boot_services
         .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
         .map_err(|error| error.status())
+}
+
+fn allocate_msr_permission_map(boot_services: &BootServices) -> Result<u64, Status> {
+    let address = boot_services
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 2)
+        .map_err(|error| error.status())?;
+    // AMD's MSRPM occupies two contiguous pages. Setting every bit intercepts
+    // every covered RDMSR and WRMSR until mBoot explicitly emulates it.
+    unsafe { write_bytes(address as *mut u8, 0xff, 8192) };
+    Ok(address)
 }
 
 fn allocate_nested_pages(

@@ -45,6 +45,7 @@ const ENTRY_CONTROLS: u64 = 0x4012;
 const ENTRY_MSR_LOAD_COUNT: u64 = 0x4014;
 const ENTRY_INTERRUPTION_INFO: u64 = 0x4016;
 const SECONDARY_CONTROLS: u64 = 0x401e;
+const MSR_BITMAP: u64 = 0x2004;
 const EPT_POINTER: u64 = 0x201a;
 const VMCS_LINK_POINTER: u64 = 0x2800;
 const GUEST_DEBUGCTL: u64 = 0x2802;
@@ -124,6 +125,8 @@ const EXTERNAL_INTERRUPT_EXIT_REASON: u64 = 1;
 const INTERRUPT_WINDOW_EXIT_REASON: u64 = 7;
 const HLT_EXIT_REASON: u64 = 12;
 const VMCALL_EXIT_REASON: u64 = 18;
+const RDMSR_EXIT_REASON: u64 = 31;
+const WRMSR_EXIT_REASON: u64 = 32;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -139,6 +142,7 @@ struct VmxRunContext {
     r14: u64,
     r15: u64,
     resume: u64,
+    rcx: u64,
 }
 
 global_asm!(
@@ -169,6 +173,7 @@ global_asm!(
     "mov rdi, [rax + 8]",
     "mov rsi, [rax + 16]",
     "mov rdx, [rax + 24]",
+    "mov rcx, [rax + 88]",
     "mov rax, [rax]",
     "sti",
     "vmlaunch",
@@ -184,6 +189,7 @@ global_asm!(
     "mov rdi, [rax + 8]",
     "mov rsi, [rax + 16]",
     "mov rdx, [rax + 24]",
+    "mov rcx, [rax + 88]",
     "mov rax, [rax]",
     "sti",
     "vmresume",
@@ -203,28 +209,31 @@ global_asm!(
     "push rdi",
     "push rsi",
     "push rdx",
-    "mov rcx, [rsp + 80]",
-    "mov rax, [rsp + 72]",
+    "push rcx",
+    "mov rcx, [rsp + 88]",
+    "mov rax, [rsp + 80]",
     "mov [rcx], rax",
-    "mov rax, [rsp + 16]",
-    "mov [rcx + 8], rax",
-    "mov rax, [rsp + 8]",
-    "mov [rcx + 16], rax",
-    "mov rax, [rsp]",
-    "mov [rcx + 24], rax",
-    "mov rax, [rsp + 64]",
-    "mov [rcx + 32], rax",
-    "mov rax, [rsp + 56]",
-    "mov [rcx + 40], rax",
-    "mov rax, [rsp + 48]",
-    "mov [rcx + 48], rax",
-    "mov rax, [rsp + 40]",
-    "mov [rcx + 56], rax",
-    "mov rax, [rsp + 32]",
-    "mov [rcx + 64], rax",
     "mov rax, [rsp + 24]",
+    "mov [rcx + 8], rax",
+    "mov rax, [rsp + 16]",
+    "mov [rcx + 16], rax",
+    "mov rax, [rsp + 8]",
+    "mov [rcx + 24], rax",
+    "mov rax, [rsp + 72]",
+    "mov [rcx + 32], rax",
+    "mov rax, [rsp + 64]",
+    "mov [rcx + 40], rax",
+    "mov rax, [rsp + 56]",
+    "mov [rcx + 48], rax",
+    "mov rax, [rsp + 48]",
+    "mov [rcx + 56], rax",
+    "mov rax, [rsp + 40]",
+    "mov [rcx + 64], rax",
+    "mov rax, [rsp + 32]",
     "mov [rcx + 72], rax",
-    "add rsp, 80",
+    "mov rax, [rsp]",
+    "mov [rcx + 88], rax",
+    "add rsp, 88",
     "xor eax, eax",
     "mboot_vmx_return:",
     "add rsp, 8",
@@ -458,6 +467,34 @@ impl Vmx {
         unsafe { self.decode_exit() }
     }
 
+    pub unsafe fn resume_msr_read(&mut self, value: u64) -> Result<VmExit, Error> {
+        self.run_context.rax = u64::from(value as u32);
+        self.run_context.rdx = u64::from((value >> 32) as u32);
+        unsafe { self.resume_msr() }
+    }
+
+    pub unsafe fn resume_msr_write(&mut self) -> Result<VmExit, Error> {
+        unsafe { self.resume_msr() }
+    }
+
+    unsafe fn resume_msr(&mut self) -> Result<VmExit, Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
+        let (rip, instruction_len) =
+            unsafe { (vmread(GUEST_RIP), vmread(EXIT_INSTRUCTION_LENGTH)) };
+        unsafe { vmwrite(GUEST_RIP, rip + instruction_len)? };
+        self.run_context.resume = 1;
+        super::timer::prepare_entry();
+        if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
+            return Err(Error::GuestEntryFailed(unsafe {
+                vmread(VM_INSTRUCTION_ERROR)
+            }));
+        }
+        unsafe { self.decode_exit() }
+    }
+
     pub unsafe fn inject_interrupt(&mut self, vector: u8) -> Result<(), Error> {
         if !self.active {
             return Err(Error::InvalidState);
@@ -537,6 +574,8 @@ impl Vmx {
                 arg0: 0,
                 arg1: 0,
                 arg2: 0,
+                msr: 0,
+                msr_value: 0,
             }),
             EXTERNAL_INTERRUPT_EXIT_REASON => {
                 let info = unsafe { vmread(EXIT_INTERRUPTION_INFO) };
@@ -549,6 +588,8 @@ impl Vmx {
                         arg0: 0,
                         arg1: 0,
                         arg2: 0,
+                        msr: 0,
+                        msr_value: 0,
                     })
                 } else {
                     Err(Error::UnexpectedVmExit(reason))
@@ -561,6 +602,8 @@ impl Vmx {
                 arg0: 0,
                 arg1: 0,
                 arg2: 0,
+                msr: 0,
+                msr_value: 0,
             }),
             VMCALL_EXIT_REASON => Ok(VmExit {
                 reason: VmExitReason::Hypercall,
@@ -569,6 +612,29 @@ impl Vmx {
                 arg0: self.run_context.rdi,
                 arg1: self.run_context.rsi,
                 arg2: self.run_context.rdx,
+                msr: 0,
+                msr_value: 0,
+            }),
+            RDMSR_EXIT_REASON => Ok(VmExit {
+                reason: VmExitReason::MsrRead,
+                raw_reason: reason,
+                hypercall_number: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+                msr: self.run_context.rcx as u32,
+                msr_value: 0,
+            }),
+            WRMSR_EXIT_REASON => Ok(VmExit {
+                reason: VmExitReason::MsrWrite,
+                raw_reason: reason,
+                hypercall_number: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+                msr: self.run_context.rcx as u32,
+                msr_value: u64::from(self.run_context.rax as u32)
+                    | (u64::from(self.run_context.rdx as u32) << 32),
             }),
             _ => Err(Error::UnexpectedVmExit(reason)),
         }
@@ -697,6 +763,10 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
     ] {
         // SAFETY: Each field is a writable control field of the current VMCS.
         unsafe { vmwrite(field, value)? };
+    }
+    if primary & (1 << 28) != 0 {
+        validate_page(config.msr_permission_map)?;
+        unsafe { vmwrite(MSR_BITMAP, config.msr_permission_map)? };
     }
     // SAFETY: `ept_pointer` was constructed from validated EPT capabilities.
     unsafe {
@@ -1006,6 +1076,13 @@ mod tests {
         assert_eq!(validate_page(0), Err(Error::InvalidPage));
         assert_eq!(validate_page(0x1001), Err(Error::InvalidPage));
         assert_eq!(validate_page(0x2000), Ok(()));
+    }
+
+    #[test]
+    fn assembly_context_offsets_include_guest_rcx() {
+        assert_eq!(core::mem::offset_of!(VmxRunContext, resume), 80);
+        assert_eq!(core::mem::offset_of!(VmxRunContext, rcx), 88);
+        assert_eq!(core::mem::size_of::<VmxRunContext>(), 96);
     }
 
     #[test]

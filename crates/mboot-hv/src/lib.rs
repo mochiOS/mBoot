@@ -57,6 +57,8 @@ pub enum VmExitReason {
     Hypercall,
     Preempted,
     InterruptWindow,
+    MsrRead,
+    MsrWrite,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +69,8 @@ pub struct VmExit {
     pub arg0: u64,
     pub arg1: u64,
     pub arg2: u64,
+    pub msr: u32,
+    pub msr_value: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +80,7 @@ pub struct GuestConfig {
     pub entry: u64,
     pub stack: u64,
     pub boot_info: u64,
+    pub msr_permission_map: u64,
 }
 
 impl Virtualization {
@@ -176,6 +181,28 @@ impl Virtualization {
         match self {
             Virtualization::Intel(vmx) => unsafe { vmx.resume_preempted() },
             Virtualization::Amd(svm) => unsafe { svm.resume_preempted() },
+        }
+    }
+
+    /// Completes an intercepted RDMSR and resumes after the instruction.
+    ///
+    /// # Safety
+    /// The previous exit must have been `VmExitReason::MsrRead` from this vCPU.
+    pub unsafe fn resume_msr_read(&mut self, value: u64) -> Result<VmExit, Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.resume_msr_read(value) },
+            Virtualization::Amd(svm) => unsafe { svm.resume_msr_read(value) },
+        }
+    }
+
+    /// Completes an intercepted WRMSR and resumes after the instruction.
+    ///
+    /// # Safety
+    /// The previous exit must have been `VmExitReason::MsrWrite` from this vCPU.
+    pub unsafe fn resume_msr_write(&mut self) -> Result<VmExit, Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.resume_msr_write() },
+            Virtualization::Amd(svm) => unsafe { svm.resume_msr_write() },
         }
     }
 

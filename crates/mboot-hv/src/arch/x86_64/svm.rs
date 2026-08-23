@@ -12,11 +12,13 @@ const VM_CR_SVMDIS: u64 = 1 << 4;
 
 const VMCB_INTERCEPT_MISC1: usize = 0x00c;
 const VMCB_INTERCEPT_MISC2: usize = 0x010;
+const VMCB_MSRPM_BASE_PA: usize = 0x048;
 const VMCB_GUEST_ASID: usize = 0x058;
 const VMCB_TLB_CONTROL: usize = 0x05c;
 const VMCB_INTERRUPT_CONTROL: usize = 0x060;
 const VMCB_INTERRUPT_VECTOR: usize = 0x064;
 const VMCB_EXIT_CODE: usize = 0x070;
+const VMCB_EXIT_INFO1: usize = 0x078;
 const VMCB_NP_ENABLE: usize = 0x090;
 const VMCB_NCR3: usize = 0x0b0;
 const VMCB_ES: usize = 0x400;
@@ -41,11 +43,13 @@ const VMCB_RSP: usize = 0x5d8;
 const VMCB_RAX: usize = 0x5f8;
 
 const INTERCEPT_HLT: u32 = 1 << 24;
+const INTERCEPT_MSR_PROT: u32 = 1 << 28;
 const INTERCEPT_VMRUN: u32 = 1;
 const INTERCEPT_VMMCALL: u32 = 1 << 1;
 const TLB_CONTROL_FLUSH_ALL: u8 = 1;
 const SVM_EXIT_HLT: u64 = 0x78;
 const SVM_EXIT_VMMCALL: u64 = 0x81;
+const SVM_EXIT_MSR: u64 = 0x7c;
 const SVM_EXIT_INTR: u64 = 0x60;
 const INTERCEPT_INTR: u32 = 1;
 const V_INTR_MASKING: u64 = 1 << 24;
@@ -68,6 +72,7 @@ struct SvmRunContext {
     r13: u64,
     r14: u64,
     r15: u64,
+    rcx: u64,
 }
 
 global_asm!(
@@ -91,6 +96,7 @@ global_asm!(
     "mov rdi, [rax + 8]",
     "mov rsi, [rax + 16]",
     "mov rdx, [rax + 24]",
+    "mov rcx, [rax + 80]",
     "mov rax, [rsp + 8]",
     "sti",
     "vmrun rax",
@@ -104,26 +110,29 @@ global_asm!(
     "push rdi",
     "push rsi",
     "push rdx",
-    "mov rax, [rsp + 72]",
-    "mov rcx, [rsp + 64]",
+    "push rcx",
+    "mov rax, [rsp + 80]",
+    "mov rcx, [rsp + 72]",
     "mov [rax + 32], rcx",
-    "mov rcx, [rsp + 56]",
+    "mov rcx, [rsp + 64]",
     "mov [rax + 40], rcx",
-    "mov rcx, [rsp + 48]",
+    "mov rcx, [rsp + 56]",
     "mov [rax + 48], rcx",
-    "mov rcx, [rsp + 40]",
+    "mov rcx, [rsp + 48]",
     "mov [rax + 56], rcx",
-    "mov rcx, [rsp + 32]",
+    "mov rcx, [rsp + 40]",
     "mov [rax + 64], rcx",
-    "mov rcx, [rsp + 24]",
+    "mov rcx, [rsp + 32]",
     "mov [rax + 72], rcx",
-    "mov rcx, [rsp + 16]",
+    "mov rcx, [rsp + 24]",
     "mov [rax + 8], rcx",
-    "mov rcx, [rsp + 8]",
+    "mov rcx, [rsp + 16]",
     "mov [rax + 16], rcx",
-    "mov rcx, [rsp]",
+    "mov rcx, [rsp + 8]",
     "mov [rax + 24], rcx",
-    "add rsp, 72",
+    "mov rcx, [rsp]",
+    "mov [rax + 80], rcx",
+    "add rsp, 80",
     "add rsp, 16",
     "pop r15",
     "pop r14",
@@ -234,6 +243,7 @@ impl Svm {
     /// accessible. The caller must execute on the CPU that called `enable`.
     pub unsafe fn run(&mut self, config: GuestConfig) -> Result<VmExit, Error> {
         validate_page(config.nested_root)?;
+        validate_page(config.msr_permission_map)?;
         if !self.active {
             return Err(Error::InvalidState);
         }
@@ -271,6 +281,26 @@ impl Svm {
         if !self.active || !self.started {
             return Err(Error::InvalidState);
         }
+        unsafe { self.enter() }
+    }
+
+    pub unsafe fn resume_msr_read(&mut self, value: u64) -> Result<VmExit, Error> {
+        self.run_context.rax = u64::from(value as u32);
+        self.run_context.rdx = u64::from((value >> 32) as u32);
+        unsafe { self.resume_msr() }
+    }
+
+    pub unsafe fn resume_msr_write(&mut self) -> Result<VmExit, Error> {
+        unsafe { self.resume_msr() }
+    }
+
+    unsafe fn resume_msr(&mut self) -> Result<VmExit, Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        let rip = unsafe { read_u64(self.vmcb_phys, VMCB_RIP) };
+        // RDMSR and WRMSR are both two-byte instructions.
+        unsafe { write_u64(self.vmcb_phys, VMCB_RIP, rip + 2) };
         unsafe { self.enter() }
     }
 
@@ -335,6 +365,8 @@ impl Svm {
                     arg0: 0,
                     arg1: 0,
                     arg2: 0,
+                    msr: 0,
+                    msr_value: 0,
                 })
             }
             SVM_EXIT_HLT => Ok(VmExit {
@@ -344,6 +376,8 @@ impl Svm {
                 arg0: 0,
                 arg1: 0,
                 arg2: 0,
+                msr: 0,
+                msr_value: 0,
             }),
             SVM_EXIT_VMMCALL => Ok(VmExit {
                 reason: VmExitReason::Hypercall,
@@ -352,7 +386,27 @@ impl Svm {
                 arg0: self.run_context.rdi,
                 arg1: self.run_context.rsi,
                 arg2: self.run_context.rdx,
+                msr: 0,
+                msr_value: 0,
             }),
+            SVM_EXIT_MSR => {
+                let write = unsafe { read_u64(self.vmcb_phys, VMCB_EXIT_INFO1) } & 1 != 0;
+                Ok(VmExit {
+                    reason: if write {
+                        VmExitReason::MsrWrite
+                    } else {
+                        VmExitReason::MsrRead
+                    },
+                    raw_reason: exit_code,
+                    hypercall_number: 0,
+                    arg0: 0,
+                    arg1: 0,
+                    arg2: 0,
+                    msr: self.run_context.rcx as u32,
+                    msr_value: u64::from(self.run_context.rax as u32)
+                        | (u64::from(self.run_context.rdx as u32) << 32),
+                })
+            }
             _ => Err(Error::UnexpectedVmExit(exit_code)),
         }
     }
@@ -378,7 +432,11 @@ unsafe fn initialize_guest(vmcb: u64, guest_asid: u32, config: GuestConfig) {
     // SAFETY: The caller owns the complete VMCB page.
     unsafe {
         write_bytes(vmcb as *mut u8, 0, 4096);
-        write_u32(vmcb, VMCB_INTERCEPT_MISC1, INTERCEPT_INTR | INTERCEPT_HLT);
+        write_u32(
+            vmcb,
+            VMCB_INTERCEPT_MISC1,
+            INTERCEPT_INTR | INTERCEPT_HLT | INTERCEPT_MSR_PROT,
+        );
         // VMRUN must never recurse into a guest-provided VMCB. AMD defines this
         // as a mandatory intercept for a valid first-level guest.
         write_u32(
@@ -387,6 +445,7 @@ unsafe fn initialize_guest(vmcb: u64, guest_asid: u32, config: GuestConfig) {
             INTERCEPT_VMRUN | INTERCEPT_VMMCALL,
         );
         write_u32(vmcb, VMCB_GUEST_ASID, guest_asid);
+        write_u64(vmcb, VMCB_MSRPM_BASE_PA, config.msr_permission_map);
         write_u8(vmcb, VMCB_TLB_CONTROL, TLB_CONTROL_FLUSH_ALL);
         // Physical interrupts are governed by host RFLAGS.IF while the guest is
         // running. The guest starts with IF clear until it installs its own IDT.
@@ -484,6 +543,12 @@ mod tests {
     fn svm_control_pages_must_be_aligned() {
         assert_eq!(validate_page(0x1234), Err(Error::InvalidPage));
         assert_eq!(validate_page(0x4000), Ok(()));
+    }
+
+    #[test]
+    fn assembly_context_offsets_include_guest_rcx() {
+        assert_eq!(core::mem::offset_of!(SvmRunContext, rcx), 80);
+        assert_eq!(core::mem::size_of::<SvmRunContext>(), 88);
     }
 
     #[test]
