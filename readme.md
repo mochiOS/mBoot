@@ -99,7 +99,7 @@ make hv-image
 
 このファイルはISO9660ではなく、USBメモリへそのまま書き込めるraw GPT
 ディスクイメージです。EFI System PartitionにはmBootのUEFIアプリ、Launch
-Manifest、mnu Domainイメージが入ります。既定のIntel実機向け設定は
+Manifest、mochiOS System Domainイメージが入ります。既定のIntel実機向け設定は
 `config/hypervisor/intel-hardware.toml`です。QEMUで複数Domainを確かめる場合は
 `config/hypervisor/qemu.toml`を使います。
 
@@ -122,9 +122,9 @@ make hv-image-test
 ```
 
 実機では、mBootが画面を濃い青に切り替えて起動状況を表示します。Intel CPUなら
-`INTEL VMX`、AMD CPUなら`AMD SVM`と表示されます。mnuの起動が終わると画面が緑に
-変わり、`MNU OK`が残ります。赤い画面が出た場合は、`ERROR`の下にある番号を確認して
-ください。
+`INTEL VMX`、AMD CPUなら`AMD SVM`と表示されます。mochiOS System Domainが
+常駐待機へ入ると画面が緑に変わり、`MOCHIOS OK`が残ります。赤い画面が出た場合は、
+`ERROR`の下にある番号を確認してください。
 
 | 番号 | 止まった場所 |
 |---:|---|

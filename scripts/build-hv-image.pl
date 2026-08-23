@@ -49,19 +49,38 @@ make_path($work, dirname($output_file));
 my $toolchain = "+$config->{toolchain}";
 my $mnu_manifest = "$mnu_dir/Cargo.toml";
 my $mnu_abi = "$mnu_dir/crates/abi";
+my %domain_images = (
+    bootstrap => {
+        bin => 'domain-bootstrap',
+        path => "$mnu_dir/target/x86_64-unknown-none/release/domain-bootstrap",
+    },
+    mochios => {
+        bin => 'mochios-domain',
+        path => "$mnu_dir/target/x86_64-unknown-none/release/mochios-domain",
+    },
+);
+my %required_images;
+for my $domain (@{$config->{domains}}) {
+    exists $domain_images{$domain->{image}}
+        or die "no builder is available for Domain image '$domain->{image}'\n";
+    $required_images{$domain->{image}} = 1;
+}
+my @bins = map { ('--bin', $domain_images{$_}->{bin}) } sort keys %required_images;
 run_env(
     { RUSTFLAGS => '-C relocation-model=static -C link-arg=-no-pie --cfg curve25519_dalek_backend="serial"' },
     $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc', '--release',
     '--target', 'x86_64-unknown-none', '--manifest-path', $mnu_manifest,
-    '--no-default-features', '--features', 'domain-guest', '--bin', 'domain-bootstrap',
+    '--no-default-features', '--features', 'domain-guest', @bins,
 );
-my $mnu_image = "$mnu_dir/target/x86_64-unknown-none/release/domain-bootstrap";
--s $mnu_image or die "mnu Domain image was not produced: $mnu_image\n";
+for my $name (keys %required_images) {
+    my $path = $domain_images{$name}->{path};
+    -s $path or die "Domain image was not produced: $path\n";
+}
 
 run(
     "$mboot_dir/scripts/create-hv-launch-manifest.pl",
     '--config', $config_file,
-    '--image', "mnu=$mnu_image",
+    map({ ('--image', "$_=$domain_images{$_}->{path}") } sort keys %required_images),
     '--output', $manifest,
 );
 
@@ -91,9 +110,7 @@ run('mcopy', '-i', $esp, $manifest, '::/EFI/MBOOT/LAUNCH.MF');
 
 my %copied_paths;
 for my $domain (@{$config->{domains}}) {
-    my $source = $domain->{image} eq 'mnu'
-        ? $mnu_image
-        : die "no builder is available for Domain image '$domain->{image}'\n";
+    my $source = $domain_images{$domain->{image}}->{path};
     next if $copied_paths{$domain->{path}}++;
     (my $destination = $domain->{path}) =~ s{\\}{/}g;
     run('mcopy', '-i', $esp, $source, "::$destination");

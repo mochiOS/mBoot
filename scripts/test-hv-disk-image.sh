@@ -11,6 +11,7 @@ TIMEOUT_SECONDS=${HV_TIMEOUT_SECONDS:-30}
 OVMF_CODE="$ROOT/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_CODE_4M.fd"
 OVMF_VARS="$ROOT/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_VARS_4M.fd"
 DOMAIN_COUNT=$($ROOT/scripts/hv-config-value.pl "$CONFIG" domain_count)
+SYSTEM_IMAGE=$($ROOT/scripts/hv-config-value.pl "$CONFIG" system_image)
 
 test -s "$IMAGE" || { echo "missing image: $IMAGE" >&2; exit 1; }
 for file in "$OVMF_CODE" "$OVMF_VARS"; do
@@ -49,7 +50,11 @@ cp --sparse=always "$IMAGE" "$WORK/mochiOS.iso"
     -no-shutdown &
 QEMU_PID=$!
 
-expected="[mBoot-HV] bootstrap complete; $DOMAIN_COUNT Domains entered and stopped cleanly"
+if [[ $SYSTEM_IMAGE == mochios ]]; then
+    expected='[mBoot-HV] mochiOS System Domain 1 ready'
+else
+    expected="[mBoot-HV] bootstrap complete; $DOMAIN_COUNT Domains entered and stopped cleanly"
+fi
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
     grep -Fq "$expected" "$WORK/serial.log" 2>/dev/null && break
     kill -0 "$QEMU_PID" 2>/dev/null || break
@@ -57,8 +62,8 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
 done
 grep -Fq "$expected" "$WORK/serial.log" || {
     sed -n '1,200p' "$WORK/serial.log" >&2
-    echo "hypervisor image did not complete bootstrap" >&2
+    echo "hypervisor image did not reach its expected Domain state" >&2
     exit 1
 }
-grep -E '\[mBoot-HV\]|\[mnu Domain' "$WORK/serial.log"
+grep -E '\[mBoot-HV\]|\[Domain' "$WORK/serial.log"
 echo 'test-hv-disk-image: PASS'

@@ -13,6 +13,11 @@ if ($key eq 'domain_count') {
     print scalar(@{$config->{domains}}), "\n";
     exit 0;
 }
+if ($key eq 'system_image') {
+    my ($system) = grep { $_->{role} eq 'system' } @{$config->{domains}};
+    print "$system->{image}\n";
+    exit 0;
+}
 exists $config->{$key} && ref($config->{$key}) eq ''
     or die "unknown scalar config key: $key\n";
 print "$config->{$key}\n";

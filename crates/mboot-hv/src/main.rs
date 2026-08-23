@@ -20,8 +20,9 @@ use mboot_hv::{
     image, BackendKind, GuestConfig, Virtualization, VirtualizationResources, VmExitReason,
 };
 use mnu_abi::hypervisor::{
-    DomainBootInfo, HypercallNumber, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS,
-    HYPERCALL_UNSUPPORTED, HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
+    DomainBootInfo, HypercallNumber, DOMAIN_ROLE_APPLICATION, DOMAIN_ROLE_HARDWARE,
+    DOMAIN_ROLE_SYSTEM, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED,
+    HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
 };
 use uefi::fs::Error as FsError;
 use uefi::prelude::*;
@@ -79,6 +80,8 @@ struct RuntimeDomain {
     started: bool,
     pending_result: u64,
     yield_count: u64,
+    ready: bool,
+    waiting: bool,
     _image: Vec<u8>,
 }
 
@@ -346,6 +349,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             domain.id().get(),
             0,
             backend_id,
+            abi_domain_role(domain.role()),
             domain.nested_pages().guest_memory_size(),
         );
         let Some(boot_info_host) = domain
@@ -388,6 +392,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             started: false,
             pending_result: HYPERCALL_SUCCESS,
             yield_count: 0,
+            ready: false,
+            waiting: false,
             _image: prepared.image,
         });
     }
@@ -443,14 +449,41 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 runtime.yield_count += 1;
                 HYPERCALL_SUCCESS
             }
+            number if number == HypercallNumber::Ready as u64 => {
+                if runtime.domain.role() != DomainRole::System || runtime.ready {
+                    HYPERCALL_INVALID_ARGUMENT
+                } else {
+                    runtime.ready = true;
+                    log!("mochiOS System Domain {} ready", runtime.domain.id().get());
+                    display::mochios_ready();
+                    HYPERCALL_SUCCESS
+                }
+            }
+            number if number == HypercallNumber::Wait as u64 => {
+                if runtime.domain.role() == DomainRole::System && !runtime.ready {
+                    HYPERCALL_INVALID_ARGUMENT
+                } else {
+                    runtime.waiting = true;
+                    runnable[index] = false;
+                    HYPERCALL_SUCCESS
+                }
+            }
             _ => HYPERCALL_UNSUPPORTED,
         };
     }
-    log!(
-        "bootstrap complete; {} Domains entered and stopped cleanly",
-        runtime_domains.len()
-    );
-    display::success();
+    let waiting_domains = runtime_domains
+        .iter()
+        .filter(|domain| domain.waiting)
+        .count();
+    if waiting_domains == 0 {
+        log!(
+            "bootstrap complete; {} Domains entered and stopped cleanly",
+            runtime_domains.len()
+        );
+        display::bootstrap_success();
+    } else {
+        log!("{} resident Domain(s) waiting", waiting_domains);
+    }
 
     let _keep_domains_alive = runtime_domains;
     let _keep_prepared_storage = prepared_domains;
@@ -476,8 +509,16 @@ fn handle_console_write(
     let Ok(message) = core::str::from_utf8(bytes) else {
         return HYPERCALL_INVALID_ARGUMENT;
     };
-    crate::serial::print(format_args!("[mnu Domain {}] {}", domain_id.get(), message));
+    crate::serial::print(format_args!("[Domain {}] {}", domain_id.get(), message));
     HYPERCALL_SUCCESS
+}
+
+fn abi_domain_role(role: DomainRole) -> u32 {
+    match role {
+        DomainRole::System => DOMAIN_ROLE_SYSTEM,
+        DomainRole::Hardware => DOMAIN_ROLE_HARDWARE,
+        DomainRole::Application => DOMAIN_ROLE_APPLICATION,
+    }
 }
 
 fn allocate_page(boot_services: &BootServices) -> Result<u64, Status> {

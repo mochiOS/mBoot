@@ -132,7 +132,7 @@ dependencies = [
 [[package]]
 name = "mnu-abi"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/mnu#85a0e6c9f50d7ca36b3f2fccbfb121b25b098580"
+source = "git+https://github.com/mochiOS/mnu#82d0380e455c4700c76d6e1242cf2b428b4708a9"
 
 [[package]]
 name = "mock-mochios-agent"
