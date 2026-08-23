@@ -2,10 +2,10 @@
 
 このcrateは、LinuxをホストOSとして使わない新しいmBootの起動部分です。現在使われているLinuxベースのmBootとは別のバイナリとしてビルドされます。
 
-UEFIから起動し、ファームウェアのメモリマップを引き継いだあと、mBoot専用のGDTとIDTへ切り替えます。Intel CPUではVMX、AMD CPUではSVMを有効にします。ゲストの物理アドレス0にはmBootが所有する1ページだけを割り当て、IntelではEPT、AMDではNPTを使ってほかの物理メモリから隔離します。
+UEFIから起動し、ファームウェアのメモリマップを引き継いだあと、mBoot専用のGDTとIDTへ切り替えます。Intel CPUではVMX、AMD CPUではSVMを有効にします。Domainには2 MiBのRAMを割り当て、IntelではEPT、AMDではNPTを使ってmBootのメモリから隔離します。
 
-最小ゲストを起動し、先頭の`HLT`をVM Exitとして受け取るところまで確認できます。これはCPU仮想化とメモリ隔離を結ぶ最初の動作確認であり、まだmochiOSやDriver Linuxを起動するものではありません。
+ESPの`\EFI\MBOOT\MNU.ELF`からmnuのDomain用ELFを読み込みます。mBootがDomain内のページテーブルと`DomainBootInfo`を用意し、mnuを64ビットモードで起動します。現在使えるHypercallは`ConsoleWrite`、`Yield`、`Shutdown`です。AMD CPUでは、`ConsoleWrite`の処理後に同じvCPUを再開し、`Shutdown`を受け取るところまでKVMで確認しています。Intel CPU用にも同じ経路がありますが、Intel実機での動作確認はまだです。
 
 現在の`crates/mboot-hv`は、LinuxベースのmBootと並行して開発するための一時的な置き場所です。移行時にはLinuxベースの構成を取り除き、mnuと同じように、リポジトリ直下の`mboot`をハイパーバイザー本体にします。既存のmBootイメージはまだこのバイナリへ切り替えません。
 
-ホスト上の単体テストは`make hv-test`、UEFIバイナリは`make hv-build`で生成します。KVMで仮想化機能を実際に有効化する試験は`make hv-qemu-test`で実行します。IntelホストではVMX、AMDホストではSVMが選ばれます。
+ホスト上の単体テストは`make hv-test`、UEFIバイナリは`make hv-build`で生成します。mnuのDomain用ELFは`make hv-domain-build`で生成します。KVMでmnuの起動まで確認するときは`make hv-qemu-test`を実行します。IntelホストではVMX、AMDホストではSVMが選ばれます。

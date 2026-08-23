@@ -1,19 +1,34 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod panic;
 mod serial;
 
+use alloc::vec::Vec;
 use core::arch::asm;
-use core::ptr::write_volatile;
+use core::mem::size_of;
+use core::ptr::copy_nonoverlapping;
 use mboot_hv::arch::x86_64::{cpu, descriptor};
 use mboot_hv::domain::{Domain, DomainId};
+use mboot_hv::image;
 use mboot_hv::memory::{NestedPageResources, NestedPageTable};
-use mboot_hv::{Virtualization, VirtualizationResources};
+use mboot_hv::{BackendKind, GuestConfig, Virtualization, VirtualizationResources, VmExitReason};
+use mnu_abi::hypervisor::{
+    DomainBootInfo, HypercallNumber, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS,
+    HYPERCALL_UNSUPPORTED, HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
+};
+use uefi::fs::Error as FsError;
 use uefi::prelude::*;
 use uefi::table::boot::{AllocateType, MemoryType};
+use uefi::CString16;
 
 const MAX_MEMORY_REGIONS: usize = 256;
+const GUEST_MEMORY_PAGES: usize = 512;
+const DOMAIN_BOOT_INFO_GPA: u64 = 0x3000;
+const DOMAIN_STACK_TOP: u64 = GUEST_MEMORY_PAGES as u64 * 4096 - 16;
+const MAX_CONSOLE_WRITE: u64 = 4096;
 
 macro_rules! log {
     ($($arg:tt)*) => {
@@ -74,9 +89,13 @@ impl BootMemoryMap {
 }
 
 #[entry]
-unsafe fn main(_image: Handle, system_table: SystemTable<Boot>) -> Status {
+unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     serial::init();
     log!("starting independent hypervisor");
+    if let Err(error) = uefi::helpers::init(&mut system_table) {
+        log!("UEFI helper initialization failed: {:?}", error.status());
+        return error.status();
+    }
 
     let features = cpu::detect();
     let vendor = core::str::from_utf8(&features.vendor).unwrap_or("unknown");
@@ -93,6 +112,13 @@ unsafe fn main(_image: Handle, system_table: SystemTable<Boot>) -> Status {
     );
 
     let boot_services = system_table.boot_services();
+    let guest_elf = match load_guest_elf(boot_services, image_handle) {
+        Ok(image) => image,
+        Err(status) => {
+            log!("failed to load mnu Domain image: {:?}", status);
+            return status;
+        }
+    };
     let host_control_page = match allocate_page(boot_services) {
         Ok(page) => page,
         Err(status) => return status,
@@ -138,8 +164,16 @@ unsafe fn main(_image: Handle, system_table: SystemTable<Boot>) -> Status {
         Ok(table) => table,
         Err(error) => halt_with_error("nested page table", error),
     };
-    // SAFETY: This is the exclusively owned and mapped guest page.
-    unsafe { write_volatile(nested.guest_page() as *mut u8, 0xf4) };
+    // SAFETY: The Domain is stopped and all guest pages belong to this table.
+    let guest_cr3 = match unsafe { nested.initialize_guest_page_tables() } {
+        Ok(root) => root,
+        Err(error) => halt_with_error("guest page tables", error),
+    };
+    // SAFETY: The Domain is stopped and its RAM is exclusively owned by mBoot.
+    let guest_image = match unsafe { image::load_elf(&guest_elf, &nested) } {
+        Ok(image) => image,
+        Err(error) => halt_with_error("mnu image", error),
+    };
 
     // SAFETY: The control pages are exclusively owned, execution is pinned to
     // the BSP, interrupts are disabled, and the code is running at CPL0.
@@ -158,24 +192,84 @@ unsafe fn main(_image: Handle, system_table: SystemTable<Boot>) -> Status {
         halt_with_error("domain", error);
     }
     log!(
-        "Domain {} ready: backend={:?} nested-root={:#x} guest-page={:#x}",
+        "Domain {} ready: backend={:?} nested-root={:#x} guest-memory={:#x}+{} KiB",
         domain.id().get(),
         domain.backend(),
         domain.nested_pages().hardware_root(),
-        domain.nested_pages().guest_page()
+        domain.nested_pages().guest_base(),
+        domain.nested_pages().guest_memory_size() / 1024
     );
+    let backend = match domain.backend() {
+        BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
+        BackendKind::AmdSvm => HYPERVISOR_BACKEND_AMD_SVM,
+    };
+    let boot_info = DomainBootInfo::new(
+        domain.id().get(),
+        0,
+        backend,
+        domain.nested_pages().guest_memory_size(),
+    );
+    let Some(boot_info_host) = domain
+        .nested_pages()
+        .guest_host_address(DOMAIN_BOOT_INFO_GPA, size_of::<DomainBootInfo>() as u64)
+    else {
+        halt_with_error("Domain boot info", mboot_hv::Error::InvalidPage)
+    };
+    // SAFETY: The destination is an aligned, in-bounds part of stopped guest RAM.
+    unsafe {
+        copy_nonoverlapping(
+            &boot_info as *const DomainBootInfo,
+            boot_info_host as *mut DomainBootInfo,
+            1,
+        )
+    };
     if let Err(error) = domain.start() {
         halt_with_error("domain start", error);
     }
-    // SAFETY: The guest page contains HLT, the nested tables are live, and this
+    // SAFETY: The image, stack, and page tables are in live Domain RAM, and this
     // is still the pinned BSP with interrupts disabled.
-    let vm_exit = match unsafe { virtualization.run(domain.nested_pages().hardware_root()) } {
+    let mut vm_exit = match unsafe {
+        virtualization.run(GuestConfig {
+            nested_root: domain.nested_pages().hardware_root(),
+            page_table_root: guest_cr3,
+            entry: guest_image.entry(),
+            stack: DOMAIN_STACK_TOP,
+            boot_info: DOMAIN_BOOT_INFO_GPA,
+        })
+    } {
         Ok(vm_exit) => vm_exit,
         Err(error) => {
             let _ = domain.mark_crashed();
             halt_with_error("guest entry", error)
         }
     };
+    loop {
+        if vm_exit.reason != VmExitReason::Hypercall {
+            let _ = domain.mark_crashed();
+            halt_with_error(
+                "mnu Hypercall",
+                mboot_hv::Error::UnexpectedVmExit(vm_exit.raw_reason),
+            );
+        }
+        if vm_exit.hypercall_number == HypercallNumber::Shutdown as u64 {
+            break;
+        }
+        let result = match vm_exit.hypercall_number {
+            number if number == HypercallNumber::ConsoleWrite as u64 => {
+                handle_console_write(domain.nested_pages(), vm_exit.arg0, vm_exit.arg1)
+            }
+            number if number == HypercallNumber::Yield as u64 => HYPERCALL_SUCCESS,
+            _ => HYPERCALL_UNSUPPORTED,
+        };
+        // SAFETY: The previous exit was a Hypercall from this stopped vCPU.
+        vm_exit = match unsafe { virtualization.resume(result) } {
+            Ok(exit) => exit,
+            Err(error) => {
+                let _ = domain.mark_crashed();
+                halt_with_error("mnu Hypercall resume", error)
+            }
+        };
+    }
     if let Err(error) = domain.stop() {
         halt_with_error("domain stop", error);
     }
@@ -185,10 +279,28 @@ unsafe fn main(_image: Handle, system_table: SystemTable<Boot>) -> Status {
         vm_exit.reason,
         vm_exit.raw_reason
     );
-    log!("bootstrap complete; guest entry and VM exit verified");
+    log!("mnu requested Domain shutdown: reason={}", vm_exit.arg0);
+    log!("bootstrap complete; mnu Domain entry and Hypercall verified");
 
     let _keep_virtualization_active = virtualization;
     halt()
+}
+
+fn handle_console_write(memory: &NestedPageTable, address: u64, len: u64) -> u64 {
+    if len > MAX_CONSOLE_WRITE {
+        return HYPERCALL_INVALID_ARGUMENT;
+    }
+    let Some(host_address) = memory.guest_host_address(address, len) else {
+        return HYPERCALL_INVALID_ARGUMENT;
+    };
+    // SAFETY: `guest_host_address` checked the complete immutable guest range and
+    // the vCPU is stopped for the duration of this read.
+    let bytes = unsafe { core::slice::from_raw_parts(host_address as *const u8, len as usize) };
+    let Ok(message) = core::str::from_utf8(bytes) else {
+        return HYPERCALL_INVALID_ARGUMENT;
+    };
+    crate::serial::print(format_args!("[mnu] {}", message));
+    HYPERCALL_SUCCESS
 }
 
 fn allocate_page(boot_services: &BootServices) -> Result<u64, Status> {
@@ -203,7 +315,27 @@ fn allocate_nested_pages(boot_services: &BootServices) -> Result<NestedPageResou
         level3: allocate_page(boot_services)?,
         level2: allocate_page(boot_services)?,
         level1: allocate_page(boot_services)?,
-        guest_page: allocate_page(boot_services)?,
+        guest_base: boot_services
+            .allocate_pages(
+                AllocateType::AnyPages,
+                MemoryType::LOADER_DATA,
+                GUEST_MEMORY_PAGES,
+            )
+            .map_err(|error| error.status())?,
+        guest_pages: GUEST_MEMORY_PAGES,
+    })
+}
+
+fn load_guest_elf(boot_services: &BootServices, image: Handle) -> Result<Vec<u8>, Status> {
+    let filesystem = boot_services
+        .get_image_file_system(image)
+        .map_err(|error| error.status())?;
+    let mut filesystem = uefi::fs::FileSystem::new(filesystem);
+    let path =
+        CString16::try_from("\\EFI\\MBOOT\\MNU.ELF").map_err(|_| Status::INVALID_PARAMETER)?;
+    filesystem.read(path.as_ref()).map_err(|error| match error {
+        FsError::Io(io) => io.uefi_error.status(),
+        FsError::Path(_) | FsError::Utf8Encoding(_) => Status::LOAD_ERROR,
     })
 }
 

@@ -2,6 +2,7 @@
 
 pub mod arch;
 pub mod domain;
+pub mod image;
 pub mod memory;
 
 use arch::x86_64::{cpu, svm, vmx};
@@ -14,9 +15,10 @@ pub enum Error {
     InvalidState,
     ControlInstructionFailed,
     ControlRegionTooLarge,
-    UnrestrictedGuestUnavailable,
     GuestEntryFailed,
     UnexpectedVmExit(u64),
+    InvalidImage,
+    ImageTooLarge,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,12 +41,26 @@ pub enum Virtualization {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VmExitReason {
     Halt,
+    Hypercall,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmExit {
     pub reason: VmExitReason,
     pub raw_reason: u64,
+    pub hypercall_number: u64,
+    pub arg0: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestConfig {
+    pub nested_root: u64,
+    pub page_table_root: u64,
+    pub entry: u64,
+    pub stack: u64,
+    pub boot_info: u64,
 }
 
 impl Virtualization {
@@ -84,14 +100,28 @@ impl Virtualization {
     ///
     /// # Safety
     /// `nested_root` must describe a live EPT/NPT owned by mBoot. Guest physical
-    /// address zero must contain executable guest code. This must run on the CPU
-    /// that enabled this backend, with interrupts disabled.
-    pub unsafe fn run(&mut self, nested_root: u64) -> Result<VmExit, Error> {
+    /// `entry`, `stack`, and `page_table_root` must point into mapped guest RAM.
+    /// This must run on the CPU that enabled this backend, with interrupts disabled.
+    pub unsafe fn run(&mut self, config: GuestConfig) -> Result<VmExit, Error> {
         match self {
             // SAFETY: The public function contract is forwarded unchanged.
-            Self::Intel(vmx) => unsafe { vmx.run(nested_root) },
+            Self::Intel(vmx) => unsafe { vmx.run(config) },
             // SAFETY: The public function contract is forwarded unchanged.
-            Self::Amd(svm) => unsafe { svm.run(nested_root) },
+            Self::Amd(svm) => unsafe { svm.run(config) },
+        }
+    }
+
+    /// Completes the intercepted Hypercall and resumes the same vCPU.
+    ///
+    /// # Safety
+    /// The previous exit must be a Hypercall from this vCPU. Guest memory and
+    /// control structures must still satisfy the `run` contract.
+    pub unsafe fn resume(&mut self, result: u64) -> Result<VmExit, Error> {
+        match self {
+            // SAFETY: The public function contract is forwarded unchanged.
+            Self::Intel(vmx) => unsafe { vmx.resume(result) },
+            // SAFETY: The public function contract is forwarded unchanged.
+            Self::Amd(svm) => unsafe { svm.resume(result) },
         }
     }
 }

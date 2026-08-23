@@ -4,7 +4,7 @@ use core::ptr::write_bytes;
 use crate::arch::x86_64::{
     descriptor, read_cr0, read_cr3, read_cr4, read_msr, write_cr0, write_cr4, write_msr,
 };
-use crate::{arch::x86_64::cpu, BackendKind, Error, VmExit, VmExitReason};
+use crate::{arch::x86_64::cpu, BackendKind, Error, GuestConfig, VmExit, VmExitReason};
 
 const IA32_FEATURE_CONTROL: u32 = 0x3a;
 const IA32_VMX_BASIC: u32 = 0x480;
@@ -26,6 +26,7 @@ const IA32_GS_BASE: u32 = 0xc000_0101;
 const IA32_SYSENTER_CS: u32 = 0x174;
 const IA32_SYSENTER_ESP: u32 = 0x175;
 const IA32_SYSENTER_EIP: u32 = 0x176;
+const IA32_EFER: u32 = 0xc000_0080;
 
 const FEATURE_CONTROL_LOCK: u64 = 1 << 0;
 const FEATURE_CONTROL_VMX_OUTSIDE_SMX: u64 = 1 << 2;
@@ -47,6 +48,8 @@ const SECONDARY_CONTROLS: u64 = 0x401e;
 const EPT_POINTER: u64 = 0x201a;
 const VMCS_LINK_POINTER: u64 = 0x2800;
 const GUEST_DEBUGCTL: u64 = 0x2802;
+const GUEST_EFER: u64 = 0x2806;
+const HOST_EFER: u64 = 0x2c02;
 const GUEST_ES_SELECTOR: u64 = 0x0800;
 const GUEST_CS_SELECTOR: u64 = 0x0802;
 const GUEST_SS_SELECTOR: u64 = 0x0804;
@@ -114,7 +117,25 @@ const HOST_IDTR_BASE: u64 = 0x6c0e;
 const HOST_SYSENTER_ESP: u64 = 0x6c10;
 const HOST_SYSENTER_EIP: u64 = 0x6c12;
 const EXIT_REASON: u64 = 0x4402;
+const EXIT_INSTRUCTION_LENGTH: u64 = 0x440c;
 const HLT_EXIT_REASON: u64 = 12;
+const VMCALL_EXIT_REASON: u64 = 18;
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct VmxRunContext {
+    rax: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    rbx: u64,
+    rbp: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    resume: u64,
+}
 
 global_asm!(
     ".global mboot_vmx_launch",
@@ -125,18 +146,79 @@ global_asm!(
     "push r13",
     "push r14",
     "push r15",
+    "push rdi",
     "mov rax, rsp",
     "mov rcx, 0x6c14",
     "vmwrite rax, rcx",
     "lea rax, [rip + mboot_vmx_exit]",
     "mov rcx, 0x6c16",
     "vmwrite rax, rcx",
+    "mov rax, [rsp]",
+    "cmp qword ptr [rax + 80], 0",
+    "jne mboot_vmx_resume_guest",
+    "mov rbx, [rax + 32]",
+    "mov rbp, [rax + 40]",
+    "mov r12, [rax + 48]",
+    "mov r13, [rax + 56]",
+    "mov r14, [rax + 64]",
+    "mov r15, [rax + 72]",
+    "mov rdi, [rax + 8]",
+    "mov rsi, [rax + 16]",
+    "mov rdx, [rax + 24]",
+    "mov rax, [rax]",
     "vmlaunch",
+    "jmp mboot_vmx_entry_failed",
+    "mboot_vmx_resume_guest:",
+    "mov rbx, [rax + 32]",
+    "mov rbp, [rax + 40]",
+    "mov r12, [rax + 48]",
+    "mov r13, [rax + 56]",
+    "mov r14, [rax + 64]",
+    "mov r15, [rax + 72]",
+    "mov rdi, [rax + 8]",
+    "mov rsi, [rax + 16]",
+    "mov rdx, [rax + 24]",
+    "mov rax, [rax]",
+    "vmresume",
+    "mboot_vmx_entry_failed:",
     "mov eax, 1",
     "jmp mboot_vmx_return",
     "mboot_vmx_exit:",
+    "push rax",
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "mov rcx, [rsp + 80]",
+    "mov rax, [rsp + 72]",
+    "mov [rcx], rax",
+    "mov rax, [rsp + 16]",
+    "mov [rcx + 8], rax",
+    "mov rax, [rsp + 8]",
+    "mov [rcx + 16], rax",
+    "mov rax, [rsp]",
+    "mov [rcx + 24], rax",
+    "mov rax, [rsp + 64]",
+    "mov [rcx + 32], rax",
+    "mov rax, [rsp + 56]",
+    "mov [rcx + 40], rax",
+    "mov rax, [rsp + 48]",
+    "mov [rcx + 48], rax",
+    "mov rax, [rsp + 40]",
+    "mov [rcx + 56], rax",
+    "mov rax, [rsp + 32]",
+    "mov [rcx + 64], rax",
+    "mov rax, [rsp + 24]",
+    "mov [rcx + 72], rax",
+    "add rsp, 80",
     "xor eax, eax",
     "mboot_vmx_return:",
+    "add rsp, 8",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -146,14 +228,15 @@ global_asm!(
     "ret",
 );
 
-unsafe extern "C" {
-    fn mboot_vmx_launch() -> u32;
+unsafe extern "sysv64" {
+    fn mboot_vmx_launch(context: *mut VmxRunContext) -> u32;
 }
 
 pub struct Vmx {
     revision_id: u32,
     vmcs_phys: u64,
     active: bool,
+    run_context: VmxRunContext,
 }
 
 impl Vmx {
@@ -242,6 +325,7 @@ impl Vmx {
             revision_id,
             vmcs_phys,
             active: true,
+            run_context: VmxRunContext::default(),
         })
     }
 
@@ -253,30 +337,75 @@ impl Vmx {
         self.vmcs_phys
     }
 
-    /// Runs a real-mode unrestricted guest whose first byte is `HLT`.
+    /// Runs a 64-bit guest until its first intercepted exit.
     ///
     /// # Safety
     /// `ept_pointer` must name a live EPT owned by mBoot. The current VMCS and
     /// descriptor tables must remain installed on the CPU that called `enable`.
-    pub unsafe fn run(&mut self, ept_pointer: u64) -> Result<VmExit, Error> {
+    pub unsafe fn run(&mut self, config: GuestConfig) -> Result<VmExit, Error> {
         if !self.active {
             return Err(Error::InvalidState);
         }
         // SAFETY: VMX is active and all VMCS host/guest values are supplied here.
-        unsafe { initialize_vmcs(ept_pointer)? };
+        unsafe { initialize_vmcs(config)? };
+        self.run_context = VmxRunContext {
+            rax: 0,
+            rdi: config.boot_info,
+            ..VmxRunContext::default()
+        };
         // SAFETY: The VMCS host RIP/RSP target the assembly return trampoline.
-        if unsafe { mboot_vmx_launch() } != 0 {
+        if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
             return Err(Error::GuestEntryFailed);
         }
+        // SAFETY: VMLAUNCH returned only through a VM exit.
+        unsafe { self.decode_exit() }
+    }
+
+    /// Resumes the vCPU after a VMCALL exit.
+    ///
+    /// # Safety
+    /// The previous exit must have been the VMCALL returned by `run`/`resume`.
+    pub unsafe fn resume(&mut self, result: u64) -> Result<VmExit, Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        // SAFETY: VMEXIT left a current, stopped VMCS with readable exit fields.
+        let (rip, instruction_len) =
+            unsafe { (vmread(GUEST_RIP), vmread(EXIT_INSTRUCTION_LENGTH)) };
+        // SAFETY: The stopped VMCS accepts the next guest RIP.
+        unsafe { vmwrite(GUEST_RIP, rip + instruction_len)? };
+        self.run_context.rax = result;
+        self.run_context.resume = 1;
+        // SAFETY: The VMCS and captured register state belong to this stopped vCPU.
+        if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
+            return Err(Error::GuestEntryFailed);
+        }
+        // SAFETY: VMRESUME returned only through a VM exit.
+        unsafe { self.decode_exit() }
+    }
+
+    unsafe fn decode_exit(&self) -> Result<VmExit, Error> {
         // SAFETY: A VM exit returned through the configured host trampoline.
         let reason = unsafe { vmread(EXIT_REASON) } & 0xffff;
-        if reason != HLT_EXIT_REASON {
-            return Err(Error::UnexpectedVmExit(reason));
+        match reason {
+            HLT_EXIT_REASON => Ok(VmExit {
+                reason: VmExitReason::Halt,
+                raw_reason: reason,
+                hypercall_number: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+            }),
+            VMCALL_EXIT_REASON => Ok(VmExit {
+                reason: VmExitReason::Hypercall,
+                raw_reason: reason,
+                hypercall_number: self.run_context.rax,
+                arg0: self.run_context.rdi,
+                arg1: self.run_context.rsi,
+                arg2: self.run_context.rdx,
+            }),
+            _ => Err(Error::UnexpectedVmExit(reason)),
         }
-        Ok(VmExit {
-            reason: VmExitReason::Halt,
-            raw_reason: reason,
-        })
     }
 
     /// Leaves VMX operation on the current logical CPU.
@@ -321,13 +450,12 @@ unsafe fn ept_available() -> bool {
 fn supports_ept(primary: u64, secondary: u64, ept: u64) -> bool {
     let secondary_controls = primary >> 32 & (1 << 31) != 0;
     let ept_control = secondary >> 32 & (1 << 1) != 0;
-    let unrestricted_guest = secondary >> 32 & (1 << 7) != 0;
     let four_level_walk = ept & (1 << 6) != 0;
     let write_back = ept & (1 << 14) != 0;
-    secondary_controls && ept_control && unrestricted_guest && four_level_walk && write_back
+    secondary_controls && ept_control && four_level_walk && write_back
 }
 
-unsafe fn initialize_vmcs(ept_pointer: u64) -> Result<(), Error> {
+unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
     // SAFETY: All MSRs are architectural VMX capability and host-state MSRs.
     let basic = unsafe { read_msr(IA32_VMX_BASIC) };
     let true_controls = basic & (1 << 55) != 0;
@@ -356,13 +484,13 @@ unsafe fn initialize_vmcs(ept_pointer: u64) -> Result<(), Error> {
         (
             adjusted_vm_control(0, read_msr(pin_msr)),
             adjusted_vm_control((1 << 7) | (1 << 31), read_msr(primary_msr)),
-            adjusted_vm_control((1 << 1) | (1 << 7), read_msr(IA32_VMX_PROCBASED_CTLS2)),
-            adjusted_vm_control(1 << 9, read_msr(exit_msr)),
-            adjusted_vm_control(0, read_msr(entry_msr)),
+            adjusted_vm_control(1 << 1, read_msr(IA32_VMX_PROCBASED_CTLS2)),
+            adjusted_vm_control((1 << 9) | (1 << 21), read_msr(exit_msr)),
+            adjusted_vm_control((1 << 9) | (1 << 15), read_msr(entry_msr)),
         )
     };
-    if secondary & ((1 << 1) | (1 << 7)) != ((1 << 1) | (1 << 7)) {
-        return Err(Error::UnrestrictedGuestUnavailable);
+    if secondary & (1 << 1) == 0 {
+        return Err(Error::NestedPagingUnavailable);
     }
 
     for (field, value) in [
@@ -385,26 +513,26 @@ unsafe fn initialize_vmcs(ept_pointer: u64) -> Result<(), Error> {
     }
     // SAFETY: `ept_pointer` was constructed from validated EPT capabilities.
     unsafe {
-        vmwrite(EPT_POINTER, ept_pointer)?;
-        initialize_guest_state()?;
+        vmwrite(EPT_POINTER, config.nested_root)?;
+        initialize_guest_state(config)?;
         initialize_host_state()?;
     }
     Ok(())
 }
 
-unsafe fn initialize_guest_state() -> Result<(), Error> {
-    for field in [
-        GUEST_ES_SELECTOR,
-        GUEST_CS_SELECTOR,
-        GUEST_SS_SELECTOR,
-        GUEST_DS_SELECTOR,
-        GUEST_FS_SELECTOR,
-        GUEST_GS_SELECTOR,
-        GUEST_LDTR_SELECTOR,
-        GUEST_TR_SELECTOR,
+unsafe fn initialize_guest_state(config: GuestConfig) -> Result<(), Error> {
+    for (field, selector) in [
+        (GUEST_ES_SELECTOR, 0x10),
+        (GUEST_CS_SELECTOR, 0x08),
+        (GUEST_SS_SELECTOR, 0x10),
+        (GUEST_DS_SELECTOR, 0x10),
+        (GUEST_FS_SELECTOR, 0x10),
+        (GUEST_GS_SELECTOR, 0x10),
+        (GUEST_LDTR_SELECTOR, 0),
+        (GUEST_TR_SELECTOR, 0x18),
     ] {
-        // SAFETY: The current VMCS accepts its 16-bit guest selector fields.
-        unsafe { vmwrite(field, 0)? };
+        // SAFETY: The selectors match the cached guest segment state below.
+        unsafe { vmwrite(field, selector)? };
     }
     for field in [
         GUEST_ES_LIMIT,
@@ -414,12 +542,9 @@ unsafe fn initialize_guest_state() -> Result<(), Error> {
         GUEST_FS_LIMIT,
         GUEST_GS_LIMIT,
         GUEST_LDTR_LIMIT,
-        GUEST_TR_LIMIT,
-        GUEST_GDTR_LIMIT,
-        GUEST_IDTR_LIMIT,
     ] {
-        // SAFETY: Real-mode segments use 64 KiB limits.
-        unsafe { vmwrite(field, 0xffff)? };
+        // SAFETY: The long-mode cached segments use flat 32-bit limits.
+        unsafe { vmwrite(field, 0xffff_ffff)? };
     }
     for field in [
         GUEST_ES_AR,
@@ -428,14 +553,17 @@ unsafe fn initialize_guest_state() -> Result<(), Error> {
         GUEST_FS_AR,
         GUEST_GS_AR,
     ] {
-        // SAFETY: 0x93 is a present real-mode writable data segment.
-        unsafe { vmwrite(field, 0x93)? };
+        // SAFETY: 0xc093 is a present flat writable data segment.
+        unsafe { vmwrite(field, 0xc093)? };
     }
-    // SAFETY: These are architectural unrestricted-guest segment encodings.
+    // SAFETY: These are architectural long-mode segment encodings.
     unsafe {
-        vmwrite(GUEST_CS_AR, 0x9b)?;
+        vmwrite(GUEST_CS_AR, 0xa09b)?;
         vmwrite(GUEST_LDTR_AR, 0x1_0000)?;
         vmwrite(GUEST_TR_AR, 0x8b)?;
+        vmwrite(GUEST_TR_LIMIT, 0x67)?;
+        vmwrite(GUEST_GDTR_LIMIT, 0)?;
+        vmwrite(GUEST_IDTR_LIMIT, 0)?;
     }
     for field in [
         GUEST_ES_BASE,
@@ -448,22 +576,33 @@ unsafe fn initialize_guest_state() -> Result<(), Error> {
         GUEST_TR_BASE,
         GUEST_GDTR_BASE,
         GUEST_IDTR_BASE,
-        GUEST_CR3,
-        GUEST_CR4,
-        GUEST_RIP,
         GUEST_SYSENTER_ESP,
         GUEST_SYSENTER_EIP,
     ] {
-        // SAFETY: The minimal guest starts with zero bases and at GPA zero.
+        // SAFETY: The Domain starts with flat segment bases.
         unsafe { vmwrite(field, 0)? };
     }
-    // SAFETY: All remaining values satisfy unrestricted real-mode VM-entry checks.
+    // SAFETY: All remaining values satisfy IA-32e guest VM-entry checks.
     unsafe {
-        vmwrite(GUEST_CR0, 0x20)?;
+        let guest_cr0 = adjusted_control_register(
+            0x8001_0033,
+            read_msr(IA32_VMX_CR0_FIXED0),
+            read_msr(IA32_VMX_CR0_FIXED1),
+        );
+        let guest_cr4 = adjusted_control_register(
+            1 << 5,
+            read_msr(IA32_VMX_CR4_FIXED0),
+            read_msr(IA32_VMX_CR4_FIXED1),
+        );
+        vmwrite(GUEST_CR0, guest_cr0)?;
+        vmwrite(GUEST_CR3, config.page_table_root)?;
+        vmwrite(GUEST_CR4, guest_cr4)?;
         vmwrite(GUEST_DR7, 0x400)?;
-        vmwrite(GUEST_RSP, 0x800)?;
+        vmwrite(GUEST_RSP, config.stack)?;
+        vmwrite(GUEST_RIP, config.entry)?;
         vmwrite(GUEST_RFLAGS, 2)?;
         vmwrite(GUEST_DEBUGCTL, 0)?;
+        vmwrite(GUEST_EFER, (1 << 8) | (1 << 10))?;
         vmwrite(VMCS_LINK_POINTER, u64::MAX)?;
         vmwrite(GUEST_INTERRUPTIBILITY, 0)?;
         vmwrite(GUEST_ACTIVITY_STATE, 0)?;
@@ -500,6 +639,7 @@ unsafe fn initialize_host_state() -> Result<(), Error> {
         vmwrite(HOST_SYSENTER_CS, read_msr(IA32_SYSENTER_CS) & 0xffff)?;
         vmwrite(HOST_SYSENTER_ESP, read_msr(IA32_SYSENTER_ESP))?;
         vmwrite(HOST_SYSENTER_EIP, read_msr(IA32_SYSENTER_EIP))?;
+        vmwrite(HOST_EFER, read_msr(IA32_EFER))?;
     }
     Ok(())
 }
@@ -683,7 +823,7 @@ mod tests {
     #[test]
     fn ept_requires_secondary_control_four_levels_and_write_back() {
         let primary = (1u64 << 31) << 32;
-        let secondary = ((1u64 << 1) | (1u64 << 7)) << 32;
+        let secondary = (1u64 << 1) << 32;
         let capabilities = (1 << 6) | (1 << 14);
         assert!(supports_ept(primary, secondary, capabilities));
         assert!(!supports_ept(primary, secondary, capabilities & !(1 << 6)));

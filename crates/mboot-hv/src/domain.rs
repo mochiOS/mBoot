@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn domain_state_machine_rejects_skipped_states() {
-        let pages = NestedPageTable::test_new(BackendKind::IntelVmx, 0x1000, 0x5000);
+        let pages = NestedPageTable::test_new(BackendKind::IntelVmx, 0x1000, 0x5000, 1);
         let mut domain = Domain::new(DomainId::new(1), BackendKind::IntelVmx, pages);
         assert_eq!(domain.start(), Err(Error::InvalidState));
         assert_eq!(domain.mark_ready(), Ok(()));

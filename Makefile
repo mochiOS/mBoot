@@ -391,23 +391,38 @@ help:
 	@echo "  make rebuild           Clean and rebuild"
 HV_TOOLCHAIN ?= nightly-2026-05-14
 HV_TARGET_DIR ?= $(CURDIR)/output/hv-target
+MNU_DIR ?= $(abspath $(CURDIR)/../core)
+MNU_DOMAIN_ELF ?= $(MNU_DIR)/target/x86_64-unknown-none/release/domain-bootstrap
+MNU_ABI_PATCH := --config 'patch."https://github.com/mochiOS/mnu".mnu-abi.path="$(MNU_DIR)/crates/abi"'
 
-.PHONY: hv-build hv-test hv-qemu-test
+.PHONY: hv-build hv-domain-build hv-test hv-qemu-test
+
+hv-domain-build:
+	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
+	RUSTFLAGS='-C relocation-model=static -C link-arg=-no-pie --cfg curve25519_dalek_backend="serial"' \
+		$(HOST_CARGO) +$(HV_TOOLCHAIN) build \
+		-Z build-std=core,alloc \
+		--release \
+		--target x86_64-unknown-none \
+		--manifest-path "$(MNU_DIR)/Cargo.toml" \
+		--no-default-features \
+		--features domain-guest \
+		--bin domain-bootstrap
 
 hv-build:
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
 	RUSTFLAGS='-C panic=abort' $(HOST_CARGO) +$(HV_TOOLCHAIN) build \
-		--locked \
-		-Z build-std=core,compiler_builtins \
+		-Z build-std=core,alloc,compiler_builtins \
 		--release \
 		--target x86_64-unknown-uefi \
 		--target-dir $(HV_TARGET_DIR) \
 		--package mboot-hv \
-		--features uefi-app
+		--features uefi-app \
+		$(MNU_ABI_PATCH)
 
 hv-test:
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
-	$(HOST_CARGO) test --locked --package mboot-hv --lib
+	$(HOST_CARGO) test --package mboot-hv --lib $(MNU_ABI_PATCH)
 
-hv-qemu-test: hv-build
-	scripts/test-hv-qemu.sh
+hv-qemu-test: hv-domain-build hv-build
+	MNU_DOMAIN_ELF="$(MNU_DOMAIN_ELF)" scripts/test-hv-qemu.sh

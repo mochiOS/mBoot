@@ -110,6 +110,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "mboot-hv"
 version = "0.1.0"
 dependencies = [
+ "mnu-abi",
  "uefi",
 ]
 
@@ -126,6 +127,11 @@ dependencies = [
  "sha2",
  "x11rb",
 ]
+
+[[package]]
+name = "mnu-abi"
+version = "0.1.0"
+source = "git+https://github.com/mochiOS/mnu#9ae543c841b48a0317f03e1e5814d1b073b4f964"
 
 [[package]]
 name = "mock-mochios-agent"

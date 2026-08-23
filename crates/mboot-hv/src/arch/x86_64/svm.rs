@@ -1,7 +1,8 @@
+use core::arch::global_asm;
 use core::ptr::write_bytes;
 
 use crate::arch::x86_64::{cpu, read_msr, write_msr};
-use crate::{BackendKind, Error, VmExit, VmExitReason};
+use crate::{BackendKind, Error, GuestConfig, VmExit, VmExitReason};
 
 const EFER: u32 = 0xc000_0080;
 const VM_CR: u32 = 0xc001_0114;
@@ -38,14 +39,99 @@ const VMCB_RAX: usize = 0x5f8;
 
 const INTERCEPT_HLT: u32 = 1 << 24;
 const INTERCEPT_VMRUN: u32 = 1;
+const INTERCEPT_VMMCALL: u32 = 1 << 1;
 const SVM_EXIT_HLT: u64 = 0x78;
-const SEGMENT_CODE_REAL_MODE: u16 = 0x009b;
-const SEGMENT_DATA_REAL_MODE: u16 = 0x0093;
+const SVM_EXIT_VMMCALL: u64 = 0x81;
+const SEGMENT_CODE_LONG_MODE: u16 = 0x0a9b;
+const SEGMENT_DATA_LONG_MODE: u16 = 0x0c93;
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct SvmRunContext {
+    rax: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    rbx: u64,
+    rbp: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+global_asm!(
+    ".global mboot_svm_enter",
+    "mboot_svm_enter:",
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "push rdi",
+    "push rsi",
+    "mov rax, [rsp]",
+    "mov rbx, [rax + 32]",
+    "mov rbp, [rax + 40]",
+    "mov r12, [rax + 48]",
+    "mov r13, [rax + 56]",
+    "mov r14, [rax + 64]",
+    "mov r15, [rax + 72]",
+    "mov rdi, [rax + 8]",
+    "mov rsi, [rax + 16]",
+    "mov rdx, [rax + 24]",
+    "mov rax, [rsp + 8]",
+    "vmrun rax",
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "mov rax, [rsp + 72]",
+    "mov rcx, [rsp + 64]",
+    "mov [rax + 32], rcx",
+    "mov rcx, [rsp + 56]",
+    "mov [rax + 40], rcx",
+    "mov rcx, [rsp + 48]",
+    "mov [rax + 48], rcx",
+    "mov rcx, [rsp + 40]",
+    "mov [rax + 56], rcx",
+    "mov rcx, [rsp + 32]",
+    "mov [rax + 64], rcx",
+    "mov rcx, [rsp + 24]",
+    "mov [rax + 72], rcx",
+    "mov rcx, [rsp + 16]",
+    "mov [rax + 8], rcx",
+    "mov rcx, [rsp + 8]",
+    "mov [rax + 16], rcx",
+    "mov rcx, [rsp]",
+    "mov [rax + 24], rcx",
+    "add rsp, 72",
+    "add rsp, 16",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rbp",
+    "pop rbx",
+    "ret",
+);
+
+unsafe extern "sysv64" {
+    fn mboot_svm_enter(vmcb: u64, context: *mut SvmRunContext);
+}
 
 pub struct Svm {
     hsave_phys: u64,
     vmcb_phys: u64,
     active: bool,
+    started: bool,
+    run_context: SvmRunContext,
 }
 
 impl Svm {
@@ -82,6 +168,8 @@ impl Svm {
             hsave_phys,
             vmcb_phys,
             active: true,
+            started: false,
+            run_context: SvmRunContext::default(),
         })
     }
 
@@ -93,39 +181,76 @@ impl Svm {
         self.vmcb_phys
     }
 
-    /// Runs a real-mode guest whose first byte is expected to be `HLT`.
+    /// Runs a 64-bit guest until its first intercepted exit.
     ///
     /// # Safety
     /// `nested_root` and the VMCB must remain exclusively owned and physically
     /// accessible. The caller must execute on the CPU that called `enable`.
-    pub unsafe fn run(&mut self, nested_root: u64) -> Result<VmExit, Error> {
-        validate_page(nested_root)?;
+    pub unsafe fn run(&mut self, config: GuestConfig) -> Result<VmExit, Error> {
+        validate_page(config.nested_root)?;
         if !self.active {
             return Err(Error::InvalidState);
         }
 
         // SAFETY: `enable` established exclusive ownership of this mapped VMCB.
-        unsafe { initialize_guest(self.vmcb_phys, nested_root) };
+        unsafe { initialize_guest(self.vmcb_phys, config) };
 
-        // SAFETY: EFER.SVME and VM_HSAVE_PA are configured, the VMCB is valid,
-        // and interrupts are disabled. The guest executes only a HLT instruction.
-        unsafe {
-            core::arch::asm!(
-                "vmrun rax",
-                inlateout("rax") self.vmcb_phys => _,
-                options(nostack)
-            );
+        self.run_context = SvmRunContext {
+            rdi: config.boot_info,
+            ..SvmRunContext::default()
+        };
+        self.started = true;
+        // SAFETY: The VMCB and initial register state were just initialized.
+        unsafe { self.enter() }
+    }
+
+    /// Resumes the vCPU after a VMMCALL exit.
+    ///
+    /// # Safety
+    /// The previous exit must have been the VMMCALL returned by `run`/`resume`.
+    pub unsafe fn resume(&mut self, result: u64) -> Result<VmExit, Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
         }
+        // SAFETY: The stopped vCPU owns the VMCB state-save area.
+        let rip = unsafe { read_u64(self.vmcb_phys, VMCB_RIP) };
+        // SAFETY: VMMCALL is three bytes and the next RIP remains in guest code.
+        unsafe { write_u64(self.vmcb_phys, VMCB_RIP, rip + 3) };
+        self.run_context.rax = result;
+        // SAFETY: The VMCB still describes the stopped vCPU.
+        unsafe { self.enter() }
+    }
+
+    unsafe fn enter(&mut self) -> Result<VmExit, Error> {
+        // SAFETY: The stopped guest owns its VMCB RAX field.
+        unsafe { write_u64(self.vmcb_phys, VMCB_RAX, self.run_context.rax) };
+        // SAFETY: EFER.SVME and VM_HSAVE_PA are configured. The assembly bridge
+        // preserves host callee-saved registers and captures guest registers.
+        unsafe { mboot_svm_enter(self.vmcb_phys, &raw mut self.run_context) };
 
         // SAFETY: VMEXIT completed and the processor wrote the control area.
         let exit_code = unsafe { read_u64(self.vmcb_phys, VMCB_EXIT_CODE) };
-        if exit_code != SVM_EXIT_HLT {
-            return Err(Error::UnexpectedVmExit(exit_code));
+        // SAFETY: VMEXIT saved guest RAX in the VMCB state area.
+        self.run_context.rax = unsafe { read_u64(self.vmcb_phys, VMCB_RAX) };
+        match exit_code {
+            SVM_EXIT_HLT => Ok(VmExit {
+                reason: VmExitReason::Halt,
+                raw_reason: exit_code,
+                hypercall_number: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+            }),
+            SVM_EXIT_VMMCALL => Ok(VmExit {
+                reason: VmExitReason::Hypercall,
+                raw_reason: exit_code,
+                hypercall_number: self.run_context.rax,
+                arg0: self.run_context.rdi,
+                arg1: self.run_context.rsi,
+                arg2: self.run_context.rdx,
+            }),
+            _ => Err(Error::UnexpectedVmExit(exit_code)),
         }
-        Ok(VmExit {
-            reason: VmExitReason::Halt,
-            raw_reason: exit_code,
-        })
     }
 
     /// Disables SVM on the current logical CPU.
@@ -142,38 +267,42 @@ impl Svm {
     }
 }
 
-unsafe fn initialize_guest(vmcb: u64, nested_root: u64) {
+unsafe fn initialize_guest(vmcb: u64, config: GuestConfig) {
     // SAFETY: The caller owns the complete VMCB page.
     unsafe {
         write_bytes(vmcb as *mut u8, 0, 4096);
         write_u32(vmcb, VMCB_INTERCEPT_MISC1, INTERCEPT_HLT);
         // VMRUN must never recurse into a guest-provided VMCB. AMD defines this
         // as a mandatory intercept for a valid first-level guest.
-        write_u32(vmcb, VMCB_INTERCEPT_MISC2, INTERCEPT_VMRUN);
+        write_u32(
+            vmcb,
+            VMCB_INTERCEPT_MISC2,
+            INTERCEPT_VMRUN | INTERCEPT_VMMCALL,
+        );
         write_u32(vmcb, VMCB_GUEST_ASID, 1);
         write_u64(vmcb, VMCB_NP_ENABLE, 1);
-        write_u64(vmcb, VMCB_NCR3, nested_root);
+        write_u64(vmcb, VMCB_NCR3, config.nested_root);
 
         for offset in [VMCB_ES, VMCB_SS, VMCB_DS, VMCB_FS, VMCB_GS] {
-            write_segment(vmcb, offset, 0, SEGMENT_DATA_REAL_MODE, 0xffff, 0);
+            write_segment(vmcb, offset, 0x10, SEGMENT_DATA_LONG_MODE, 0xffff_ffff, 0);
         }
-        write_segment(vmcb, VMCB_CS, 0, SEGMENT_CODE_REAL_MODE, 0xffff, 0);
-        write_segment(vmcb, VMCB_GDTR, 0, 0, 0xffff, 0);
-        write_segment(vmcb, VMCB_IDTR, 0, 0, 0xffff, 0);
-        write_segment(vmcb, VMCB_LDTR, 0, 0x0082, 0xffff, 0);
-        write_segment(vmcb, VMCB_TR, 0, 0x008b, 0xffff, 0);
+        write_segment(vmcb, VMCB_CS, 0x08, SEGMENT_CODE_LONG_MODE, 0xffff_ffff, 0);
+        write_segment(vmcb, VMCB_GDTR, 0, 0, 0, 0);
+        write_segment(vmcb, VMCB_IDTR, 0, 0, 0, 0);
+        write_segment(vmcb, VMCB_LDTR, 0, 0, 0, 0);
+        write_segment(vmcb, VMCB_TR, 0x18, 0x008b, 0x67, 0);
 
-        // SVME remains set in guest EFER while SVM is active, even though this
-        // guest starts in real mode and does not use long mode.
-        write_u64(vmcb, VMCB_EFER, EFER_SVME);
-        write_u64(vmcb, VMCB_CR4, 0);
-        write_u64(vmcb, VMCB_CR3, 0);
-        write_u64(vmcb, VMCB_CR0, 0x10);
+        // SVME remains set in guest EFER while SVM is active. LME and LMA start
+        // the Domain directly in 64-bit mode.
+        write_u64(vmcb, VMCB_EFER, EFER_SVME | (1 << 8) | (1 << 10));
+        write_u64(vmcb, VMCB_CR4, 1 << 5);
+        write_u64(vmcb, VMCB_CR3, config.page_table_root);
+        write_u64(vmcb, VMCB_CR0, 0x8001_0033);
         write_u64(vmcb, VMCB_DR7, 0x400);
         write_u64(vmcb, VMCB_DR6, 0xffff_0ff0);
         write_u64(vmcb, VMCB_RFLAGS, 2);
-        write_u64(vmcb, VMCB_RIP, 0);
-        write_u64(vmcb, VMCB_RSP, 0x800);
+        write_u64(vmcb, VMCB_RIP, config.entry);
+        write_u64(vmcb, VMCB_RSP, config.stack);
         write_u64(vmcb, VMCB_RAX, 0);
     }
 }

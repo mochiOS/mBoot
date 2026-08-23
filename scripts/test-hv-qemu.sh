@@ -8,10 +8,11 @@ ACCEL=${HV_ACCEL:-kvm}
 CPU=${HV_CPU:-host}
 EXPECT_BACKEND=${HV_EXPECT_BACKEND:-}
 EFI="$ROOT/output/hv-target/x86_64-unknown-uefi/release/mboot-hv.efi"
+MNU_DOMAIN_ELF=${MNU_DOMAIN_ELF:-"$ROOT/../core/target/x86_64-unknown-none/release/domain-bootstrap"}
 OVMF_CODE="$ROOT/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_CODE_4M.fd"
 OVMF_VARS="$ROOT/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_VARS_4M.fd"
 
-for command in "$QEMU"; do
+for command in "$QEMU" mkfs.vfat mcopy mmd truncate; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "test-hv-qemu: missing command: $command" >&2
         exit 1
@@ -19,6 +20,10 @@ for command in "$QEMU"; do
 done
 test -s "$EFI" || {
     echo "test-hv-qemu: missing UEFI binary: $EFI" >&2
+    exit 1
+}
+test -s "$MNU_DOMAIN_ELF" || {
+    echo "test-hv-qemu: missing mnu Domain image: $MNU_DOMAIN_ELF" >&2
     exit 1
 }
 
@@ -32,23 +37,30 @@ cleanup() {
     rm -rf -- "$WORK"
 }
 trap cleanup EXIT
-ESP="$WORK/esp"
+ESP="$WORK/esp.img"
 VARS="$WORK/OVMF_VARS.fd"
 SERIAL="$WORK/serial.log"
 
-mkdir -p "$ESP/EFI/BOOT"
-cp "$EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
+truncate -s 64M "$ESP"
+mkfs.vfat -n MBOOTTEST "$ESP" >/dev/null
+mmd -i "$ESP" ::/EFI
+mmd -i "$ESP" ::/EFI/BOOT
+mmd -i "$ESP" ::/EFI/MBOOT
+mcopy -i "$ESP" "$EFI" ::/EFI/BOOT/BOOTX64.EFI
+mcopy -i "$ESP" "$MNU_DOMAIN_ELF" ::/EFI/MBOOT/MNU.ELF
 cp "$OVMF_VARS" "$VARS"
 
 "$QEMU" \
     -accel "$ACCEL" \
     -cpu "$CPU" \
     -machine q35 \
+    -boot menu=off,strict=on \
     -smp 1 \
     -m 512 \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$VARS" \
-    -drive "file=fat:rw:$ESP,format=raw" \
+    -drive "if=none,id=esp,format=raw,file=$ESP" \
+    -device virtio-blk-pci,drive=esp,bootindex=1 \
     -display none \
     -monitor none \
     -serial "file:$SERIAL" \
@@ -59,7 +71,7 @@ QEMU_PID=$!
 
 BOOTSTRAPPED=0
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
-    if grep -Fq '[mBoot-HV] bootstrap complete' "$SERIAL" 2>/dev/null; then
+    if grep -Fq '[mBoot-HV] bootstrap complete; mnu Domain entry and Hypercall verified' "$SERIAL" 2>/dev/null; then
         BOOTSTRAPPED=1
         break
     fi
@@ -81,11 +93,16 @@ if [[ -n $EXPECT_BACKEND ]]; then
         exit 1
     }
 fi
-grep -Fq 'guest entry and VM exit verified' "$SERIAL" || {
+grep -Fq 'mnu requested Domain shutdown: reason=0' "$SERIAL" || {
     sed -n '1,200p' "$SERIAL" >&2
-    echo 'test-hv-qemu: guest did not exit through HLT interception' >&2
+    echo 'test-hv-qemu: mnu did not request a clean Domain shutdown' >&2
+    exit 1
+}
+grep -Fq '[mnu] mnu entered its mBoot Domain' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: mnu ConsoleWrite Hypercall was not handled' >&2
     exit 1
 }
 
-grep -F '[mBoot-HV]' "$SERIAL"
+grep -E '\[mBoot-HV\]|\[mnu\]' "$SERIAL"
 echo 'test-hv-qemu: PASS'
