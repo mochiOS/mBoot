@@ -20,6 +20,7 @@ const VMCB_INTERRUPT_VECTOR: usize = 0x064;
 const VMCB_EXIT_CODE: usize = 0x070;
 const VMCB_EXIT_INFO1: usize = 0x078;
 const VMCB_NP_ENABLE: usize = 0x090;
+const VMCB_EVENT_INJECTION: usize = 0x0a8;
 const VMCB_NCR3: usize = 0x0b0;
 const VMCB_ES: usize = 0x400;
 const VMCB_CS: usize = 0x410;
@@ -316,6 +317,20 @@ impl Svm {
             );
             write_u8(self.vmcb_phys, VMCB_INTERRUPT_VECTOR, vector);
         }
+        Ok(())
+    }
+
+    pub unsafe fn inject_general_protection(&mut self) -> Result<(), Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        unsafe {
+            write_u64(
+                self.vmcb_phys,
+                VMCB_EVENT_INJECTION,
+                (1 << 31) | (1 << 11) | (3 << 8) | 13,
+            )
+        };
         Ok(())
     }
 

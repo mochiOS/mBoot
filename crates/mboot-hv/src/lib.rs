@@ -217,6 +217,17 @@ impl Virtualization {
         }
     }
 
+    /// Queues a general-protection fault with error code zero for VM entry.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped at the faulting instruction.
+    pub unsafe fn inject_general_protection(&mut self) -> Result<(), Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.inject_general_protection() },
+            Virtualization::Amd(svm) => unsafe { svm.inject_general_protection() },
+        }
+    }
+
     /// Reports whether the stopped guest can accept an external interrupt on
     /// its next entry.
     ///

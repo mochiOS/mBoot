@@ -119,6 +119,11 @@ grep -Fq '[Domain 2] x2APIC MSR interface verified' "$SERIAL" || {
     echo 'test-hv-qemu: Hardware Domain did not verify the x2APIC MSR interface' >&2
     exit 1
 }
+grep -Fq '[Domain 2] Rejected MSR delivered #GP' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: rejected MSR did not fault only the Hardware Domain' >&2
+    exit 1
+}
 grep -Fq '[Domain 1] Shared Ring bootstrap entered' "$SERIAL" || {
     sed -n '1,200p' "$SERIAL" >&2
     echo 'test-hv-qemu: System Domain ConsoleWrite was not handled' >&2

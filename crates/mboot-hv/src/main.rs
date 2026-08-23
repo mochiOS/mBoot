@@ -84,6 +84,7 @@ enum ResumeKind {
     WithoutAdvance,
     MsrRead(u64),
     MsrWrite,
+    GeneralProtection,
 }
 
 struct RuntimeDomain {
@@ -468,24 +469,29 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     let mut scheduler = CooperativeScheduler::new();
     while let Some(index) = scheduler.next(&runnable) {
         let runtime = &mut runtime_domains[index];
-        if let Some(vector) = runtime.interrupts.next_pending() {
-            let can_inject = match unsafe { runtime.virtualization.can_inject_interrupt() } {
-                Ok(can_inject) => can_inject,
-                Err(error) => halt_with_error("Event IRQ readiness", error),
-            };
-            if can_inject {
-                if let Err(error) = unsafe { runtime.virtualization.set_interrupt_window(false) } {
-                    halt_with_error("Interrupt window disable", error)
+        if !matches!(runtime.resume_kind, ResumeKind::GeneralProtection) {
+            if let Some(vector) = runtime.interrupts.next_pending() {
+                let can_inject = match unsafe { runtime.virtualization.can_inject_interrupt() } {
+                    Ok(can_inject) => can_inject,
+                    Err(error) => halt_with_error("Event IRQ readiness", error),
+                };
+                if can_inject {
+                    if let Err(error) =
+                        unsafe { runtime.virtualization.set_interrupt_window(false) }
+                    {
+                        halt_with_error("Interrupt window disable", error)
+                    }
+                    if let Err(error) = unsafe { runtime.virtualization.inject_interrupt(vector) } {
+                        halt_with_error("Event IRQ injection", error)
+                    }
+                    if runtime.interrupts.accept(vector).is_err() {
+                        halt_with_error("Virtual APIC accept", mboot_hv::Error::InvalidState)
+                    }
+                } else if let Err(error) =
+                    unsafe { runtime.virtualization.set_interrupt_window(true) }
+                {
+                    halt_with_error("Interrupt window enable", error)
                 }
-                if let Err(error) = unsafe { runtime.virtualization.inject_interrupt(vector) } {
-                    halt_with_error("Event IRQ injection", error)
-                }
-                if runtime.interrupts.accept(vector).is_err() {
-                    halt_with_error("Virtual APIC accept", mboot_hv::Error::InvalidState)
-                }
-            } else if let Err(error) = unsafe { runtime.virtualization.set_interrupt_window(true) }
-            {
-                halt_with_error("Interrupt window enable", error)
             }
         }
         // SAFETY: The selected vCPU is stopped and owns all guest and control state.
@@ -506,6 +512,16 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 ResumeKind::MsrWrite => {
                     // SAFETY: The preceding intercepted WRMSR was emulated.
                     unsafe { runtime.virtualization.resume_msr_write() }
+                }
+                ResumeKind::GeneralProtection => {
+                    // SAFETY: The vCPU is stopped at the rejected instruction.
+                    if let Err(error) =
+                        unsafe { runtime.virtualization.inject_general_protection() }
+                    {
+                        halt_with_error("Domain exception injection", error)
+                    }
+                    // SAFETY: Fault delivery must preserve the faulting guest RIP.
+                    unsafe { runtime.virtualization.resume_preempted() }
                 }
             }
         } else {
@@ -539,23 +555,20 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         if vm_exit.reason == VmExitReason::MsrRead {
             runtime.resume_kind = match runtime.interrupts.read_msr(vm_exit.msr) {
                 Ok(value) => ResumeKind::MsrRead(value),
-                Err(_) => {
-                    let _ = runtime.domain.mark_crashed();
-                    halt_with_error("Domain MSR read", mboot_hv::Error::InvalidState)
-                }
+                Err(_) => ResumeKind::GeneralProtection,
             };
             continue;
         }
         if vm_exit.reason == VmExitReason::MsrWrite {
-            if runtime
+            runtime.resume_kind = if runtime
                 .interrupts
                 .write_msr(vm_exit.msr, vm_exit.msr_value)
                 .is_err()
             {
-                let _ = runtime.domain.mark_crashed();
-                halt_with_error("Domain MSR write", mboot_hv::Error::InvalidState)
-            }
-            runtime.resume_kind = ResumeKind::MsrWrite;
+                ResumeKind::GeneralProtection
+            } else {
+                ResumeKind::MsrWrite
+            };
             continue;
         }
         if vm_exit.reason != VmExitReason::Hypercall {

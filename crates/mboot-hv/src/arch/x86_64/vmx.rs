@@ -44,6 +44,7 @@ const EXIT_MSR_LOAD_COUNT: u64 = 0x4010;
 const ENTRY_CONTROLS: u64 = 0x4012;
 const ENTRY_MSR_LOAD_COUNT: u64 = 0x4014;
 const ENTRY_INTERRUPTION_INFO: u64 = 0x4016;
+const ENTRY_EXCEPTION_ERROR_CODE: u64 = 0x4018;
 const SECONDARY_CONTROLS: u64 = 0x401e;
 const MSR_BITMAP: u64 = 0x2004;
 const EPT_POINTER: u64 = 0x201a;
@@ -502,6 +503,20 @@ impl Vmx {
         unsafe {
             vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)?;
             vmwrite(ENTRY_INTERRUPTION_INFO, (1 << 31) | u64::from(vector))
+        }
+    }
+
+    pub unsafe fn inject_general_protection(&mut self) -> Result<(), Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        unsafe {
+            vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)?;
+            vmwrite(ENTRY_EXCEPTION_ERROR_CODE, 0)?;
+            vmwrite(
+                ENTRY_INTERRUPTION_INFO,
+                (1 << 31) | (1 << 11) | (3 << 8) | 13,
+            )
         }
     }
 
