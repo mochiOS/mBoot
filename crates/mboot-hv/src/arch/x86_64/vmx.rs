@@ -119,6 +119,8 @@ const HOST_SYSENTER_EIP: u64 = 0x6c12;
 const EXIT_REASON: u64 = 0x4402;
 const VM_INSTRUCTION_ERROR: u64 = 0x4400;
 const EXIT_INSTRUCTION_LENGTH: u64 = 0x440c;
+const EXIT_INTERRUPTION_INFO: u64 = 0x4404;
+const EXTERNAL_INTERRUPT_EXIT_REASON: u64 = 1;
 const HLT_EXIT_REASON: u64 = 12;
 const VMCALL_EXIT_REASON: u64 = 18;
 
@@ -167,7 +169,9 @@ global_asm!(
     "mov rsi, [rax + 16]",
     "mov rdx, [rax + 24]",
     "mov rax, [rax]",
+    "sti",
     "vmlaunch",
+    "cli",
     "jmp mboot_vmx_entry_failed",
     "mboot_vmx_resume_guest:",
     "mov rbx, [rax + 32]",
@@ -180,11 +184,14 @@ global_asm!(
     "mov rsi, [rax + 16]",
     "mov rdx, [rax + 24]",
     "mov rax, [rax]",
+    "sti",
     "vmresume",
+    "cli",
     "mboot_vmx_entry_failed:",
     "mov eax, 1",
     "jmp mboot_vmx_return",
     "mboot_vmx_exit:",
+    "cli",
     "push rax",
     "push rbx",
     "push rbp",
@@ -392,6 +399,7 @@ impl Vmx {
             rdi: config.boot_info,
             ..VmxRunContext::default()
         };
+        super::timer::prepare_entry();
         // SAFETY: The VMCS host RIP/RSP target the assembly return trampoline.
         if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
             // SAFETY: VMfailValid leaves the current VMCS readable. A zero value
@@ -421,6 +429,7 @@ impl Vmx {
         unsafe { vmwrite(GUEST_RIP, rip + instruction_len)? };
         self.run_context.rax = result;
         self.run_context.resume = 1;
+        super::timer::prepare_entry();
         // SAFETY: The VMCS and captured register state belong to this stopped vCPU.
         if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
             // SAFETY: VMfailValid leaves the current VMCS readable. A zero value
@@ -431,6 +440,31 @@ impl Vmx {
         }
         // SAFETY: VMRESUME returned only through a VM exit.
         unsafe { self.decode_exit() }
+    }
+
+    pub unsafe fn resume_preempted(&mut self) -> Result<VmExit, Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
+        self.run_context.resume = 1;
+        super::timer::prepare_entry();
+        if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
+            return Err(Error::GuestEntryFailed(unsafe {
+                vmread(VM_INSTRUCTION_ERROR)
+            }));
+        }
+        unsafe { self.decode_exit() }
+    }
+
+    pub unsafe fn inject_interrupt(&mut self, vector: u8) -> Result<(), Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        unsafe {
+            vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)?;
+            vmwrite(ENTRY_INTERRUPTION_INFO, (1 << 31) | u64::from(vector))
+        }
     }
 
     /// Invalidates cached translations for one EPT hierarchy.
@@ -471,6 +505,22 @@ impl Vmx {
         // SAFETY: A VM exit returned through the configured host trampoline.
         let reason = unsafe { vmread(EXIT_REASON) } & 0xffff;
         match reason {
+            EXTERNAL_INTERRUPT_EXIT_REASON => {
+                let info = unsafe { vmread(EXIT_INTERRUPTION_INFO) };
+                if info & (1 << 31) != 0 && info as u8 == super::timer::VECTOR {
+                    super::timer::acknowledge();
+                    Ok(VmExit {
+                        reason: VmExitReason::Preempted,
+                        raw_reason: reason,
+                        hypercall_number: 0,
+                        arg0: 0,
+                        arg1: 0,
+                        arg2: 0,
+                    })
+                } else {
+                    Err(Error::UnexpectedVmExit(reason))
+                }
+            }
             HLT_EXIT_REASON => Ok(VmExit {
                 reason: VmExitReason::Halt,
                 raw_reason: reason,
@@ -580,15 +630,18 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
     // SAFETY: Capability MSRs are available after VMX CPUID detection.
     let (pin, primary, secondary, exit, entry) = unsafe {
         (
-            adjusted_vm_control(0, read_msr(pin_msr)),
+            adjusted_vm_control(1, read_msr(pin_msr)),
             adjusted_vm_control((1 << 7) | (1 << 31), read_msr(primary_msr)),
             adjusted_vm_control(1 << 1, read_msr(IA32_VMX_PROCBASED_CTLS2)),
-            adjusted_vm_control((1 << 9) | (1 << 21), read_msr(exit_msr)),
+            adjusted_vm_control((1 << 9) | (1 << 15) | (1 << 21), read_msr(exit_msr)),
             adjusted_vm_control((1 << 9) | (1 << 15), read_msr(entry_msr)),
         )
     };
     if secondary & (1 << 1) == 0 {
         return Err(Error::NestedPagingUnavailable);
+    }
+    if pin & 1 == 0 || exit & (1 << 15) == 0 {
+        return Err(Error::InterruptVirtualizationUnavailable);
     }
 
     for (field, value) in [

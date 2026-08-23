@@ -14,6 +14,8 @@ const VMCB_INTERCEPT_MISC1: usize = 0x00c;
 const VMCB_INTERCEPT_MISC2: usize = 0x010;
 const VMCB_GUEST_ASID: usize = 0x058;
 const VMCB_TLB_CONTROL: usize = 0x05c;
+const VMCB_INTERRUPT_CONTROL: usize = 0x060;
+const VMCB_INTERRUPT_VECTOR: usize = 0x064;
 const VMCB_EXIT_CODE: usize = 0x070;
 const VMCB_NP_ENABLE: usize = 0x090;
 const VMCB_NCR3: usize = 0x0b0;
@@ -44,6 +46,12 @@ const INTERCEPT_VMMCALL: u32 = 1 << 1;
 const TLB_CONTROL_FLUSH_ALL: u8 = 1;
 const SVM_EXIT_HLT: u64 = 0x78;
 const SVM_EXIT_VMMCALL: u64 = 0x81;
+const SVM_EXIT_INTR: u64 = 0x60;
+const INTERCEPT_INTR: u32 = 1;
+const V_INTR_MASKING: u64 = 1 << 24;
+const V_IRQ: u64 = 1 << 8;
+const V_INTR_PRIORITY: u64 = 0x4 << 16;
+const V_IGNORE_TPR: u64 = 1 << 20;
 const SEGMENT_CODE_LONG_MODE: u16 = 0x0a9b;
 const SEGMENT_DATA_LONG_MODE: u16 = 0x0c93;
 
@@ -84,7 +92,9 @@ global_asm!(
     "mov rsi, [rax + 16]",
     "mov rdx, [rax + 24]",
     "mov rax, [rsp + 8]",
+    "sti",
     "vmrun rax",
+    "cli",
     "push rbx",
     "push rbp",
     "push r12",
@@ -257,6 +267,28 @@ impl Svm {
         unsafe { self.enter() }
     }
 
+    pub unsafe fn resume_preempted(&mut self) -> Result<VmExit, Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        unsafe { self.enter() }
+    }
+
+    pub unsafe fn inject_interrupt(&mut self, vector: u8) -> Result<(), Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        unsafe {
+            write_u64(
+                self.vmcb_phys,
+                VMCB_INTERRUPT_CONTROL,
+                V_INTR_MASKING | V_IRQ | V_INTR_PRIORITY | V_IGNORE_TPR,
+            );
+            write_u8(self.vmcb_phys, VMCB_INTERRUPT_VECTOR, vector);
+        }
+        Ok(())
+    }
+
     /// Requests an ASID translation flush before the next VMRUN.
     ///
     /// # Safety
@@ -272,6 +304,7 @@ impl Svm {
     unsafe fn enter(&mut self) -> Result<VmExit, Error> {
         // SAFETY: The stopped guest owns its VMCB RAX field.
         unsafe { write_u64(self.vmcb_phys, VMCB_RAX, self.run_context.rax) };
+        super::timer::prepare_entry();
         // SAFETY: EFER.SVME and VM_HSAVE_PA are configured. The assembly bridge
         // preserves host callee-saved registers and captures guest registers.
         unsafe { mboot_svm_enter(self.vmcb_phys, &raw mut self.run_context) };
@@ -284,6 +317,17 @@ impl Svm {
         // SAFETY: VMEXIT saved guest RAX in the VMCB state area.
         self.run_context.rax = unsafe { read_u64(self.vmcb_phys, VMCB_RAX) };
         match exit_code {
+            SVM_EXIT_INTR => {
+                super::timer::acknowledge();
+                Ok(VmExit {
+                    reason: VmExitReason::Preempted,
+                    raw_reason: exit_code,
+                    hypercall_number: 0,
+                    arg0: 0,
+                    arg1: 0,
+                    arg2: 0,
+                })
+            }
             SVM_EXIT_HLT => Ok(VmExit {
                 reason: VmExitReason::Halt,
                 raw_reason: exit_code,
@@ -325,7 +369,7 @@ unsafe fn initialize_guest(vmcb: u64, guest_asid: u32, config: GuestConfig) {
     // SAFETY: The caller owns the complete VMCB page.
     unsafe {
         write_bytes(vmcb as *mut u8, 0, 4096);
-        write_u32(vmcb, VMCB_INTERCEPT_MISC1, INTERCEPT_HLT);
+        write_u32(vmcb, VMCB_INTERCEPT_MISC1, INTERCEPT_INTR | INTERCEPT_HLT);
         // VMRUN must never recurse into a guest-provided VMCB. AMD defines this
         // as a mandatory intercept for a valid first-level guest.
         write_u32(
@@ -335,6 +379,9 @@ unsafe fn initialize_guest(vmcb: u64, guest_asid: u32, config: GuestConfig) {
         );
         write_u32(vmcb, VMCB_GUEST_ASID, guest_asid);
         write_u8(vmcb, VMCB_TLB_CONTROL, TLB_CONTROL_FLUSH_ALL);
+        // Physical interrupts are governed by host RFLAGS.IF while the guest is
+        // running. The guest starts with IF clear until it installs its own IDT.
+        write_u64(vmcb, VMCB_INTERRUPT_CONTROL, V_INTR_MASKING);
         write_u64(vmcb, VMCB_NP_ENABLE, 1);
         write_u64(vmcb, VMCB_NCR3, config.nested_root);
 

@@ -20,8 +20,46 @@ global_asm!(
     "jmp 2b",
 );
 
+global_asm!(
+    ".global mboot_hv_timer_stub",
+    "mboot_hv_timer_stub:",
+    "push rax",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "mov r11, rsp",
+    "sub rsp, 528",
+    "and rsp, -16",
+    "mov [rsp + 512], r11",
+    "fxsave64 [rsp]",
+    "call mboot_hv_timer_interrupt",
+    "fxrstor64 [rsp]",
+    "mov rsp, [rsp + 512]",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rax",
+    "iretq",
+);
+
 unsafe extern "C" {
     fn mboot_hv_exception_stub();
+    fn mboot_hv_timer_stub();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn mboot_hv_timer_interrupt() {
+    super::timer::acknowledge();
 }
 
 #[repr(C, packed)]
@@ -79,6 +117,13 @@ pub unsafe fn install() {
     for index in 0..256 {
         // SAFETY: IDT is exclusively initialized here before it is loaded.
         unsafe { idt_ptr.add(index).write(IdtEntry::interrupt(handler)) };
+    }
+    unsafe {
+        idt_ptr
+            .add(super::timer::VECTOR as usize)
+            .write(IdtEntry::interrupt(
+                mboot_hv_timer_stub as *const () as usize as u64,
+            ));
     }
 
     let tss_base = addr_of!(TSS) as u64;

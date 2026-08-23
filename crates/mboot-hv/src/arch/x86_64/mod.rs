@@ -2,6 +2,7 @@ pub mod cpu;
 pub mod descriptor;
 mod instructions;
 pub mod svm;
+pub mod timer;
 pub mod vmx;
 
 pub(crate) use instructions::{

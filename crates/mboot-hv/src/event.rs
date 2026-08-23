@@ -103,6 +103,13 @@ impl EventChannelTable {
         None
     }
 
+    pub fn has_pending(&self, receiver: DomainId) -> bool {
+        self.channels.iter().flatten().any(|channel| {
+            (channel.a.domain == receiver && channel.a.pending)
+                || (channel.b.domain == receiver && channel.b.pending)
+        })
+    }
+
     fn endpoint_exists(&self, domain: DomainId, port: u32) -> bool {
         self.channels.iter().flatten().any(|channel| {
             (channel.a.domain == domain && channel.a.port == port)
@@ -158,7 +165,9 @@ mod tests {
             .unwrap();
         assert!(table.send(DomainId::new(1), 1).is_ok());
         assert!(table.send(DomainId::new(1), 1).is_ok());
+        assert!(table.has_pending(DomainId::new(2)));
         assert_eq!(table.receive(DomainId::new(2)), Some(1));
+        assert!(!table.has_pending(DomainId::new(2)));
         assert_eq!(table.receive(DomainId::new(2)), None);
     }
 

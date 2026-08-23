@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::mem::size_of;
 use core::ptr::copy_nonoverlapping;
-use mboot_hv::arch::x86_64::{cpu, descriptor};
+use mboot_hv::arch::x86_64::{cpu, descriptor, timer};
 use mboot_hv::domain::{Domain, DomainId, DomainRole, DomainState};
 use mboot_hv::event::EventChannelTable;
 use mboot_hv::grant::{GrantRef, GrantTable};
@@ -23,8 +23,9 @@ use mboot_hv::{
 };
 use mnu_abi::hypervisor::{
     DomainBootInfo, HypercallNumber, DOMAIN_ROLE_APPLICATION, DOMAIN_ROLE_HARDWARE,
-    DOMAIN_ROLE_SYSTEM, GRANT_FLAG_WRITABLE, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS,
-    HYPERCALL_UNSUPPORTED, HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
+    DOMAIN_ROLE_SYSTEM, EVENT_CHANNEL_VECTOR, GRANT_FLAG_WRITABLE, HYPERCALL_INVALID_ARGUMENT,
+    HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED, HYPERVISOR_BACKEND_AMD_SVM,
+    HYPERVISOR_BACKEND_INTEL_VMX,
 };
 use uefi::fs::Error as FsError;
 use uefi::prelude::*;
@@ -82,8 +83,12 @@ struct RuntimeDomain {
     started: bool,
     pending_result: u64,
     yield_count: u64,
+    preemption_count: u64,
     ready: bool,
     waiting: bool,
+    resume_preempted: bool,
+    event_irq_enabled: bool,
+    event_irq_pending: bool,
     _image: Vec<u8>,
 }
 
@@ -283,6 +288,15 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         asm!("cli", options(nomem, nostack));
         descriptor::install();
     }
+    let preemption_timer = unsafe { timer::initialize() };
+    log!(
+        "vCPU preemption timer {}",
+        if preemption_timer {
+            "enabled"
+        } else {
+            "unavailable"
+        }
+    );
     log!(
         "owned memory map: regions={} usable={} MiB lowest={:#x}",
         memory_map.len,
@@ -395,8 +409,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             started: false,
             pending_result: HYPERCALL_SUCCESS,
             yield_count: 0,
+            preemption_count: 0,
             ready: false,
             waiting: false,
+            resume_preempted: false,
+            event_irq_enabled: false,
+            event_irq_pending: false,
             _image: prepared.image,
         });
     }
@@ -431,8 +449,22 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     let mut scheduler = CooperativeScheduler::new();
     while let Some(index) = scheduler.next(&runnable) {
         let runtime = &mut runtime_domains[index];
+        if runtime.event_irq_pending {
+            if let Err(error) = unsafe {
+                runtime
+                    .virtualization
+                    .inject_interrupt(EVENT_CHANNEL_VECTOR)
+            } {
+                halt_with_error("Event IRQ injection", error)
+            }
+            runtime.event_irq_pending = false;
+        }
         // SAFETY: The selected vCPU is stopped and owns all guest and control state.
-        let vm_exit = if runtime.started {
+        let vm_exit = if runtime.resume_preempted {
+            runtime.resume_preempted = false;
+            // SAFETY: The timer stopped this vCPU without completing a guest instruction.
+            unsafe { runtime.virtualization.resume_preempted() }
+        } else if runtime.started {
             // SAFETY: This vCPU stopped at the previous VM exit and remains selected.
             unsafe { runtime.virtualization.resume(runtime.pending_result) }
         } else {
@@ -447,6 +479,18 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 halt_with_error("vCPU entry", error)
             }
         };
+        if vm_exit.reason == VmExitReason::Preempted {
+            runtime.preemption_count += 1;
+            if runtime.preemption_count <= 3 {
+                log!(
+                    "Domain {} preempted: count={}",
+                    runtime.domain.id().get(),
+                    runtime.preemption_count
+                );
+            }
+            runtime.resume_preempted = true;
+            continue;
+        }
         if vm_exit.reason != VmExitReason::Hypercall {
             let _ = runtime.domain.mark_crashed();
             halt_with_error(
@@ -488,10 +532,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             }
             runnable[index] = false;
             log!(
-                "Domain {} stopped: reason={} yields={} raw={:#x}",
+                "Domain {} stopped: reason={} yields={} preemptions={} raw={:#x}",
                 runtime.domain.id().get(),
                 vm_exit.arg0,
                 runtime.yield_count,
+                runtime.preemption_count,
                 vm_exit.raw_reason
             );
             continue;
@@ -668,8 +713,30 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                         runtime_domains[target_index].pending_result = u64::from(port);
                         runtime_domains[target_index].waiting = false;
                         runnable[target_index] = true;
+                    } else if runtime_domains[target_index].event_irq_enabled {
+                        runtime_domains[target_index].event_irq_pending = true;
                     }
                 }
+            }
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::EventIrqEnable as u64 {
+            let receiver = runtime_domains[index].domain.id();
+            if vm_exit.arg0 != 0
+                || vm_exit.arg1 != 0
+                || vm_exit.arg2 != 0
+                || runtime_domains[index].event_irq_enabled
+            {
+                runtime_domains[index].pending_result = HYPERCALL_INVALID_ARGUMENT;
+            } else {
+                runtime_domains[index].event_irq_enabled = true;
+                runtime_domains[index].event_irq_pending = event_channels.has_pending(receiver);
+                runtime_domains[index].pending_result = HYPERCALL_SUCCESS;
+                log!(
+                    "Domain {} enabled Event Channel IRQ vector {:#x}",
+                    receiver.get(),
+                    EVENT_CHANNEL_VECTOR
+                );
             }
             continue;
         }

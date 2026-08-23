@@ -30,6 +30,7 @@ pub enum Error {
     ImageDigestMismatch,
     UnsupportedDomainConfig,
     AddressSpaceIdUnavailable,
+    InterruptVirtualizationUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +54,7 @@ pub enum Virtualization {
 pub enum VmExitReason {
     Halt,
     Hypercall,
+    Preempted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,6 +160,31 @@ impl Virtualization {
             Self::Intel(vmx) => unsafe { vmx.resume(result) },
             // SAFETY: The public function contract is forwarded unchanged.
             Self::Amd(svm) => unsafe { svm.resume(result) },
+        }
+    }
+
+    /// Resumes a vCPU after a host timer preempted it.
+    ///
+    /// Unlike [`Self::resume`], this does not advance the guest instruction
+    /// pointer or replace RAX because no guest instruction caused the exit.
+    ///
+    /// # Safety
+    /// The previous exit must have been `VmExitReason::Preempted` from this vCPU.
+    pub unsafe fn resume_preempted(&mut self) -> Result<VmExit, Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.resume_preempted() },
+            Virtualization::Amd(svm) => unsafe { svm.resume_preempted() },
+        }
+    }
+
+    /// Queues an external interrupt for delivery on the next vCPU entry.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped and its guest IDT must accept `vector`.
+    pub unsafe fn inject_interrupt(&mut self, vector: u8) -> Result<(), Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.inject_interrupt(vector) },
+            Virtualization::Amd(svm) => unsafe { svm.inject_interrupt(vector) },
         }
     }
 
