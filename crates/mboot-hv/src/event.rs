@@ -137,6 +137,14 @@ mod tests {
         assert_eq!(table.receive(DomainId::new(1)), None);
         assert_eq!(table.receive(DomainId::new(2)), Some(11));
         assert_eq!(
+            table.send(DomainId::new(2), 11),
+            Ok(EventDelivery {
+                domain: DomainId::new(1),
+                port: 7,
+            })
+        );
+        assert_eq!(table.receive(DomainId::new(1)), Some(7));
+        assert_eq!(
             table.send(DomainId::new(3), 7),
             Err(EventError::UnboundPort)
         );
