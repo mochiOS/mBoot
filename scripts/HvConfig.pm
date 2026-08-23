@@ -1,0 +1,94 @@
+package HvConfig;
+
+use strict;
+use warnings;
+use Exporter 'import';
+
+our @EXPORT_OK = qw(read_hv_config role_id);
+
+sub read_hv_config {
+    my ($path) = @_;
+    open my $fh, '<', $path or die "cannot read $path: $!\n";
+
+    my %root;
+    my @domains;
+    my $current = \%root;
+    my $line_number = 0;
+    while (my $line = <$fh>) {
+        ++$line_number;
+        chomp $line;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '' || $line =~ /^#/;
+        if ($line eq '[[domains]]') {
+            push @domains, {};
+            $current = $domains[-1];
+            next;
+        }
+        $line =~ /^([a-z][a-z0-9_]*)\s*=\s*(.+)$/
+            or die "$path:$line_number: invalid config line\n";
+        my ($key, $raw) = ($1, $2);
+        exists $current->{$key}
+            and die "$path:$line_number: duplicate key $key\n";
+        $current->{$key} = parse_value($raw, $path, $line_number);
+    }
+    close $fh or die "cannot close $path: $!\n";
+
+    for my $key (qw(version toolchain disk_size_mib esp_size_mib disk_guid esp_guid)) {
+        exists $root{$key} or die "$path: missing $key\n";
+    }
+    $root{version} == 1 or die "$path: unsupported version $root{version}\n";
+    $root{disk_size_mib} > $root{esp_size_mib} + 2
+        or die "$path: disk_size_mib must exceed esp_size_mib by at least 2 MiB\n";
+    @domains && @domains <= 8 or die "$path: domains must contain 1 to 8 entries\n";
+
+    my %ids;
+    my $system_domains = 0;
+    for my $domain (@domains) {
+        for my $key (qw(id role memory_mib vcpus capabilities image path autostart required)) {
+            exists $domain->{$key} or die "$path: Domain is missing $key\n";
+        }
+        $domain->{id} > 0 && !$ids{$domain->{id}}++
+            or die "$path: Domain IDs must be nonzero and unique\n";
+        role_id($domain->{role});
+        ++$system_domains if $domain->{role} eq 'system';
+        $domain->{memory_mib} > 0 && $domain->{memory_mib} <= 2
+            or die "$path: current Domain memory_mib range is 1 to 2\n";
+        $domain->{vcpus} == 1
+            or die "$path: current hypervisor supports one vCPU per Domain\n";
+        $domain->{path} =~ m{^\\EFI\\MBOOT\\[A-Za-z0-9._-]+$}
+            or die "$path: Domain path must stay below \\EFI\\MBOOT\n";
+        $domain->{autostart} && $domain->{required}
+            or die "$path: current bootstrap requires autostart and required Domains\n";
+    }
+    $system_domains == 1 or die "$path: exactly one System Domain is required\n";
+
+    $root{domains} = \@domains;
+    return \%root;
+}
+
+sub role_id {
+    my ($role) = @_;
+    return 1 if $role eq 'system';
+    return 2 if $role eq 'hardware';
+    return 3 if $role eq 'application';
+    die "unknown Domain role: $role\n";
+}
+
+sub parse_value {
+    my ($raw, $path, $line_number) = @_;
+    if ($raw =~ /^'(.*)'$/) {
+        return $1;
+    }
+    if ($raw =~ /^"((?:[^"\\]|\\.)*)"$/) {
+        my $value = $1;
+        $value =~ s/\\([\\"nrt])/$1 eq 'n' ? "\n" : $1 eq 'r' ? "\r" : $1 eq 't' ? "\t" : $1/ge;
+        return $value;
+    }
+    return 1 if $raw eq 'true';
+    return 0 if $raw eq 'false';
+    return hex($raw) if $raw =~ /^0x[0-9a-fA-F]+$/;
+    return 0 + $raw if $raw =~ /^\d+$/;
+    die "$path:$line_number: unsupported value\n";
+}
+
+1;

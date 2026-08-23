@@ -1,5 +1,9 @@
 # mBoot
 
+> **注意:** このリポジトリには、現在使っているLinuxベースのmBootと、次の構成に
+> 向けて開発中のType-1ハイパーバイザーが同居しています。以下の「ハイパーバイザー
+> イメージ」は後者について説明しています。
+
 mBoot は、物理 x86_64 PC 上で mochiOS を全画面 QEMU 仮想マシンとして
 起動する Buildroot ベースの専用 Linux アプライアンスです。mBoot 自体は
 BIOS/UEFI の両方から起動でき、物理 GPU、入力、ストレージ、音声、
@@ -83,6 +87,39 @@ make run QEMU_DISPLAY=none
 `make run` は完成した1台のmBootディスクだけを外側のQEMUへ接続します。内側の
 mochiOSが自動起動するため、単一ディスク構成をそのまま仮想環境で確認できます。
 利用可能ならKVM、利用できなければTCGを選択します。
+
+## ハイパーバイザーイメージ
+
+ワークスペースのルートで次を実行すると、Intel実機向けの
+`out/mochiOS.iso`を生成します。
+
+```sh
+make hv-image
+```
+
+このファイルはISO9660ではなく、USBメモリへそのまま書き込めるraw GPT
+ディスクイメージです。EFI System PartitionにはmBootのUEFIアプリ、Launch
+Manifest、mnu Domainイメージが入ります。既定のIntel実機向け設定は
+`config/hypervisor/intel-hardware.toml`です。QEMUで複数Domainを確かめる場合は
+`config/hypervisor/qemu.toml`を使います。
+
+```sh
+make hv-image \
+  HV_CONFIG=mboot/config/hypervisor/qemu.toml \
+  HV_OUTPUT_IMAGE=out/mochiOS-qemu.iso
+```
+
+設定ファイルではRust toolchain、ディスクとESPの容量、GPT GUID、起動するDomainを
+まとめて指定します。各DomainにはID、役割、メモリ、vCPU数、Capability、イメージ、
+EFI上の配置先を指定します。現在は1 Domainあたり1 vCPU、最大2 MiBのRAM、最大8
+Domainに対応しています。System Domainは必ず1つだけ必要です。
+
+生成したイメージは次のコマンドでUEFI起動まで確認できます。この試験にはKVMと、
+CPU側のIntel VMXまたはAMD SVMが必要です。
+
+```sh
+make hv-image-test
+```
 
 ## USBまたはSSDから実機起動
 

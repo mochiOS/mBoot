@@ -389,14 +389,16 @@ help:
 	@echo "  make clean             Clean Buildroot outputs"
 	@echo "  make distclean         Remove the entire output directory"
 	@echo "  make rebuild           Clean and rebuild"
-HV_TOOLCHAIN ?= nightly-2026-05-14
+HV_CONFIG ?= $(CURDIR)/config/hypervisor/qemu.toml
+HV_TOOLCHAIN ?= $(shell scripts/hv-config-value.pl "$(HV_CONFIG)" toolchain)
 HV_TARGET_DIR ?= $(CURDIR)/output/hv-target
 MNU_DIR ?= $(abspath $(CURDIR)/../core)
 MNU_DOMAIN_ELF ?= $(MNU_DIR)/target/x86_64-unknown-none/release/domain-bootstrap
 HV_LAUNCH_MANIFEST ?= $(CURDIR)/output/hv/launch.manifest
+HV_OUTPUT_IMAGE ?= $(CURDIR)/output/mochiOS.iso
 MNU_ABI_PATCH := --config 'patch."https://github.com/mochiOS/mnu".mnu-abi.path="$(MNU_DIR)/crates/abi"'
 
-.PHONY: hv-build hv-domain-build hv-manifest hv-test hv-qemu-test
+.PHONY: hv-build hv-domain-build hv-image hv-image-test hv-manifest hv-test hv-qemu-test
 
 hv-domain-build:
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
@@ -412,7 +414,10 @@ hv-domain-build:
 
 hv-manifest: hv-domain-build
 	@mkdir -p "$(dir $(HV_LAUNCH_MANIFEST))"
-	scripts/create-hv-launch-manifest.pl "$(MNU_DOMAIN_ELF)" "$(HV_LAUNCH_MANIFEST)"
+	scripts/create-hv-launch-manifest.pl \
+		--config "$(HV_CONFIG)" \
+		--image "mnu=$(MNU_DOMAIN_ELF)" \
+		--output "$(HV_LAUNCH_MANIFEST)"
 
 hv-build: hv-manifest
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
@@ -429,6 +434,17 @@ hv-build: hv-manifest
 hv-test:
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
 	$(HOST_CARGO) test --package mboot-hv --lib $(MNU_ABI_PATCH)
+
+hv-image:
+	MBOOT_HOST_CARGO="$(HOST_CARGO)" scripts/build-hv-image.pl \
+		--config "$(HV_CONFIG)" \
+		--mnu-dir "$(MNU_DIR)" \
+		--output "$(HV_OUTPUT_IMAGE)"
+
+hv-image-test: hv-image
+	HV_CONFIG="$(HV_CONFIG)" \
+	HV_DISK_IMAGE="$(HV_OUTPUT_IMAGE)" \
+		scripts/test-hv-disk-image.sh
 
 hv-qemu-test: hv-domain-build hv-build
 	MNU_DOMAIN_ELF="$(MNU_DOMAIN_ELF)" \

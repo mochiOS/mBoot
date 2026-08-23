@@ -1,0 +1,17 @@
+version = 1
+toolchain = "nightly-2026-05-14"
+disk_size_mib = 96
+esp_size_mib = 64
+disk_guid = "6d426f6f-7400-4b00-8a00-000000000200"
+esp_guid = "6d426f6f-7400-4b00-8a00-000000000201"
+
+[[domains]]
+id = 1
+role = "system"
+memory_mib = 2
+vcpus = 1
+capabilities = 0
+image = "mnu"
+path = '\EFI\MBOOT\MNU.ELF'
+autostart = true
+required = true
