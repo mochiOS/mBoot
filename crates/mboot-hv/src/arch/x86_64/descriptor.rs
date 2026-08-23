@@ -4,10 +4,12 @@ use core::ptr::{addr_of, addr_of_mut};
 
 const KERNEL_CODE_SELECTOR: u16 = 0x08;
 const KERNEL_DATA_SELECTOR: u16 = 0x10;
+const TSS_SELECTOR: u16 = 0x18;
 const INTERRUPT_GATE: u8 = 0x8e;
 
-static mut GDT: [u64; 3] = [0, 0x00af_9a00_0000_ffff, 0x00af_9200_0000_ffff];
+static mut GDT: [u64; 5] = [0, 0x00af_9a00_0000_ffff, 0x00af_9200_0000_ffff, 0, 0];
 static mut IDT: [IdtEntry; 256] = [IdtEntry::missing(); 256];
+static mut TSS: [u8; 104] = [0; 104];
 
 global_asm!(
     ".global mboot_hv_exception_stub",
@@ -79,8 +81,27 @@ pub unsafe fn install() {
         unsafe { idt_ptr.add(index).write(IdtEntry::interrupt(handler)) };
     }
 
+    let tss_base = addr_of!(TSS) as u64;
+    let tss_limit = (size_of::<[u8; 104]>() - 1) as u64;
+    let tss_low = (tss_limit & 0xffff)
+        | ((tss_base & 0x00ff_ffff) << 16)
+        | (0x89 << 40)
+        | (((tss_limit >> 16) & 0xf) << 48)
+        | (((tss_base >> 24) & 0xff) << 56);
+    let gdt_ptr = addr_of_mut!(GDT).cast::<u64>();
+    let tss_ptr = addr_of_mut!(TSS).cast::<u8>();
+    // SAFETY: The GDT and TSS are exclusively initialized before LGDT/LTR.
+    unsafe {
+        gdt_ptr.add(3).write(tss_low);
+        gdt_ptr.add(4).write(tss_base >> 32);
+        tss_ptr
+            .add(102)
+            .cast::<u16>()
+            .write((size_of::<[u8; 104]>()) as u16);
+    }
+
     let gdt_pointer = DescriptorTablePointer {
-        limit: (size_of::<[u64; 3]>() - 1) as u16,
+        limit: (size_of::<[u64; 5]>() - 1) as u16,
         base: addr_of!(GDT) as u64,
     };
     let idt_pointer = DescriptorTablePointer {
@@ -106,5 +127,10 @@ pub unsafe fn install() {
             out("rax") _,
         );
         asm!("lidt [{}]", in(reg) &idt_pointer, options(readonly, nostack, preserves_flags));
+        asm!("ltr {selector:x}", selector = in(reg) TSS_SELECTOR, options(nostack, preserves_flags));
     }
+}
+
+pub(crate) fn tss_base() -> u64 {
+    addr_of!(TSS) as u64
 }

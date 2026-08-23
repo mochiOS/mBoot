@@ -4,6 +4,8 @@
 
 UEFIから起動し、ファームウェアのメモリマップを引き継いだあと、mBoot専用のGDTとIDTへ切り替えます。Intel CPUではVMX、AMD CPUではSVMを有効にします。ゲストの物理アドレス0にはmBootが所有する1ページだけを割り当て、IntelではEPT、AMDではNPTを使ってほかの物理メモリから隔離します。
 
-現在は仮想化機能を有効にしてDomainを実行直前の状態にするところまでです。VMCSとVMCBへゲストCPU状態を書き込み、実際にDomainへ入る処理は次の段階で追加します。既存のmBootイメージはまだこのバイナリへ切り替えません。
+最小ゲストを起動し、先頭の`HLT`をVM Exitとして受け取るところまで確認できます。これはCPU仮想化とメモリ隔離を結ぶ最初の動作確認であり、まだmochiOSやDriver Linuxを起動するものではありません。
+
+現在の`crates/mboot-hv`は、LinuxベースのmBootと並行して開発するための一時的な置き場所です。移行時にはLinuxベースの構成を取り除き、mnuと同じように、リポジトリ直下の`mboot`をハイパーバイザー本体にします。既存のmBootイメージはまだこのバイナリへ切り替えません。
 
 ホスト上の単体テストは`make hv-test`、UEFIバイナリは`make hv-build`で生成します。KVMで仮想化機能を実際に有効化する試験は`make hv-qemu-test`で実行します。IntelホストではVMX、AMDホストではSVMが選ばれます。

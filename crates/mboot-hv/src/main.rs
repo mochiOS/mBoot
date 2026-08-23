@@ -143,7 +143,7 @@ unsafe fn main(_image: Handle, system_table: SystemTable<Boot>) -> Status {
 
     // SAFETY: The control pages are exclusively owned, execution is pinned to
     // the BSP, interrupts are disabled, and the code is running at CPL0.
-    let virtualization = match unsafe {
+    let mut virtualization = match unsafe {
         Virtualization::enable(VirtualizationResources {
             host_control_page,
             vcpu_control_page,
@@ -164,7 +164,28 @@ unsafe fn main(_image: Handle, system_table: SystemTable<Boot>) -> Status {
         domain.nested_pages().hardware_root(),
         domain.nested_pages().guest_page()
     );
-    log!("bootstrap complete; guest entry is the next milestone");
+    if let Err(error) = domain.start() {
+        halt_with_error("domain start", error);
+    }
+    // SAFETY: The guest page contains HLT, the nested tables are live, and this
+    // is still the pinned BSP with interrupts disabled.
+    let vm_exit = match unsafe { virtualization.run(domain.nested_pages().hardware_root()) } {
+        Ok(vm_exit) => vm_exit,
+        Err(error) => {
+            let _ = domain.mark_crashed();
+            halt_with_error("guest entry", error)
+        }
+    };
+    if let Err(error) = domain.stop() {
+        halt_with_error("domain stop", error);
+    }
+    log!(
+        "Domain {} exited: reason={:?} raw={:#x}",
+        domain.id().get(),
+        vm_exit.reason,
+        vm_exit.raw_reason
+    );
+    log!("bootstrap complete; guest entry and VM exit verified");
 
     let _keep_virtualization_active = virtualization;
     halt()

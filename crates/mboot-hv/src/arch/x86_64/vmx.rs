@@ -1,22 +1,154 @@
-use core::arch::asm;
+use core::arch::{asm, global_asm};
 use core::ptr::write_bytes;
 
-use crate::arch::x86_64::{read_cr0, read_cr4, read_msr, write_cr0, write_cr4, write_msr};
-use crate::{arch::x86_64::cpu, BackendKind, Error};
+use crate::arch::x86_64::{
+    descriptor, read_cr0, read_cr3, read_cr4, read_msr, write_cr0, write_cr4, write_msr,
+};
+use crate::{arch::x86_64::cpu, BackendKind, Error, VmExit, VmExitReason};
 
 const IA32_FEATURE_CONTROL: u32 = 0x3a;
 const IA32_VMX_BASIC: u32 = 0x480;
 const IA32_VMX_PROCBASED_CTLS: u32 = 0x482;
+const IA32_VMX_EXIT_CTLS: u32 = 0x483;
+const IA32_VMX_ENTRY_CTLS: u32 = 0x484;
 const IA32_VMX_CR0_FIXED0: u32 = 0x486;
 const IA32_VMX_CR0_FIXED1: u32 = 0x487;
 const IA32_VMX_CR4_FIXED0: u32 = 0x488;
 const IA32_VMX_CR4_FIXED1: u32 = 0x489;
 const IA32_VMX_PROCBASED_CTLS2: u32 = 0x48b;
 const IA32_VMX_EPT_VPID_CAP: u32 = 0x48c;
+const IA32_VMX_TRUE_PINBASED_CTLS: u32 = 0x48d;
+const IA32_VMX_TRUE_PROCBASED_CTLS: u32 = 0x48e;
+const IA32_VMX_TRUE_EXIT_CTLS: u32 = 0x48f;
+const IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x490;
+const IA32_FS_BASE: u32 = 0xc000_0100;
+const IA32_GS_BASE: u32 = 0xc000_0101;
+const IA32_SYSENTER_CS: u32 = 0x174;
+const IA32_SYSENTER_ESP: u32 = 0x175;
+const IA32_SYSENTER_EIP: u32 = 0x176;
 
 const FEATURE_CONTROL_LOCK: u64 = 1 << 0;
 const FEATURE_CONTROL_VMX_OUTSIDE_SMX: u64 = 1 << 2;
 const CR4_VMXE: u64 = 1 << 13;
+
+const PIN_BASED_CONTROLS: u64 = 0x4000;
+const PRIMARY_CONTROLS: u64 = 0x4002;
+const EXCEPTION_BITMAP: u64 = 0x4004;
+const PAGE_FAULT_ERROR_MASK: u64 = 0x4006;
+const PAGE_FAULT_ERROR_MATCH: u64 = 0x4008;
+const CR3_TARGET_COUNT: u64 = 0x400a;
+const EXIT_CONTROLS: u64 = 0x400c;
+const EXIT_MSR_STORE_COUNT: u64 = 0x400e;
+const EXIT_MSR_LOAD_COUNT: u64 = 0x4010;
+const ENTRY_CONTROLS: u64 = 0x4012;
+const ENTRY_MSR_LOAD_COUNT: u64 = 0x4014;
+const ENTRY_INTERRUPTION_INFO: u64 = 0x4016;
+const SECONDARY_CONTROLS: u64 = 0x401e;
+const EPT_POINTER: u64 = 0x201a;
+const VMCS_LINK_POINTER: u64 = 0x2800;
+const GUEST_DEBUGCTL: u64 = 0x2802;
+const GUEST_ES_SELECTOR: u64 = 0x0800;
+const GUEST_CS_SELECTOR: u64 = 0x0802;
+const GUEST_SS_SELECTOR: u64 = 0x0804;
+const GUEST_DS_SELECTOR: u64 = 0x0806;
+const GUEST_FS_SELECTOR: u64 = 0x0808;
+const GUEST_GS_SELECTOR: u64 = 0x080a;
+const GUEST_LDTR_SELECTOR: u64 = 0x080c;
+const GUEST_TR_SELECTOR: u64 = 0x080e;
+const HOST_ES_SELECTOR: u64 = 0x0c00;
+const HOST_CS_SELECTOR: u64 = 0x0c02;
+const HOST_SS_SELECTOR: u64 = 0x0c04;
+const HOST_DS_SELECTOR: u64 = 0x0c06;
+const HOST_FS_SELECTOR: u64 = 0x0c08;
+const HOST_GS_SELECTOR: u64 = 0x0c0a;
+const HOST_TR_SELECTOR: u64 = 0x0c0c;
+const GUEST_ES_LIMIT: u64 = 0x4800;
+const GUEST_CS_LIMIT: u64 = 0x4802;
+const GUEST_SS_LIMIT: u64 = 0x4804;
+const GUEST_DS_LIMIT: u64 = 0x4806;
+const GUEST_FS_LIMIT: u64 = 0x4808;
+const GUEST_GS_LIMIT: u64 = 0x480a;
+const GUEST_LDTR_LIMIT: u64 = 0x480c;
+const GUEST_TR_LIMIT: u64 = 0x480e;
+const GUEST_GDTR_LIMIT: u64 = 0x4810;
+const GUEST_IDTR_LIMIT: u64 = 0x4812;
+const GUEST_ES_AR: u64 = 0x4814;
+const GUEST_CS_AR: u64 = 0x4816;
+const GUEST_SS_AR: u64 = 0x4818;
+const GUEST_DS_AR: u64 = 0x481a;
+const GUEST_FS_AR: u64 = 0x481c;
+const GUEST_GS_AR: u64 = 0x481e;
+const GUEST_LDTR_AR: u64 = 0x4820;
+const GUEST_TR_AR: u64 = 0x4822;
+const GUEST_INTERRUPTIBILITY: u64 = 0x4824;
+const GUEST_ACTIVITY_STATE: u64 = 0x4826;
+const GUEST_SYSENTER_CS: u64 = 0x482a;
+const HOST_SYSENTER_CS: u64 = 0x4c00;
+const GUEST_CR0: u64 = 0x6800;
+const GUEST_CR3: u64 = 0x6802;
+const GUEST_CR4: u64 = 0x6804;
+const GUEST_ES_BASE: u64 = 0x6806;
+const GUEST_CS_BASE: u64 = 0x6808;
+const GUEST_SS_BASE: u64 = 0x680a;
+const GUEST_DS_BASE: u64 = 0x680c;
+const GUEST_FS_BASE: u64 = 0x680e;
+const GUEST_GS_BASE: u64 = 0x6810;
+const GUEST_LDTR_BASE: u64 = 0x6812;
+const GUEST_TR_BASE: u64 = 0x6814;
+const GUEST_GDTR_BASE: u64 = 0x6816;
+const GUEST_IDTR_BASE: u64 = 0x6818;
+const GUEST_DR7: u64 = 0x681a;
+const GUEST_RSP: u64 = 0x681c;
+const GUEST_RIP: u64 = 0x681e;
+const GUEST_RFLAGS: u64 = 0x6820;
+const GUEST_SYSENTER_ESP: u64 = 0x6824;
+const GUEST_SYSENTER_EIP: u64 = 0x6826;
+const HOST_CR0: u64 = 0x6c00;
+const HOST_CR3: u64 = 0x6c02;
+const HOST_CR4: u64 = 0x6c04;
+const HOST_FS_BASE: u64 = 0x6c06;
+const HOST_GS_BASE: u64 = 0x6c08;
+const HOST_TR_BASE: u64 = 0x6c0a;
+const HOST_GDTR_BASE: u64 = 0x6c0c;
+const HOST_IDTR_BASE: u64 = 0x6c0e;
+const HOST_SYSENTER_ESP: u64 = 0x6c10;
+const HOST_SYSENTER_EIP: u64 = 0x6c12;
+const EXIT_REASON: u64 = 0x4402;
+const HLT_EXIT_REASON: u64 = 12;
+
+global_asm!(
+    ".global mboot_vmx_launch",
+    "mboot_vmx_launch:",
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov rax, rsp",
+    "mov rcx, 0x6c14",
+    "vmwrite rax, rcx",
+    "lea rax, [rip + mboot_vmx_exit]",
+    "mov rcx, 0x6c16",
+    "vmwrite rax, rcx",
+    "vmlaunch",
+    "mov eax, 1",
+    "jmp mboot_vmx_return",
+    "mboot_vmx_exit:",
+    "xor eax, eax",
+    "mboot_vmx_return:",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rbp",
+    "pop rbx",
+    "ret",
+);
+
+unsafe extern "C" {
+    fn mboot_vmx_launch() -> u32;
+}
 
 pub struct Vmx {
     revision_id: u32,
@@ -121,6 +253,32 @@ impl Vmx {
         self.vmcs_phys
     }
 
+    /// Runs a real-mode unrestricted guest whose first byte is `HLT`.
+    ///
+    /// # Safety
+    /// `ept_pointer` must name a live EPT owned by mBoot. The current VMCS and
+    /// descriptor tables must remain installed on the CPU that called `enable`.
+    pub unsafe fn run(&mut self, ept_pointer: u64) -> Result<VmExit, Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        // SAFETY: VMX is active and all VMCS host/guest values are supplied here.
+        unsafe { initialize_vmcs(ept_pointer)? };
+        // SAFETY: The VMCS host RIP/RSP target the assembly return trampoline.
+        if unsafe { mboot_vmx_launch() } != 0 {
+            return Err(Error::GuestEntryFailed);
+        }
+        // SAFETY: A VM exit returned through the configured host trampoline.
+        let reason = unsafe { vmread(EXIT_REASON) } & 0xffff;
+        if reason != HLT_EXIT_REASON {
+            return Err(Error::UnexpectedVmExit(reason));
+        }
+        Ok(VmExit {
+            reason: VmExitReason::Halt,
+            raw_reason: reason,
+        })
+    }
+
     /// Leaves VMX operation on the current logical CPU.
     ///
     /// # Safety
@@ -163,9 +321,271 @@ unsafe fn ept_available() -> bool {
 fn supports_ept(primary: u64, secondary: u64, ept: u64) -> bool {
     let secondary_controls = primary >> 32 & (1 << 31) != 0;
     let ept_control = secondary >> 32 & (1 << 1) != 0;
+    let unrestricted_guest = secondary >> 32 & (1 << 7) != 0;
     let four_level_walk = ept & (1 << 6) != 0;
     let write_back = ept & (1 << 14) != 0;
-    secondary_controls && ept_control && four_level_walk && write_back
+    secondary_controls && ept_control && unrestricted_guest && four_level_walk && write_back
+}
+
+unsafe fn initialize_vmcs(ept_pointer: u64) -> Result<(), Error> {
+    // SAFETY: All MSRs are architectural VMX capability and host-state MSRs.
+    let basic = unsafe { read_msr(IA32_VMX_BASIC) };
+    let true_controls = basic & (1 << 55) != 0;
+    let pin_msr = if true_controls {
+        IA32_VMX_TRUE_PINBASED_CTLS
+    } else {
+        0x481
+    };
+    let primary_msr = if true_controls {
+        IA32_VMX_TRUE_PROCBASED_CTLS
+    } else {
+        IA32_VMX_PROCBASED_CTLS
+    };
+    let exit_msr = if true_controls {
+        IA32_VMX_TRUE_EXIT_CTLS
+    } else {
+        IA32_VMX_EXIT_CTLS
+    };
+    let entry_msr = if true_controls {
+        IA32_VMX_TRUE_ENTRY_CTLS
+    } else {
+        IA32_VMX_ENTRY_CTLS
+    };
+    // SAFETY: Capability MSRs are available after VMX CPUID detection.
+    let (pin, primary, secondary, exit, entry) = unsafe {
+        (
+            adjusted_vm_control(0, read_msr(pin_msr)),
+            adjusted_vm_control((1 << 7) | (1 << 31), read_msr(primary_msr)),
+            adjusted_vm_control((1 << 1) | (1 << 7), read_msr(IA32_VMX_PROCBASED_CTLS2)),
+            adjusted_vm_control(1 << 9, read_msr(exit_msr)),
+            adjusted_vm_control(0, read_msr(entry_msr)),
+        )
+    };
+    if secondary & ((1 << 1) | (1 << 7)) != ((1 << 1) | (1 << 7)) {
+        return Err(Error::UnrestrictedGuestUnavailable);
+    }
+
+    for (field, value) in [
+        (PIN_BASED_CONTROLS, pin),
+        (PRIMARY_CONTROLS, primary),
+        (SECONDARY_CONTROLS, secondary),
+        (EXIT_CONTROLS, exit),
+        (ENTRY_CONTROLS, entry),
+        (EXCEPTION_BITMAP, 0),
+        (PAGE_FAULT_ERROR_MASK, 0),
+        (PAGE_FAULT_ERROR_MATCH, 0),
+        (CR3_TARGET_COUNT, 0),
+        (EXIT_MSR_STORE_COUNT, 0),
+        (EXIT_MSR_LOAD_COUNT, 0),
+        (ENTRY_MSR_LOAD_COUNT, 0),
+        (ENTRY_INTERRUPTION_INFO, 0),
+    ] {
+        // SAFETY: Each field is a writable control field of the current VMCS.
+        unsafe { vmwrite(field, value)? };
+    }
+    // SAFETY: `ept_pointer` was constructed from validated EPT capabilities.
+    unsafe {
+        vmwrite(EPT_POINTER, ept_pointer)?;
+        initialize_guest_state()?;
+        initialize_host_state()?;
+    }
+    Ok(())
+}
+
+unsafe fn initialize_guest_state() -> Result<(), Error> {
+    for field in [
+        GUEST_ES_SELECTOR,
+        GUEST_CS_SELECTOR,
+        GUEST_SS_SELECTOR,
+        GUEST_DS_SELECTOR,
+        GUEST_FS_SELECTOR,
+        GUEST_GS_SELECTOR,
+        GUEST_LDTR_SELECTOR,
+        GUEST_TR_SELECTOR,
+    ] {
+        // SAFETY: The current VMCS accepts its 16-bit guest selector fields.
+        unsafe { vmwrite(field, 0)? };
+    }
+    for field in [
+        GUEST_ES_LIMIT,
+        GUEST_CS_LIMIT,
+        GUEST_SS_LIMIT,
+        GUEST_DS_LIMIT,
+        GUEST_FS_LIMIT,
+        GUEST_GS_LIMIT,
+        GUEST_LDTR_LIMIT,
+        GUEST_TR_LIMIT,
+        GUEST_GDTR_LIMIT,
+        GUEST_IDTR_LIMIT,
+    ] {
+        // SAFETY: Real-mode segments use 64 KiB limits.
+        unsafe { vmwrite(field, 0xffff)? };
+    }
+    for field in [
+        GUEST_ES_AR,
+        GUEST_SS_AR,
+        GUEST_DS_AR,
+        GUEST_FS_AR,
+        GUEST_GS_AR,
+    ] {
+        // SAFETY: 0x93 is a present real-mode writable data segment.
+        unsafe { vmwrite(field, 0x93)? };
+    }
+    // SAFETY: These are architectural unrestricted-guest segment encodings.
+    unsafe {
+        vmwrite(GUEST_CS_AR, 0x9b)?;
+        vmwrite(GUEST_LDTR_AR, 0x1_0000)?;
+        vmwrite(GUEST_TR_AR, 0x8b)?;
+    }
+    for field in [
+        GUEST_ES_BASE,
+        GUEST_CS_BASE,
+        GUEST_SS_BASE,
+        GUEST_DS_BASE,
+        GUEST_FS_BASE,
+        GUEST_GS_BASE,
+        GUEST_LDTR_BASE,
+        GUEST_TR_BASE,
+        GUEST_GDTR_BASE,
+        GUEST_IDTR_BASE,
+        GUEST_CR3,
+        GUEST_CR4,
+        GUEST_RIP,
+        GUEST_SYSENTER_ESP,
+        GUEST_SYSENTER_EIP,
+    ] {
+        // SAFETY: The minimal guest starts with zero bases and at GPA zero.
+        unsafe { vmwrite(field, 0)? };
+    }
+    // SAFETY: All remaining values satisfy unrestricted real-mode VM-entry checks.
+    unsafe {
+        vmwrite(GUEST_CR0, 0x20)?;
+        vmwrite(GUEST_DR7, 0x400)?;
+        vmwrite(GUEST_RSP, 0x800)?;
+        vmwrite(GUEST_RFLAGS, 2)?;
+        vmwrite(GUEST_DEBUGCTL, 0)?;
+        vmwrite(VMCS_LINK_POINTER, u64::MAX)?;
+        vmwrite(GUEST_INTERRUPTIBILITY, 0)?;
+        vmwrite(GUEST_ACTIVITY_STATE, 0)?;
+        vmwrite(GUEST_SYSENTER_CS, 0)?;
+    }
+    Ok(())
+}
+
+unsafe fn initialize_host_state() -> Result<(), Error> {
+    // SAFETY: SGDT/SIDT only read the active descriptor-table registers.
+    let (gdt_base, idt_base) = unsafe { descriptor_bases() };
+    for (field, selector) in [
+        (HOST_ES_SELECTOR, read_selector(SegmentRegister::Es)),
+        (HOST_CS_SELECTOR, read_selector(SegmentRegister::Cs)),
+        (HOST_SS_SELECTOR, read_selector(SegmentRegister::Ss)),
+        (HOST_DS_SELECTOR, read_selector(SegmentRegister::Ds)),
+        (HOST_FS_SELECTOR, read_selector(SegmentRegister::Fs)),
+        (HOST_GS_SELECTOR, read_selector(SegmentRegister::Gs)),
+        (HOST_TR_SELECTOR, read_selector(SegmentRegister::Tr)),
+    ] {
+        // SAFETY: Host selectors are current CPL0 selectors with RPL/TI removed.
+        unsafe { vmwrite(field, u64::from(selector & !7))? };
+    }
+    // SAFETY: These values describe the currently executing 64-bit mBoot host.
+    unsafe {
+        vmwrite(HOST_CR0, read_cr0())?;
+        vmwrite(HOST_CR3, read_cr3())?;
+        vmwrite(HOST_CR4, read_cr4())?;
+        vmwrite(HOST_FS_BASE, read_msr(IA32_FS_BASE))?;
+        vmwrite(HOST_GS_BASE, read_msr(IA32_GS_BASE))?;
+        vmwrite(HOST_TR_BASE, descriptor::tss_base())?;
+        vmwrite(HOST_GDTR_BASE, gdt_base)?;
+        vmwrite(HOST_IDTR_BASE, idt_base)?;
+        vmwrite(HOST_SYSENTER_CS, read_msr(IA32_SYSENTER_CS) & 0xffff)?;
+        vmwrite(HOST_SYSENTER_ESP, read_msr(IA32_SYSENTER_ESP))?;
+        vmwrite(HOST_SYSENTER_EIP, read_msr(IA32_SYSENTER_EIP))?;
+    }
+    Ok(())
+}
+
+fn adjusted_vm_control(desired: u64, capability: u64) -> u64 {
+    (desired | (capability & 0xffff_ffff)) & (capability >> 32)
+}
+
+#[derive(Clone, Copy)]
+enum SegmentRegister {
+    Es,
+    Cs,
+    Ss,
+    Ds,
+    Fs,
+    Gs,
+    Tr,
+}
+
+unsafe fn read_selector(register: SegmentRegister) -> u16 {
+    let value: u16;
+    // SAFETY: Reading segment selectors is valid at CPL0.
+    unsafe {
+        match register {
+            SegmentRegister::Es => {
+                asm!("mov {0:x}, es", out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            SegmentRegister::Cs => {
+                asm!("mov {0:x}, cs", out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            SegmentRegister::Ss => {
+                asm!("mov {0:x}, ss", out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            SegmentRegister::Ds => {
+                asm!("mov {0:x}, ds", out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            SegmentRegister::Fs => {
+                asm!("mov {0:x}, fs", out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            SegmentRegister::Gs => {
+                asm!("mov {0:x}, gs", out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            SegmentRegister::Tr => {
+                asm!("str {0:x}", out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+        }
+    }
+    value
+}
+
+#[repr(C, packed)]
+struct DescriptorTablePointer {
+    limit: u16,
+    base: u64,
+}
+
+unsafe fn descriptor_bases() -> (u64, u64) {
+    let mut gdt = DescriptorTablePointer { limit: 0, base: 0 };
+    let mut idt = DescriptorTablePointer { limit: 0, base: 0 };
+    // SAFETY: SGDT and SIDT store into valid local descriptors.
+    unsafe {
+        asm!("sgdt [{}]", in(reg) &mut gdt, options(nostack, preserves_flags));
+        asm!("sidt [{}]", in(reg) &mut idt, options(nostack, preserves_flags));
+    }
+    (gdt.base, idt.base)
+}
+
+unsafe fn vmwrite(field: u64, value: u64) -> Result<(), Error> {
+    let failed: u8;
+    // SAFETY: VMX is active and a current VMCS was loaded by `enable`.
+    unsafe {
+        asm!("vmwrite {value}, {field}", "setna {failed}", value = in(reg) value,
+            field = in(reg) field, failed = lateout(reg_byte) failed, options(nostack));
+    }
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(Error::ControlInstructionFailed)
+    }
+}
+
+unsafe fn vmread(field: u64) -> u64 {
+    let value: u64;
+    // SAFETY: VMX is active and the field is readable from the current VMCS.
+    unsafe { asm!("vmread rax, rcx", in("rcx") field, lateout("rax") value, options(nostack)) };
+    value
 }
 
 unsafe fn initialize_control_region(phys: u64, revision_id: u32) {
@@ -248,6 +668,12 @@ mod tests {
     }
 
     #[test]
+    fn vm_controls_include_required_bits_and_remove_unsupported_bits() {
+        let capability = 0b0010 | (0b0111u64 << 32);
+        assert_eq!(adjusted_vm_control(0b1101, capability), 0b0111);
+    }
+
+    #[test]
     fn control_pages_must_be_aligned() {
         assert_eq!(validate_page(0), Err(Error::InvalidPage));
         assert_eq!(validate_page(0x1001), Err(Error::InvalidPage));
@@ -257,7 +683,7 @@ mod tests {
     #[test]
     fn ept_requires_secondary_control_four_levels_and_write_back() {
         let primary = (1u64 << 31) << 32;
-        let secondary = (1u64 << 1) << 32;
+        let secondary = ((1u64 << 1) | (1u64 << 7)) << 32;
         let capabilities = (1 << 6) | (1 << 14);
         assert!(supports_ept(primary, secondary, capabilities));
         assert!(!supports_ept(primary, secondary, capabilities & !(1 << 6)));

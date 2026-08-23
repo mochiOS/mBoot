@@ -81,6 +81,11 @@ if [[ -n $EXPECT_BACKEND ]]; then
         exit 1
     }
 fi
+grep -Fq 'guest entry and VM exit verified' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: guest did not exit through HLT interception' >&2
+    exit 1
+}
 
 grep -F '[mBoot-HV]' "$SERIAL"
 echo 'test-hv-qemu: PASS'

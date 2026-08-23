@@ -48,6 +48,14 @@ pub(crate) unsafe fn read_cr4() -> u64 {
 }
 
 #[inline]
+pub(crate) unsafe fn read_cr3() -> u64 {
+    let value: u64;
+    // SAFETY: The caller guarantees CPL0.
+    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+#[inline]
 pub(crate) unsafe fn write_cr4(value: u64) {
     // SAFETY: The caller guarantees CPL0 and a valid CR4 value.
     unsafe { asm!("mov cr4, {}", in(reg) value, options(nostack, preserves_flags)) };
