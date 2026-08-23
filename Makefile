@@ -393,9 +393,10 @@ HV_TOOLCHAIN ?= nightly-2026-05-14
 HV_TARGET_DIR ?= $(CURDIR)/output/hv-target
 MNU_DIR ?= $(abspath $(CURDIR)/../core)
 MNU_DOMAIN_ELF ?= $(MNU_DIR)/target/x86_64-unknown-none/release/domain-bootstrap
+HV_LAUNCH_MANIFEST ?= $(CURDIR)/output/hv/launch.manifest
 MNU_ABI_PATCH := --config 'patch."https://github.com/mochiOS/mnu".mnu-abi.path="$(MNU_DIR)/crates/abi"'
 
-.PHONY: hv-build hv-domain-build hv-test hv-qemu-test
+.PHONY: hv-build hv-domain-build hv-manifest hv-test hv-qemu-test
 
 hv-domain-build:
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
@@ -409,8 +410,13 @@ hv-domain-build:
 		--features domain-guest \
 		--bin domain-bootstrap
 
-hv-build:
+hv-manifest: hv-domain-build
+	@mkdir -p "$(dir $(HV_LAUNCH_MANIFEST))"
+	scripts/create-hv-launch-manifest.pl "$(MNU_DOMAIN_ELF)" "$(HV_LAUNCH_MANIFEST)"
+
+hv-build: hv-manifest
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
+	MBOOT_LAUNCH_MANIFEST="$(HV_LAUNCH_MANIFEST)" \
 	RUSTFLAGS='-C panic=abort' $(HOST_CARGO) +$(HV_TOOLCHAIN) build \
 		-Z build-std=core,alloc,compiler_builtins \
 		--release \
@@ -425,4 +431,6 @@ hv-test:
 	$(HOST_CARGO) test --package mboot-hv --lib $(MNU_ABI_PATCH)
 
 hv-qemu-test: hv-domain-build hv-build
-	MNU_DOMAIN_ELF="$(MNU_DOMAIN_ELF)" scripts/test-hv-qemu.sh
+	MNU_DOMAIN_ELF="$(MNU_DOMAIN_ELF)" \
+	HV_LAUNCH_MANIFEST="$(HV_LAUNCH_MANIFEST)" \
+		scripts/test-hv-qemu.sh

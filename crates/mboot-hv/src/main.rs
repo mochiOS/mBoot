@@ -11,10 +11,12 @@ use core::arch::asm;
 use core::mem::size_of;
 use core::ptr::copy_nonoverlapping;
 use mboot_hv::arch::x86_64::{cpu, descriptor};
-use mboot_hv::domain::{Domain, DomainId};
-use mboot_hv::image;
+use mboot_hv::domain::{Domain, DomainId, DomainRole};
+use mboot_hv::manifest::{LaunchManifest, ManifestDomainRole};
 use mboot_hv::memory::{NestedPageResources, NestedPageTable};
-use mboot_hv::{BackendKind, GuestConfig, Virtualization, VirtualizationResources, VmExitReason};
+use mboot_hv::{
+    image, BackendKind, GuestConfig, Virtualization, VirtualizationResources, VmExitReason,
+};
 use mnu_abi::hypervisor::{
     DomainBootInfo, HypercallNumber, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS,
     HYPERCALL_UNSUPPORTED, HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
@@ -25,10 +27,12 @@ use uefi::table::boot::{AllocateType, MemoryType};
 use uefi::CString16;
 
 const MAX_MEMORY_REGIONS: usize = 256;
-const GUEST_MEMORY_PAGES: usize = 512;
+const MAX_GUEST_MEMORY_PAGES: usize = 512;
 const DOMAIN_BOOT_INFO_GPA: u64 = 0x3000;
-const DOMAIN_STACK_TOP: u64 = GUEST_MEMORY_PAGES as u64 * 4096 - 16;
 const MAX_CONSOLE_WRITE: u64 = 4096;
+const LAUNCH_MANIFEST_PATH: &str = "\\EFI\\MBOOT\\LAUNCH.MF";
+
+include!(concat!(env!("OUT_DIR"), "/launch_manifest_digest.rs"));
 
 macro_rules! log {
     ($($arg:tt)*) => {
@@ -112,13 +116,57 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     );
 
     let boot_services = system_table.boot_services();
-    let guest_elf = match load_guest_elf(boot_services, image_handle) {
-        Ok(image) => image,
+    let manifest_bytes = match load_file(boot_services, image_handle, LAUNCH_MANIFEST_PATH) {
+        Ok(bytes) => bytes,
         Err(status) => {
-            log!("failed to load mnu Domain image: {:?}", status);
+            log!("failed to load Launch Manifest: {:?}", status);
             return status;
         }
     };
+    let manifest = match LaunchManifest::parse(&manifest_bytes, EMBEDDED_LAUNCH_MANIFEST_SHA256) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            log!("Launch Manifest verification failed: {:?}", error);
+            return Status::SECURITY_VIOLATION;
+        }
+    };
+    if manifest.domain_count() != 1 {
+        log!("this bootstrap supports exactly one Domain");
+        return Status::UNSUPPORTED;
+    }
+    let config = match manifest.domain(0) {
+        Ok(config) => config,
+        Err(error) => {
+            log!("invalid Domain entry: {:?}", error);
+            return Status::LOAD_ERROR;
+        }
+    };
+    let guest_pages = (config.memory_size / 4096) as usize;
+    if config.role != ManifestDomainRole::System
+        || !config.auto_starts()
+        || !config.is_required()
+        || config.vcpu_count != 1
+        || guest_pages < 16
+        || guest_pages > MAX_GUEST_MEMORY_PAGES
+    {
+        log!("unsupported bootstrap Domain configuration");
+        return Status::UNSUPPORTED;
+    }
+    let guest_elf = match load_file(boot_services, image_handle, config.image_path) {
+        Ok(image) => image,
+        Err(status) => {
+            log!(
+                "failed to load Domain image {}: {:?}",
+                config.image_path,
+                status
+            );
+            return status;
+        }
+    };
+    if let Err(error) = config.verify_image(&guest_elf) {
+        log!("Domain image verification failed: {:?}", error);
+        return Status::SECURITY_VIOLATION;
+    }
     let host_control_page = match allocate_page(boot_services) {
         Ok(page) => page,
         Err(status) => return status,
@@ -127,7 +175,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         Ok(page) => page,
         Err(status) => return status,
     };
-    let nested_pages = match allocate_nested_pages(boot_services) {
+    let nested_pages = match allocate_nested_pages(boot_services, guest_pages) {
         Ok(pages) => pages,
         Err(status) => return status,
     };
@@ -187,13 +235,21 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         Err(error) => halt_with_error("virtualization", error),
     };
 
-    let mut domain = Domain::new(DomainId::new(1), virtualization.kind(), nested);
+    let mut domain = Domain::new(
+        DomainId::new(config.id),
+        DomainRole::System,
+        config.capabilities,
+        virtualization.kind(),
+        nested,
+    );
     if let Err(error) = domain.mark_ready() {
         halt_with_error("domain", error);
     }
     log!(
-        "Domain {} ready: backend={:?} nested-root={:#x} guest-memory={:#x}+{} KiB",
+        "Domain {} ready: role={:?} capabilities={:#x} backend={:?} nested-root={:#x} guest-memory={:#x}+{} KiB",
         domain.id().get(),
+        domain.role(),
+        domain.capabilities(),
         domain.backend(),
         domain.nested_pages().hardware_root(),
         domain.nested_pages().guest_base(),
@@ -233,7 +289,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             nested_root: domain.nested_pages().hardware_root(),
             page_table_root: guest_cr3,
             entry: guest_image.entry(),
-            stack: DOMAIN_STACK_TOP,
+            stack: config.memory_size - 16,
             boot_info: DOMAIN_BOOT_INFO_GPA,
         })
     } {
@@ -309,30 +365,28 @@ fn allocate_page(boot_services: &BootServices) -> Result<u64, Status> {
         .map_err(|error| error.status())
 }
 
-fn allocate_nested_pages(boot_services: &BootServices) -> Result<NestedPageResources, Status> {
+fn allocate_nested_pages(
+    boot_services: &BootServices,
+    guest_pages: usize,
+) -> Result<NestedPageResources, Status> {
     Ok(NestedPageResources {
         root: allocate_page(boot_services)?,
         level3: allocate_page(boot_services)?,
         level2: allocate_page(boot_services)?,
         level1: allocate_page(boot_services)?,
         guest_base: boot_services
-            .allocate_pages(
-                AllocateType::AnyPages,
-                MemoryType::LOADER_DATA,
-                GUEST_MEMORY_PAGES,
-            )
+            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, guest_pages)
             .map_err(|error| error.status())?,
-        guest_pages: GUEST_MEMORY_PAGES,
+        guest_pages,
     })
 }
 
-fn load_guest_elf(boot_services: &BootServices, image: Handle) -> Result<Vec<u8>, Status> {
+fn load_file(boot_services: &BootServices, image: Handle, path: &str) -> Result<Vec<u8>, Status> {
     let filesystem = boot_services
         .get_image_file_system(image)
         .map_err(|error| error.status())?;
     let mut filesystem = uefi::fs::FileSystem::new(filesystem);
-    let path =
-        CString16::try_from("\\EFI\\MBOOT\\MNU.ELF").map_err(|_| Status::INVALID_PARAMETER)?;
+    let path = CString16::try_from(path).map_err(|_| Status::INVALID_PARAMETER)?;
     filesystem.read(path.as_ref()).map_err(|error| match error {
         FsError::Io(io) => io.uefi_error.status(),
         FsError::Path(_) | FsError::Utf8Encoding(_) => Status::LOAD_ERROR,

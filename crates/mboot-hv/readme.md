@@ -2,10 +2,12 @@
 
 このcrateは、LinuxをホストOSとして使わない新しいmBootの起動部分です。現在使われているLinuxベースのmBootとは別のバイナリとしてビルドされます。
 
-UEFIから起動し、ファームウェアのメモリマップを引き継いだあと、mBoot専用のGDTとIDTへ切り替えます。Intel CPUではVMX、AMD CPUではSVMを有効にします。Domainには2 MiBのRAMを割り当て、IntelではEPT、AMDではNPTを使ってmBootのメモリから隔離します。
+UEFIから起動し、ファームウェアのメモリマップを引き継いだあと、mBoot専用のGDTとIDTへ切り替えます。Intel CPUではVMX、AMD CPUではSVMを有効にします。DomainのRAM量はLaunch Manifestから読み取り、IntelではEPT、AMDではNPTを使ってmBootのメモリから隔離します。今のブートストラップで扱えるRAMは最大2 MiB、vCPUは1個です。
 
-ESPの`\EFI\MBOOT\MNU.ELF`からmnuのDomain用ELFを読み込みます。mBootがDomain内のページテーブルと`DomainBootInfo`を用意し、mnuを64ビットモードで起動します。現在使えるHypercallは`ConsoleWrite`、`Yield`、`Shutdown`です。AMD CPUでは、`ConsoleWrite`の処理後に同じvCPUを再開し、`Shutdown`を受け取るところまでKVMで確認しています。Intel CPU用にも同じ経路がありますが、Intel実機での動作確認はまだです。
+ESPの`\EFI\MBOOT\LAUNCH.MF`には、Domain ID、役割、RAM量、vCPU数、Capability、イメージの場所とSHA-256を記録します。mBootはManifest全体を、ビルド時にmBootへ埋め込んだSHA-256と照合します。続いてDomainイメージもManifest内のSHA-256と照合します。Manifestやmnu ELFをあとから差し替えると起動しません。この確認は、mBootのUEFIバイナリ自体が正しいことを前提にしています。公開用イメージでは、UEFI Secure BootなどでmBootまでの信頼をつなぐ必要があります。
+
+mBootはManifestで指定されたELFを読み込み、Domain内のページテーブルと`DomainBootInfo`を用意して、mnuを64ビットモードで起動します。現在使えるHypercallは`ConsoleWrite`、`Yield`、`Shutdown`です。AMD CPUでは、`ConsoleWrite`の処理後に同じvCPUを再開し、`Shutdown`を受け取るところまでKVMで確認しています。Intel CPU用にも同じ経路がありますが、Intel実機での動作確認はまだです。
 
 現在の`crates/mboot-hv`は、LinuxベースのmBootと並行して開発するための一時的な置き場所です。移行時にはLinuxベースの構成を取り除き、mnuと同じように、リポジトリ直下の`mboot`をハイパーバイザー本体にします。既存のmBootイメージはまだこのバイナリへ切り替えません。
 
-ホスト上の単体テストは`make hv-test`、UEFIバイナリは`make hv-build`で生成します。mnuのDomain用ELFは`make hv-domain-build`で生成します。KVMでmnuの起動まで確認するときは`make hv-qemu-test`を実行します。IntelホストではVMX、AMDホストではSVMが選ばれます。
+ホスト上の単体テストは`make hv-test`で実行します。`make hv-build`はmnuのDomain用ELFとLaunch Manifestも生成してから、UEFIバイナリを作ります。KVMでmnuの起動まで確認するときは`make hv-qemu-test`を実行します。IntelホストではVMX、AMDホストではSVMが選ばれます。

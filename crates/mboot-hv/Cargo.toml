@@ -22,7 +22,11 @@ uefi-app = ["dep:uefi"]
 
 [dependencies]
 mnu-abi = { git = "https://github.com/mochiOS/mnu" }
+sha2 = { version = "0.10", default-features = false }
 uefi = { version = "0.30", default-features = false, features = ["alloc", "global_allocator"], optional = true }
+
+[build-dependencies]
+sha2 = "0.10"
 
 [lints.rust]
 unused = "deny"

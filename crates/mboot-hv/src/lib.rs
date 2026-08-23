@@ -3,6 +3,7 @@
 pub mod arch;
 pub mod domain;
 pub mod image;
+pub mod manifest;
 pub mod memory;
 
 use arch::x86_64::{cpu, svm, vmx};
@@ -19,6 +20,10 @@ pub enum Error {
     UnexpectedVmExit(u64),
     InvalidImage,
     ImageTooLarge,
+    InvalidManifest,
+    ManifestDigestMismatch,
+    ImageDigestMismatch,
+    UnsupportedDomainConfig,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

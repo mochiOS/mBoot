@@ -9,6 +9,7 @@ CPU=${HV_CPU:-host}
 EXPECT_BACKEND=${HV_EXPECT_BACKEND:-}
 EFI="$ROOT/output/hv-target/x86_64-unknown-uefi/release/mboot-hv.efi"
 MNU_DOMAIN_ELF=${MNU_DOMAIN_ELF:-"$ROOT/../core/target/x86_64-unknown-none/release/domain-bootstrap"}
+HV_LAUNCH_MANIFEST=${HV_LAUNCH_MANIFEST:-"$ROOT/output/hv/launch.manifest"}
 OVMF_CODE="$ROOT/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_CODE_4M.fd"
 OVMF_VARS="$ROOT/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_VARS_4M.fd"
 
@@ -24,6 +25,10 @@ test -s "$EFI" || {
 }
 test -s "$MNU_DOMAIN_ELF" || {
     echo "test-hv-qemu: missing mnu Domain image: $MNU_DOMAIN_ELF" >&2
+    exit 1
+}
+test -s "$HV_LAUNCH_MANIFEST" || {
+    echo "test-hv-qemu: missing Launch Manifest: $HV_LAUNCH_MANIFEST" >&2
     exit 1
 }
 
@@ -48,6 +53,7 @@ mmd -i "$ESP" ::/EFI/BOOT
 mmd -i "$ESP" ::/EFI/MBOOT
 mcopy -i "$ESP" "$EFI" ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$ESP" "$MNU_DOMAIN_ELF" ::/EFI/MBOOT/MNU.ELF
+mcopy -i "$ESP" "$HV_LAUNCH_MANIFEST" ::/EFI/MBOOT/LAUNCH.MF
 cp "$OVMF_VARS" "$VARS"
 
 "$QEMU" \

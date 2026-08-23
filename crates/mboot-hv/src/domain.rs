@@ -24,17 +24,34 @@ pub enum DomainState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DomainRole {
+    System,
+    Hardware,
+    Application,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Domain {
     id: DomainId,
+    role: DomainRole,
+    capabilities: u64,
     backend: BackendKind,
     state: DomainState,
     nested_pages: NestedPageTable,
 }
 
 impl Domain {
-    pub const fn new(id: DomainId, backend: BackendKind, nested_pages: NestedPageTable) -> Self {
+    pub const fn new(
+        id: DomainId,
+        role: DomainRole,
+        capabilities: u64,
+        backend: BackendKind,
+        nested_pages: NestedPageTable,
+    ) -> Self {
         Self {
             id,
+            role,
+            capabilities,
             backend,
             state: DomainState::Created,
             nested_pages,
@@ -47,6 +64,14 @@ impl Domain {
 
     pub const fn backend(&self) -> BackendKind {
         self.backend
+    }
+
+    pub const fn role(&self) -> DomainRole {
+        self.role
+    }
+
+    pub const fn capabilities(&self) -> u64 {
+        self.capabilities
     }
 
     pub const fn state(&self) -> DomainState {
@@ -93,7 +118,13 @@ mod tests {
     #[test]
     fn domain_state_machine_rejects_skipped_states() {
         let pages = NestedPageTable::test_new(BackendKind::IntelVmx, 0x1000, 0x5000, 1);
-        let mut domain = Domain::new(DomainId::new(1), BackendKind::IntelVmx, pages);
+        let mut domain = Domain::new(
+            DomainId::new(1),
+            DomainRole::System,
+            0,
+            BackendKind::IntelVmx,
+            pages,
+        );
         assert_eq!(domain.start(), Err(Error::InvalidState));
         assert_eq!(domain.mark_ready(), Ok(()));
         assert_eq!(domain.start(), Ok(()));

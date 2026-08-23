@@ -111,6 +111,7 @@ name = "mboot-hv"
 version = "0.1.0"
 dependencies = [
  "mnu-abi",
+ "sha2",
  "uefi",
 ]
 
