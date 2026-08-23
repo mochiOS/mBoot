@@ -62,6 +62,10 @@ my %domain_images = (
         bin => 'grant-bootstrap',
         path => "$mnu_dir/target/x86_64-unknown-none/release/grant-bootstrap",
     },
+    'ring-bootstrap' => {
+        bin => 'ring-bootstrap',
+        path => "$mnu_dir/target/x86_64-unknown-none/release/ring-bootstrap",
+    },
     mochios => {
         bin => 'mochios-domain',
         path => "$mnu_dir/target/x86_64-unknown-none/release/mochios-domain",

@@ -8,7 +8,7 @@ ACCEL=${HV_ACCEL:-kvm}
 CPU=${HV_CPU:-host}
 EXPECT_BACKEND=${HV_EXPECT_BACKEND:-}
 EFI="$ROOT/output/hv-target/x86_64-unknown-uefi/release/mboot-hv.efi"
-GRANT_BOOTSTRAP_DOMAIN_ELF=${GRANT_BOOTSTRAP_DOMAIN_ELF:-"$ROOT/../core/target/x86_64-unknown-none/release/grant-bootstrap"}
+RING_BOOTSTRAP_DOMAIN_ELF=${RING_BOOTSTRAP_DOMAIN_ELF:-"$ROOT/../core/target/x86_64-unknown-none/release/ring-bootstrap"}
 HV_LAUNCH_MANIFEST=${HV_LAUNCH_MANIFEST:-"$ROOT/output/hv/launch.manifest"}
 OVMF_CODE="$ROOT/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_CODE_4M.fd"
 OVMF_VARS="$ROOT/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_VARS_4M.fd"
@@ -23,8 +23,8 @@ test -s "$EFI" || {
     echo "test-hv-qemu: missing UEFI binary: $EFI" >&2
     exit 1
 }
-test -s "$GRANT_BOOTSTRAP_DOMAIN_ELF" || {
-    echo "test-hv-qemu: missing Grant bootstrap image: $GRANT_BOOTSTRAP_DOMAIN_ELF" >&2
+test -s "$RING_BOOTSTRAP_DOMAIN_ELF" || {
+    echo "test-hv-qemu: missing Shared Ring bootstrap image: $RING_BOOTSTRAP_DOMAIN_ELF" >&2
     exit 1
 }
 test -s "$HV_LAUNCH_MANIFEST" || {
@@ -52,7 +52,7 @@ mmd -i "$ESP" ::/EFI
 mmd -i "$ESP" ::/EFI/BOOT
 mmd -i "$ESP" ::/EFI/MBOOT
 mcopy -i "$ESP" "$EFI" ::/EFI/BOOT/BOOTX64.EFI
-mcopy -i "$ESP" "$GRANT_BOOTSTRAP_DOMAIN_ELF" ::/EFI/MBOOT/GRANTBOOT.ELF
+mcopy -i "$ESP" "$RING_BOOTSTRAP_DOMAIN_ELF" ::/EFI/MBOOT/RINGBOOT.ELF
 mcopy -i "$ESP" "$HV_LAUNCH_MANIFEST" ::/EFI/MBOOT/LAUNCH.MF
 cp "$OVMF_VARS" "$VARS"
 
@@ -109,14 +109,24 @@ grep -Fq 'Domain 2 stopped: reason=0 yields=0' "$SERIAL" || {
     echo 'test-hv-qemu: Hardware Domain did not stop cleanly' >&2
     exit 1
 }
-grep -Fq '[Domain 1] Grant and Event Channel bootstrap entered' "$SERIAL" || {
+grep -Fq '[Domain 1] Shared Ring bootstrap entered' "$SERIAL" || {
     sed -n '1,200p' "$SERIAL" >&2
     echo 'test-hv-qemu: System Domain ConsoleWrite was not handled' >&2
     exit 1
 }
-grep -Fq '[Domain 2] Grant and Event Channel bootstrap entered' "$SERIAL" || {
+grep -Fq '[Domain 2] Shared Ring bootstrap entered' "$SERIAL" || {
     sed -n '1,200p' "$SERIAL" >&2
     echo 'test-hv-qemu: Hardware Domain ConsoleWrite was not handled' >&2
+    exit 1
+}
+grep -Fq '[Domain 2] Shared Ring request handled' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: Hardware Domain did not consume the Shared Ring request' >&2
+    exit 1
+}
+grep -Fq '[Domain 1] Shared Ring response verified' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: System Domain did not verify the Shared Ring response' >&2
     exit 1
 }
 grep -Fq 'Grant 257 mapped: Domain 2 GPA 0x1f0000' "$SERIAL" || {

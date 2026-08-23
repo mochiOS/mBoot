@@ -393,7 +393,7 @@ HV_CONFIG ?= $(CURDIR)/config/hypervisor/qemu.toml
 HV_TOOLCHAIN ?= $(shell scripts/hv-config-value.pl "$(HV_CONFIG)" toolchain)
 HV_TARGET_DIR ?= $(CURDIR)/output/hv-target
 MNU_DIR ?= $(abspath $(CURDIR)/../core)
-GRANT_BOOTSTRAP_DOMAIN_ELF ?= $(MNU_DIR)/target/x86_64-unknown-none/release/grant-bootstrap
+RING_BOOTSTRAP_DOMAIN_ELF ?= $(MNU_DIR)/target/x86_64-unknown-none/release/ring-bootstrap
 HV_LAUNCH_MANIFEST ?= $(CURDIR)/output/hv/launch.manifest
 HV_OUTPUT_IMAGE ?= $(CURDIR)/output/mochiOS.iso
 MNU_ABI_PATCH := --config 'patch."https://github.com/mochiOS/mnu".mnu-abi.path="$(MNU_DIR)/crates/abi"'
@@ -410,13 +410,13 @@ hv-domain-build:
 		--manifest-path "$(MNU_DIR)/Cargo.toml" \
 		--no-default-features \
 		--features domain-guest \
-		--bin grant-bootstrap
+		--bin ring-bootstrap
 
 hv-manifest: hv-domain-build
 	@mkdir -p "$(dir $(HV_LAUNCH_MANIFEST))"
 	scripts/create-hv-launch-manifest.pl \
 		--config "$(HV_CONFIG)" \
-		--image "grant-bootstrap=$(GRANT_BOOTSTRAP_DOMAIN_ELF)" \
+		--image "ring-bootstrap=$(RING_BOOTSTRAP_DOMAIN_ELF)" \
 		--output "$(HV_LAUNCH_MANIFEST)"
 
 hv-build: hv-manifest
@@ -447,6 +447,6 @@ hv-image-test: hv-image
 		scripts/test-hv-disk-image.sh
 
 hv-qemu-test: hv-domain-build hv-build
-	GRANT_BOOTSTRAP_DOMAIN_ELF="$(GRANT_BOOTSTRAP_DOMAIN_ELF)" \
+	RING_BOOTSTRAP_DOMAIN_ELF="$(RING_BOOTSTRAP_DOMAIN_ELF)" \
 	HV_LAUNCH_MANIFEST="$(HV_LAUNCH_MANIFEST)" \
 		scripts/test-hv-qemu.sh

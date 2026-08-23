@@ -186,7 +186,10 @@ impl GrantTable {
             let Some(grant) = slot.grant else {
                 continue;
             };
-            if grant.owner != domain && grant.target != domain {
+            let owner_is_stopping = grant.owner == domain;
+            let mapped_target_is_stopping =
+                grant.target == domain && grant.target_page.is_some();
+            if !owner_is_stopping && !mapped_target_is_stopping {
                 continue;
             }
             if let Some(target_page) = grant.target_page {
@@ -286,5 +289,15 @@ mod tests {
             table.unmap(target, reference),
             Err(GrantError::UnknownGrant)
         );
+    }
+
+    #[test]
+    fn stopped_unmapped_target_does_not_steal_owner_revoke() {
+        let mut table = GrantTable::new();
+        let owner = DomainId::new(1);
+        let target = DomainId::new(2);
+        let reference = table.create(owner, target, 0x8000, true).unwrap();
+        assert_eq!(table.cleanup_domain(target), [None; MAX_GRANTS]);
+        assert_eq!(table.revoke(owner, reference), Ok(()));
     }
 }
