@@ -150,10 +150,10 @@ global_asm!(
     "push rdi",
     "mov rax, rsp",
     "mov rcx, 0x6c14",
-    "vmwrite rax, rcx",
+    "vmwrite rcx, rax",
     "lea rax, [rip + mboot_vmx_exit]",
     "mov rcx, 0x6c16",
-    "vmwrite rax, rcx",
+    "vmwrite rcx, rax",
     "mov rax, [rsp]",
     "cmp qword ptr [rax + 80], 0",
     "jne mboot_vmx_resume_guest",
@@ -766,9 +766,10 @@ unsafe fn descriptor_bases() -> (u64, u64) {
 
 unsafe fn vmwrite(field: u64, value: u64) -> Result<(), Error> {
     let failed: u8;
-    // SAFETY: VMX is active and a current VMCS was loaded by `enable`.
+    // SAFETY: VMX is active and a current VMCS was loaded by `enable`. Intel
+    // syntax places the VMCS field register before the value operand.
     unsafe {
-        asm!("vmwrite {value}, {field}", "setna {failed}", value = in(reg) value,
+        asm!("vmwrite {field}, {value}", "setna {failed}", value = in(reg) value,
             field = in(reg) field, failed = lateout(reg_byte) failed, options(nostack));
     }
     if failed == 0 {
