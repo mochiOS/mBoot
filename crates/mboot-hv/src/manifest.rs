@@ -3,10 +3,12 @@ use sha2::{Digest, Sha256};
 use crate::Error;
 
 pub const MANIFEST_MAGIC: &[u8; 8] = b"MBLHV1\0\0";
-pub const MANIFEST_VERSION: u16 = 1;
+pub const MANIFEST_VERSION: u16 = 2;
 pub const MANIFEST_HEADER_SIZE: usize = 32;
 pub const DOMAIN_ENTRY_SIZE: usize = 160;
+pub const EVENT_CHANNEL_ENTRY_SIZE: usize = 32;
 pub const MAX_DOMAIN_COUNT: usize = 8;
+pub const MAX_EVENT_CHANNEL_COUNT: usize = 64;
 
 pub const DOMAIN_FLAG_AUTO_START: u16 = 1 << 0;
 pub const DOMAIN_FLAG_REQUIRED: u16 = 1 << 1;
@@ -32,6 +34,14 @@ pub struct ManifestDomain<'a> {
     pub image_path: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManifestEventChannel {
+    pub domain_a: u32,
+    pub port_a: u32,
+    pub domain_b: u32,
+    pub port_b: u32,
+}
+
 impl ManifestDomain<'_> {
     pub const fn auto_starts(self) -> bool {
         self.flags & DOMAIN_FLAG_AUTO_START != 0
@@ -55,6 +65,7 @@ impl ManifestDomain<'_> {
 pub struct LaunchManifest<'a> {
     bytes: &'a [u8],
     domain_count: usize,
+    event_channel_count: usize,
 }
 
 impl<'a> LaunchManifest<'a> {
@@ -71,7 +82,12 @@ impl<'a> LaunchManifest<'a> {
             return Err(Error::InvalidManifest);
         }
         let domain_count = usize::from(read_u16(bytes, 14)?);
-        if domain_count == 0 || domain_count > MAX_DOMAIN_COUNT || read_u32(bytes, 20)? != 0 {
+        let event_channel_count = usize::from(read_u16(bytes, 20)?);
+        if domain_count == 0
+            || domain_count > MAX_DOMAIN_COUNT
+            || event_channel_count > MAX_EVENT_CHANNEL_COUNT
+            || usize::from(read_u16(bytes, 22)?) != EVENT_CHANNEL_ENTRY_SIZE
+        {
             return Err(Error::InvalidManifest);
         }
         let expected_size = MANIFEST_HEADER_SIZE
@@ -80,6 +96,11 @@ impl<'a> LaunchManifest<'a> {
                     .checked_mul(DOMAIN_ENTRY_SIZE)
                     .ok_or(Error::InvalidManifest)?,
             )
+            .and_then(|size| {
+                event_channel_count
+                    .checked_mul(EVENT_CHANNEL_ENTRY_SIZE)
+                    .and_then(|channel_bytes| size.checked_add(channel_bytes))
+            })
             .ok_or(Error::InvalidManifest)?;
         if read_u32(bytes, 16)? as usize != expected_size
             || bytes.len() != expected_size
@@ -92,6 +113,7 @@ impl<'a> LaunchManifest<'a> {
         let manifest = Self {
             bytes,
             domain_count,
+            event_channel_count,
         };
         for index in 0..domain_count {
             let domain = manifest.domain(index)?;
@@ -101,11 +123,29 @@ impl<'a> LaunchManifest<'a> {
                 }
             }
         }
+        for index in 0..event_channel_count {
+            let channel = manifest.event_channel(index)?;
+            if !manifest.has_domain(channel.domain_a) || !manifest.has_domain(channel.domain_b) {
+                return Err(Error::InvalidManifest);
+            }
+            for previous in 0..index {
+                let other = manifest.event_channel(previous)?;
+                if endpoint_matches(channel.domain_a, channel.port_a, other)
+                    || endpoint_matches(channel.domain_b, channel.port_b, other)
+                {
+                    return Err(Error::InvalidManifest);
+                }
+            }
+        }
         Ok(manifest)
     }
 
     pub const fn domain_count(self) -> usize {
         self.domain_count
+    }
+
+    pub const fn event_channel_count(self) -> usize {
+        self.event_channel_count
     }
 
     pub fn domain(self, index: usize) -> Result<ManifestDomain<'a>, Error> {
@@ -158,6 +198,41 @@ impl<'a> LaunchManifest<'a> {
             image_path,
         })
     }
+
+    pub fn event_channel(self, index: usize) -> Result<ManifestEventChannel, Error> {
+        if index >= self.event_channel_count {
+            return Err(Error::InvalidManifest);
+        }
+        let offset = MANIFEST_HEADER_SIZE
+            + self.domain_count * DOMAIN_ENTRY_SIZE
+            + index * EVENT_CHANNEL_ENTRY_SIZE;
+        let entry = &self.bytes[offset..offset + EVENT_CHANNEL_ENTRY_SIZE];
+        let channel = ManifestEventChannel {
+            domain_a: read_u32(entry, 0)?,
+            port_a: read_u32(entry, 4)?,
+            domain_b: read_u32(entry, 8)?,
+            port_b: read_u32(entry, 12)?,
+        };
+        if channel.domain_a == 0
+            || channel.domain_b == 0
+            || channel.domain_a == channel.domain_b
+            || channel.port_a == 0
+            || channel.port_b == 0
+            || entry[16..].iter().any(|byte| *byte != 0)
+        {
+            return Err(Error::InvalidManifest);
+        }
+        Ok(channel)
+    }
+
+    fn has_domain(self, id: u32) -> bool {
+        (0..self.domain_count).any(|index| self.domain(index).is_ok_and(|domain| domain.id == id))
+    }
+}
+
+fn endpoint_matches(domain: u32, port: u32, channel: ManifestEventChannel) -> bool {
+    (channel.domain_a == domain && channel.port_a == port)
+        || (channel.domain_b == domain && channel.port_b == port)
 }
 
 fn valid_uefi_path(path: &str) -> bool {
@@ -209,6 +284,7 @@ mod tests {
         bytes[12..14].copy_from_slice(&(DOMAIN_ENTRY_SIZE as u16).to_le_bytes());
         bytes[14..16].copy_from_slice(&1_u16.to_le_bytes());
         bytes[16..20].copy_from_slice(&total_size.to_le_bytes());
+        bytes[22..24].copy_from_slice(&(EVENT_CHANNEL_ENTRY_SIZE as u16).to_le_bytes());
         let entry = &mut bytes[MANIFEST_HEADER_SIZE..];
         entry[..4].copy_from_slice(&1_u32.to_le_bytes());
         entry[4..6].copy_from_slice(&(ManifestDomainRole::System as u16).to_le_bytes());

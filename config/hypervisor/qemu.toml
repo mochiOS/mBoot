@@ -1,4 +1,4 @@
-version = 1
+version = 2
 toolchain = "nightly-2026-05-14"
 disk_size_mib = 96
 esp_size_mib = 64
@@ -11,8 +11,8 @@ role = "system"
 memory_mib = 2
 vcpus = 1
 capabilities = 0
-image = "bootstrap"
-path = '\EFI\MBOOT\BOOTSTRAP.ELF'
+image = "event-bootstrap"
+path = '\EFI\MBOOT\EVENTBOOT.ELF'
 autostart = true
 required = true
 
@@ -22,7 +22,13 @@ role = "hardware"
 memory_mib = 2
 vcpus = 1
 capabilities = 0
-image = "bootstrap"
-path = '\EFI\MBOOT\BOOTSTRAP.ELF'
+image = "event-bootstrap"
+path = '\EFI\MBOOT\EVENTBOOT.ELF'
 autostart = true
 required = true
+
+[[channels]]
+domain_a = 1
+port_a = 1
+domain_b = 2
+port_b = 1

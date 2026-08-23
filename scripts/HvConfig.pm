@@ -12,6 +12,7 @@ sub read_hv_config {
 
     my %root;
     my @domains;
+    my @channels;
     my $current = \%root;
     my $line_number = 0;
     while (my $line = <$fh>) {
@@ -22,6 +23,11 @@ sub read_hv_config {
         if ($line eq '[[domains]]') {
             push @domains, {};
             $current = $domains[-1];
+            next;
+        }
+        if ($line eq '[[channels]]') {
+            push @channels, {};
+            $current = $channels[-1];
             next;
         }
         $line =~ /^([a-z][a-z0-9_]*)\s*=\s*(.+)$/
@@ -36,7 +42,7 @@ sub read_hv_config {
     for my $key (qw(version toolchain disk_size_mib esp_size_mib disk_guid esp_guid)) {
         exists $root{$key} or die "$path: missing $key\n";
     }
-    $root{version} == 1 or die "$path: unsupported version $root{version}\n";
+    $root{version} == 2 or die "$path: unsupported version $root{version}\n";
     $root{disk_size_mib} > $root{esp_size_mib} + 2
         or die "$path: disk_size_mib must exceed esp_size_mib by at least 2 MiB\n";
     @domains && @domains <= 8 or die "$path: domains must contain 1 to 8 entries\n";
@@ -62,7 +68,29 @@ sub read_hv_config {
     }
     $system_domains == 1 or die "$path: exactly one System Domain is required\n";
 
+    @channels <= 64 or die "$path: channels may contain at most 64 entries\n";
+    my %endpoints;
+    for my $channel (@channels) {
+        for my $key (qw(domain_a port_a domain_b port_b)) {
+            exists $channel->{$key} or die "$path: Event Channel is missing $key\n";
+        }
+        $channel->{domain_a} != $channel->{domain_b}
+            or die "$path: Event Channel endpoints must use different Domains\n";
+        $channel->{port_a} > 0 && $channel->{port_b} > 0
+            or die "$path: Event Channel ports must be nonzero\n";
+        $ids{$channel->{domain_a}} && $ids{$channel->{domain_b}}
+            or die "$path: Event Channel refers to an unknown Domain\n";
+        for my $endpoint (
+            "$channel->{domain_a}:$channel->{port_a}",
+            "$channel->{domain_b}:$channel->{port_b}",
+        ) {
+            !$endpoints{$endpoint}++
+                or die "$path: Event Channel endpoint $endpoint is duplicated\n";
+        }
+    }
+
     $root{domains} = \@domains;
+    $root{channels} = \@channels;
     return \%root;
 }
 

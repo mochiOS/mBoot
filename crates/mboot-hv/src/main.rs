@@ -12,7 +12,8 @@ use core::arch::asm;
 use core::mem::size_of;
 use core::ptr::copy_nonoverlapping;
 use mboot_hv::arch::x86_64::{cpu, descriptor};
-use mboot_hv::domain::{Domain, DomainId, DomainRole};
+use mboot_hv::domain::{Domain, DomainId, DomainRole, DomainState};
+use mboot_hv::event::EventChannelTable;
 use mboot_hv::manifest::{LaunchManifest, ManifestDomainRole};
 use mboot_hv::memory::{NestedPageResources, NestedPageTable};
 use mboot_hv::scheduler::CooperativeScheduler;
@@ -398,6 +399,32 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         });
     }
 
+    let mut event_channels = EventChannelTable::new();
+    for index in 0..manifest.event_channel_count() {
+        let channel = match manifest.event_channel(index) {
+            Ok(channel) => channel,
+            Err(error) => halt_with_error("Event Channel manifest", error),
+        };
+        if event_channels
+            .connect(
+                DomainId::new(channel.domain_a),
+                channel.port_a,
+                DomainId::new(channel.domain_b),
+                channel.port_b,
+            )
+            .is_err()
+        {
+            halt_with_error("Event Channel manifest", mboot_hv::Error::InvalidManifest)
+        }
+        log!(
+            "Event Channel connected: {}:{} <-> {}:{}",
+            channel.domain_a,
+            channel.port_a,
+            channel.domain_b,
+            channel.port_b
+        );
+    }
+
     let mut scheduler = CooperativeScheduler::new();
     while let Some(index) = scheduler.next(&runnable) {
         let runtime = &mut runtime_domains[index];
@@ -436,6 +463,68 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 runtime.yield_count,
                 vm_exit.raw_reason
             );
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::EventSend as u64 {
+            let sender = runtime_domains[index].domain.id();
+            let mut delivery = if vm_exit.arg1 == 0 && vm_exit.arg2 == 0 {
+                u32::try_from(vm_exit.arg0)
+                    .ok()
+                    .and_then(|port| event_channels.send(sender, port).ok())
+            } else {
+                None
+            };
+            let target_index = delivery.and_then(|event| {
+                runtime_domains
+                    .iter()
+                    .position(|domain| domain.domain.id() == event.domain)
+            });
+            if target_index
+                .is_none_or(|target| runtime_domains[target].domain.state() != DomainState::Running)
+            {
+                if let Some(event) = delivery {
+                    let _ = event_channels.receive(event.domain);
+                }
+                delivery = None;
+            }
+            runtime_domains[index].pending_result = if delivery.is_some() {
+                HYPERCALL_SUCCESS
+            } else {
+                HYPERCALL_INVALID_ARGUMENT
+            };
+            if let Some(delivery) = delivery {
+                log!(
+                    "Event Channel {}:{} -> {}:{}",
+                    sender.get(),
+                    vm_exit.arg0,
+                    delivery.domain.get(),
+                    delivery.port
+                );
+                if let Some(target_index) = target_index {
+                    if runtime_domains[target_index].waiting {
+                        let port = event_channels
+                            .receive(delivery.domain)
+                            .unwrap_or(delivery.port);
+                        runtime_domains[target_index].pending_result = u64::from(port);
+                        runtime_domains[target_index].waiting = false;
+                        runnable[target_index] = true;
+                    }
+                }
+            }
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::EventWait as u64 {
+            if vm_exit.arg0 != 0 || vm_exit.arg1 != 0 || vm_exit.arg2 != 0 {
+                runtime_domains[index].pending_result = HYPERCALL_INVALID_ARGUMENT;
+                continue;
+            }
+            let receiver = runtime_domains[index].domain.id();
+            if let Some(port) = event_channels.receive(receiver) {
+                runtime_domains[index].pending_result = u64::from(port);
+            } else {
+                runtime_domains[index].waiting = true;
+                runnable[index] = false;
+            }
             continue;
         }
         runtime.pending_result = match vm_exit.hypercall_number {
@@ -591,6 +680,7 @@ fn halt_error_code(stage: &str, error: mboot_hv::Error) -> u8 {
         },
         "Domain Hypercall" => 53,
         "Domain stop" => 54,
+        "Event Channel manifest" => 55,
         _ => 10,
     }
 }

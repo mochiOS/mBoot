@@ -2,6 +2,7 @@
 
 pub mod arch;
 pub mod domain;
+pub mod event;
 pub mod image;
 pub mod manifest;
 pub mod memory;

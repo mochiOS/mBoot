@@ -33,11 +33,14 @@ defined $config_file && defined $output_file
 my $config = read_hv_config($config_file);
 my $header_size = 32;
 my $entry_size = 160;
+my $channel_entry_size = 32;
 my $domain_count = scalar @{$config->{domains}};
+my $channel_count = scalar @{$config->{channels}};
 my $header = pack(
-    'a8 v v v v V V Q<',
+    'a8 v v v v V v v Q<',
     "MBLHV1\0\0", $config->{version}, $header_size, $entry_size, $domain_count,
-    $header_size + $entry_size * $domain_count, 0, 0,
+    $header_size + $entry_size * $domain_count + $channel_entry_size * $channel_count,
+    $channel_count, $channel_entry_size, 0,
 );
 
 my %image_bytes;
@@ -65,6 +68,16 @@ for my $domain (@{$config->{domains}}) {
     );
 }
 
+my $channel_entries = '';
+for my $channel (@{$config->{channels}}) {
+    $channel_entries .= pack(
+        'V V V V a16',
+        $channel->{domain_a}, $channel->{port_a},
+        $channel->{domain_b}, $channel->{port_b}, '',
+    );
+}
+
 open my $output_fh, '>:raw', $output_file or die "cannot write $output_file: $!\n";
-print {$output_fh} $header, $entries or die "cannot write $output_file: $!\n";
+print {$output_fh} $header, $entries, $channel_entries
+    or die "cannot write $output_file: $!\n";
 close $output_fh or die "cannot close $output_file: $!\n";
