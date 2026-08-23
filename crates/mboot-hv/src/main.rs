@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod display;
 mod panic;
 mod serial;
 
@@ -121,13 +122,17 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         log!("UEFI helper initialization failed: {:?}", error.status());
         return error.status();
     }
+    let has_display = display::initialize(system_table.boot_services());
+    log!("boot display available={}", has_display);
 
     let features = cpu::detect();
     let vendor = core::str::from_utf8(&features.vendor).unwrap_or("unknown");
     let Some(backend) = features.backend else {
         log!("CPU {} has neither VMX nor SVM", vendor);
+        display::failure(1);
         return Status::UNSUPPORTED;
     };
+    display::backend(backend == BackendKind::IntelVmx);
     log!(
         "CPU {} backend={:?} nested-paging={:?} asids={}",
         vendor,
@@ -141,6 +146,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         Ok(bytes) => bytes,
         Err(status) => {
             log!("failed to load Launch Manifest: {:?}", status);
+            display::failure(2);
             return status;
         }
     };
@@ -148,6 +154,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         Ok(manifest) => manifest,
         Err(error) => {
             log!("Launch Manifest verification failed: {:?}", error);
+            display::failure(3);
             return Status::SECURITY_VIOLATION;
         }
     };
@@ -159,11 +166,15 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             manifest.domain_count(),
             features.address_space_ids.saturating_sub(1)
         );
+        display::failure(4);
         return Status::UNSUPPORTED;
     }
     let host_control_page = match allocate_page(boot_services) {
         Ok(page) => page,
-        Err(status) => return status,
+        Err(status) => {
+            display::failure(11);
+            return status;
+        }
     };
     let mut prepared_domains = Vec::with_capacity(manifest.domain_count());
     let mut runtime_domains: Vec<RuntimeDomain> = Vec::with_capacity(manifest.domain_count());
@@ -174,6 +185,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             Ok(config) => config,
             Err(error) => {
                 log!("invalid Domain entry {}: {:?}", index, error);
+                display::failure(5);
                 return Status::LOAD_ERROR;
             }
         };
@@ -189,10 +201,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         if !config.auto_starts()
             || !config.is_required()
             || config.vcpu_count != 1
-            || guest_pages < 16
-            || guest_pages > MAX_GUEST_MEMORY_PAGES
+            || !(16..=MAX_GUEST_MEMORY_PAGES).contains(&guest_pages)
         {
             log!("unsupported configuration for Domain {}", config.id);
+            display::failure(6);
             return Status::UNSUPPORTED;
         }
         let image = match load_file(boot_services, image_handle, config.image_path) {
@@ -204,6 +216,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     config.image_path,
                     status
                 );
+                display::failure(7);
                 return status;
             }
         };
@@ -213,15 +226,22 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 config.id,
                 error
             );
+            display::failure(8);
             return Status::SECURITY_VIOLATION;
         }
         let vcpu_control_page = match allocate_page(boot_services) {
             Ok(page) => page,
-            Err(status) => return status,
+            Err(status) => {
+                display::failure(12);
+                return status;
+            }
         };
         let nested_pages = match allocate_nested_pages(boot_services, guest_pages) {
             Ok(pages) => pages,
-            Err(status) => return status,
+            Err(status) => {
+                display::failure(13);
+                return status;
+            }
         };
         prepared_domains.push(PreparedDomain {
             id: config.id,
@@ -236,6 +256,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
     if system_domains != 1 {
         log!("Launch Manifest must contain exactly one System Domain");
+        display::failure(9);
         return Status::UNSUPPORTED;
     }
 
@@ -285,6 +306,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         // SAFETY: Control pages are exclusive, execution is pinned to the BSP,
         // interrupts are disabled, and this code runs at CPL0.
         let virtualization = if index == 0 {
+            // SAFETY: The preconditions above apply to the BSP's first vCPU.
             match unsafe {
                 Virtualization::enable(VirtualizationResources {
                     host_control_page,
@@ -295,6 +317,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 Err(error) => halt_with_error("virtualization", error),
             }
         } else {
+            // SAFETY: The first backend is active on this BSP and the new control
+            // page and address-space identifier are exclusive to this vCPU.
             match unsafe {
                 runtime_domains[0]
                     .virtualization
@@ -373,9 +397,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         let runtime = &mut runtime_domains[index];
         // SAFETY: The selected vCPU is stopped and owns all guest and control state.
         let vm_exit = if runtime.started {
+            // SAFETY: This vCPU stopped at the previous VM exit and remains selected.
             unsafe { runtime.virtualization.resume(runtime.pending_result) }
         } else {
             runtime.started = true;
+            // SAFETY: This is the first entry into the stopped, fully prepared vCPU.
             unsafe { runtime.virtualization.run(runtime.guest) }
         };
         let vm_exit = match vm_exit {
@@ -424,6 +450,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         "bootstrap complete; {} Domains entered and stopped cleanly",
         runtime_domains.len()
     );
+    display::success();
 
     let _keep_domains_alive = runtime_domains;
     let _keep_prepared_storage = prepared_domains;
@@ -489,6 +516,7 @@ fn load_file(boot_services: &BootServices, image: Handle, path: &str) -> Result<
 
 fn halt_with_error(stage: &str, error: mboot_hv::Error) -> ! {
     log!("{} initialization failed: {:?}", stage, error);
+    display::failure(10);
     halt()
 }
 

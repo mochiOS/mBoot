@@ -121,6 +121,26 @@ CPU側のIntel VMXまたはAMD SVMが必要です。
 make hv-image-test
 ```
 
+実機では、mBootが画面を濃い青に切り替えて起動状況を表示します。Intel CPUなら
+`INTEL VMX`、AMD CPUなら`AMD SVM`と表示されます。mnuの起動が終わると画面が緑に
+変わり、`MNU OK`が残ります。赤い画面が出た場合は、`ERROR`の下にある番号を確認して
+ください。
+
+| 番号 | 止まった場所 |
+|---:|---|
+| 01 | CPUでVMXとSVMのどちらも利用できません |
+| 02 | Launch Manifestを読み込めません |
+| 03 | Launch Manifestの検証に失敗しました |
+| 04 | AMD SVMのASIDが足りません |
+| 05 | Domain設定を読み取れません |
+| 06 | 現在のmBootで扱えないDomain設定です |
+| 07 | Domainイメージを読み込めません |
+| 08 | DomainイメージのSHA-256が一致しません |
+| 09 | System Domainが1つではありません |
+| 10 | 仮想化、ページテーブル、またはDomain実行中に失敗しました |
+| 11〜13 | UEFIから必要なメモリを確保できません |
+| 99 | mBoot内でpanicが発生しました |
+
 ## USBまたはSSDから実機起動
 
 `output/images/mboot.iso`または`disk.img`を、ファイルとしてコピーするのではなく、
