@@ -257,6 +257,18 @@ impl Svm {
         unsafe { self.enter() }
     }
 
+    /// Requests an ASID translation flush before the next VMRUN.
+    ///
+    /// # Safety
+    /// The associated vCPU must be stopped and the VMCB must remain writable.
+    pub unsafe fn flush_nested(&mut self) -> Result<(), Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        unsafe { write_u8(self.vmcb_phys, VMCB_TLB_CONTROL, TLB_CONTROL_FLUSH_ALL) };
+        Ok(())
+    }
+
     unsafe fn enter(&mut self) -> Result<VmExit, Error> {
         // SAFETY: The stopped guest owns its VMCB RAX field.
         unsafe { write_u64(self.vmcb_phys, VMCB_RAX, self.run_context.rax) };
@@ -337,7 +349,11 @@ unsafe fn initialize_guest(vmcb: u64, guest_asid: u32, config: GuestConfig) {
 
         // SVME remains set in guest EFER while SVM is active. LME and LMA start
         // the Domain directly in 64-bit mode.
-        write_u64(vmcb, VMCB_EFER, EFER_SVME | (1 << 8) | (1 << 10));
+        write_u64(
+            vmcb,
+            VMCB_EFER,
+            EFER_SVME | (1 << 8) | (1 << 10) | (1 << 11),
+        );
         write_u64(vmcb, VMCB_CR4, 1 << 5);
         write_u64(vmcb, VMCB_CR3, config.page_table_root);
         write_u64(vmcb, VMCB_CR0, 0x8001_0033);

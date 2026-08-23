@@ -11,8 +11,8 @@ role = "system"
 memory_mib = 2
 vcpus = 1
 capabilities = 0
-image = "event-bootstrap"
-path = '\EFI\MBOOT\EVENTBOOT.ELF'
+image = "grant-bootstrap"
+path = '\EFI\MBOOT\GRANTBOOT.ELF'
 autostart = true
 required = true
 
@@ -22,8 +22,8 @@ role = "hardware"
 memory_mib = 2
 vcpus = 1
 capabilities = 0
-image = "event-bootstrap"
-path = '\EFI\MBOOT\EVENTBOOT.ELF'
+image = "grant-bootstrap"
+path = '\EFI\MBOOT\GRANTBOOT.ELF'
 autostart = true
 required = true
 

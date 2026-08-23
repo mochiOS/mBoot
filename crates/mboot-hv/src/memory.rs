@@ -9,6 +9,7 @@ const EPT_LEAF_WRITE_BACK: u64 = EPT_READ_WRITE_EXECUTE | (6 << 3);
 const EPT_WRITE_BACK: u64 = 6;
 const EPT_WALK_LENGTH_4: u64 = 3 << 3;
 const NPT_PRESENT_WRITE_USER: u64 = 0b111;
+const NPT_PRESENT_USER_NO_EXECUTE: u64 = 0b101 | (1 << 63);
 const GUEST_PAGE_TABLE_FLAGS: u64 = 0b111;
 const GUEST_LARGE_PAGE_FLAGS: u64 = GUEST_PAGE_TABLE_FLAGS | (1 << 7);
 
@@ -46,6 +47,7 @@ impl NestedPageResources {
 pub struct NestedPageTable {
     backend: BackendKind,
     root: u64,
+    level1: u64,
     guest_base: u64,
     guest_pages: usize,
 }
@@ -102,6 +104,7 @@ impl NestedPageTable {
         Ok(Self {
             backend,
             root: resources.root,
+            level1: resources.level1,
             guest_base: resources.guest_base,
             guest_pages: resources.guest_pages,
         })
@@ -125,6 +128,62 @@ impl NestedPageTable {
             return None;
         }
         self.guest_base.checked_add(guest_address)
+    }
+
+    pub fn owned_page_host_address(&self, guest_page: u64) -> Option<u64> {
+        if guest_page & (PAGE_SIZE - 1) != 0
+            || guest_page.checked_add(PAGE_SIZE)? > self.guest_memory_size()
+        {
+            return None;
+        }
+        self.guest_base.checked_add(guest_page)
+    }
+
+    /// Replaces one stopped Domain mapping with a page owned by another Domain.
+    ///
+    /// # Safety
+    /// Both addresses must denote live aligned pages. No vCPU may use this nested
+    /// page table until the backend translation cache has been invalidated.
+    pub unsafe fn map_shared_page(
+        &self,
+        guest_page: u64,
+        host_page: u64,
+        writable: bool,
+    ) -> Result<(), Error> {
+        let index = self.page_index(guest_page)?;
+        if host_page == 0 || host_page & (PAGE_SIZE - 1) != 0 {
+            return Err(Error::InvalidPage);
+        }
+        let flags = match self.backend {
+            BackendKind::IntelVmx => (6 << 3) | 1 | if writable { 1 << 1 } else { 0 },
+            BackendKind::AmdSvm => NPT_PRESENT_USER_NO_EXECUTE | if writable { 1 << 1 } else { 0 },
+        };
+        unsafe { write_entry(self.level1, index, host_page | flags) };
+        Ok(())
+    }
+
+    /// Restores a shared guest page to the Domain's own backing page.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped until the backend translation cache is invalidated.
+    pub unsafe fn restore_owned_page(&self, guest_page: u64) -> Result<(), Error> {
+        let index = self.page_index(guest_page)?;
+        let host_page = self
+            .guest_base
+            .checked_add(guest_page)
+            .ok_or(Error::InvalidPage)?;
+        let flags = match self.backend {
+            BackendKind::IntelVmx => EPT_LEAF_WRITE_BACK,
+            BackendKind::AmdSvm => NPT_PRESENT_WRITE_USER,
+        };
+        unsafe { write_entry(self.level1, index, host_page | flags) };
+        Ok(())
+    }
+
+    fn page_index(&self, guest_page: u64) -> Result<usize, Error> {
+        self.owned_page_host_address(guest_page)
+            .ok_or(Error::InvalidPage)?;
+        usize::try_from(guest_page / PAGE_SIZE).map_err(|_| Error::InvalidPage)
     }
 
     /// Creates a guest-owned four-level table that identity maps the first 2 MiB.
@@ -166,6 +225,7 @@ impl NestedPageTable {
         Self {
             backend,
             root,
+            level1: root,
             guest_base,
             guest_pages,
         }
@@ -201,6 +261,15 @@ mod tests {
         assert_eq!(level1.0[0], resources.guest_base | EPT_LEAF_WRITE_BACK);
         assert_eq!(level1.0[1], 0);
         assert_eq!(guest.0[0], 0);
+        let mut shared = Page([0; ENTRY_COUNT]);
+        unsafe {
+            table
+                .map_shared_page(0, shared.0.as_mut_ptr() as u64, false)
+                .unwrap()
+        };
+        assert_eq!(level1.0[0], shared.0.as_mut_ptr() as u64 | (6 << 3) | 1);
+        unsafe { table.restore_owned_page(0).unwrap() };
+        assert_eq!(level1.0[0], resources.guest_base | EPT_LEAF_WRITE_BACK);
         assert_eq!(
             table.hardware_root() & 0xfff,
             EPT_WRITE_BACK | EPT_WALK_LENGTH_4
@@ -220,6 +289,16 @@ mod tests {
         let table = unsafe { NestedPageTable::initialize(BackendKind::AmdSvm, resources) }.unwrap();
         assert_eq!(root.0[0], resources.level3 | NPT_PRESENT_WRITE_USER);
         assert_eq!(table.hardware_root(), resources.root);
+        let mut shared = Page([0; ENTRY_COUNT]);
+        unsafe {
+            table
+                .map_shared_page(0, shared.0.as_mut_ptr() as u64, true)
+                .unwrap()
+        };
+        assert_eq!(
+            level1.0[0],
+            shared.0.as_mut_ptr() as u64 | NPT_PRESENT_USER_NO_EXECUTE | (1 << 1)
+        );
     }
 
     fn resources(

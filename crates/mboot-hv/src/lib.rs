@@ -3,6 +3,7 @@
 pub mod arch;
 pub mod domain;
 pub mod event;
+pub mod grant;
 pub mod image;
 pub mod manifest;
 pub mod memory;
@@ -157,6 +158,17 @@ impl Virtualization {
             Self::Intel(vmx) => unsafe { vmx.resume(result) },
             // SAFETY: The public function contract is forwarded unchanged.
             Self::Amd(svm) => unsafe { svm.resume(result) },
+        }
+    }
+
+    /// Invalidates nested translations after mBoot changes a stopped Domain map.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped on the CPU that owns this virtualization state.
+    pub unsafe fn flush_nested(&mut self, nested_root: u64) -> Result<(), Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.flush_nested(nested_root) },
+            Virtualization::Amd(svm) => unsafe { svm.flush_nested() },
         }
     }
 }

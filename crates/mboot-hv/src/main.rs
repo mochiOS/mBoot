@@ -14,6 +14,7 @@ use core::ptr::copy_nonoverlapping;
 use mboot_hv::arch::x86_64::{cpu, descriptor};
 use mboot_hv::domain::{Domain, DomainId, DomainRole, DomainState};
 use mboot_hv::event::EventChannelTable;
+use mboot_hv::grant::{GrantRef, GrantTable};
 use mboot_hv::manifest::{LaunchManifest, ManifestDomainRole};
 use mboot_hv::memory::{NestedPageResources, NestedPageTable};
 use mboot_hv::scheduler::CooperativeScheduler;
@@ -22,8 +23,8 @@ use mboot_hv::{
 };
 use mnu_abi::hypervisor::{
     DomainBootInfo, HypercallNumber, DOMAIN_ROLE_APPLICATION, DOMAIN_ROLE_HARDWARE,
-    DOMAIN_ROLE_SYSTEM, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED,
-    HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
+    DOMAIN_ROLE_SYSTEM, GRANT_FLAG_WRITABLE, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS,
+    HYPERCALL_UNSUPPORTED, HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
 };
 use uefi::fs::Error as FsError;
 use uefi::prelude::*;
@@ -32,6 +33,7 @@ use uefi::CString16;
 
 const MAX_MEMORY_REGIONS: usize = 256;
 const MAX_GUEST_MEMORY_PAGES: usize = 512;
+const GRANT_WINDOW_PAGES: usize = 16;
 const DOMAIN_BOOT_INFO_GPA: u64 = 0x3000;
 const MAX_CONSOLE_WRITE: u64 = 4096;
 const LAUNCH_MANIFEST_PATH: &str = "\\EFI\\MBOOT\\LAUNCH.MF";
@@ -68,7 +70,6 @@ struct PreparedDomain {
     id: u32,
     role: DomainRole,
     capabilities: u64,
-    memory_size: u64,
     image: Vec<u8>,
     nested_pages: NestedPageResources,
     vcpu_control_page: u64,
@@ -205,7 +206,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         if !config.auto_starts()
             || !config.is_required()
             || config.vcpu_count != 1
-            || !(16..=MAX_GUEST_MEMORY_PAGES).contains(&guest_pages)
+            || !(GRANT_WINDOW_PAGES + 16..=MAX_GUEST_MEMORY_PAGES).contains(&guest_pages)
         {
             log!("unsupported configuration for Domain {}", config.id);
             display::failure(6);
@@ -251,7 +252,6 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             id: config.id,
             role,
             capabilities: config.capabilities,
-            memory_size: config.memory_size,
             image,
             nested_pages,
             vcpu_control_page,
@@ -352,6 +352,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             backend_id,
             abi_domain_role(domain.role()),
             domain.nested_pages().guest_memory_size(),
+            grant_window_start(domain.nested_pages()),
+            GRANT_WINDOW_PAGES as u64 * 4096,
         );
         let Some(boot_info_host) = domain
             .nested_pages()
@@ -385,7 +387,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 nested_root: domain.nested_pages().hardware_root(),
                 page_table_root: guest_cr3,
                 entry: guest_image.entry(),
-                stack: prepared.memory_size - 16,
+                stack: grant_window_start(domain.nested_pages()) - 16,
                 boot_info: DOMAIN_BOOT_INFO_GPA,
             },
             domain,
@@ -400,6 +402,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
 
     let mut event_channels = EventChannelTable::new();
+    let mut grants = GrantTable::new();
     for index in 0..manifest.event_channel_count() {
         let channel = match manifest.event_channel(index) {
             Ok(channel) => channel,
@@ -452,6 +455,34 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             );
         }
         if vm_exit.hypercall_number == HypercallNumber::Shutdown as u64 {
+            let stopping_domain = runtime_domains[index].domain.id();
+            for mapping in grants.cleanup_domain(stopping_domain).into_iter().flatten() {
+                let Some(target_index) = runtime_domains
+                    .iter()
+                    .position(|runtime| runtime.domain.id() == mapping.target)
+                else {
+                    halt_with_error("Grant cleanup", mboot_hv::Error::InvalidState)
+                };
+                let target = &mut runtime_domains[target_index];
+                let nested_root = target.domain.nested_pages().hardware_root();
+                if let Err(error) = unsafe {
+                    target
+                        .domain
+                        .nested_pages()
+                        .restore_owned_page(mapping.target_page)
+                } {
+                    halt_with_error("Grant cleanup", error)
+                }
+                if let Err(error) = unsafe { target.virtualization.flush_nested(nested_root) } {
+                    halt_with_error("Grant translation flush", error)
+                }
+                log!(
+                    "Grant mapping at Domain {} GPA {:#x} cleaned up",
+                    mapping.target.get(),
+                    mapping.target_page
+                );
+            }
+            let runtime = &mut runtime_domains[index];
             if let Err(error) = runtime.domain.stop() {
                 halt_with_error("Domain stop", error);
             }
@@ -463,6 +494,135 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 runtime.yield_count,
                 vm_exit.raw_reason
             );
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::GrantCreate as u64 {
+            let owner = runtime_domains[index].domain.id();
+            let target = u32::try_from(vm_exit.arg1).ok().map(DomainId::new);
+            let target_is_running = target.is_some_and(|target| {
+                runtime_domains.iter().any(|runtime| {
+                    runtime.domain.id() == target && runtime.domain.state() == DomainState::Running
+                })
+            });
+            let source_page = vm_exit.arg0;
+            let writable = vm_exit.arg2 & GRANT_FLAG_WRITABLE != 0;
+            let valid_flags = vm_exit.arg2 & !GRANT_FLAG_WRITABLE == 0;
+            let host_page =
+                if grant_window_contains(runtime_domains[index].domain.nested_pages(), source_page)
+                    && !grants.target_page_is_mapped(owner, source_page)
+                {
+                    runtime_domains[index]
+                        .domain
+                        .nested_pages()
+                        .owned_page_host_address(source_page)
+                } else {
+                    None
+                };
+            runtime_domains[index].pending_result = match (target, host_page) {
+                (Some(target), Some(host_page)) if target_is_running && valid_flags => grants
+                    .create(owner, target, host_page, writable)
+                    .map_or(HYPERCALL_INVALID_ARGUMENT, |reference| {
+                        log!(
+                            "Grant {} created: {}:{:#x} -> {} writable={}",
+                            reference.get(),
+                            owner.get(),
+                            source_page,
+                            target.get(),
+                            writable
+                        );
+                        u64::from(reference.get())
+                    }),
+                _ => HYPERCALL_INVALID_ARGUMENT,
+            };
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::GrantMap as u64 {
+            let target = runtime_domains[index].domain.id();
+            let reference = u32::try_from(vm_exit.arg0).ok().and_then(GrantRef::new);
+            let target_page = vm_exit.arg1;
+            let mapping = if vm_exit.arg2 == 0
+                && grant_window_contains(runtime_domains[index].domain.nested_pages(), target_page)
+            {
+                reference.and_then(|reference| grants.map(target, reference, target_page).ok())
+            } else {
+                None
+            };
+            if let (Some(reference), Some(mapping)) = (reference, mapping) {
+                let runtime = &mut runtime_domains[index];
+                let nested_root = runtime.domain.nested_pages().hardware_root();
+                if unsafe {
+                    runtime.domain.nested_pages().map_shared_page(
+                        mapping.target_page,
+                        mapping.host_page,
+                        mapping.writable,
+                    )
+                }
+                .is_err()
+                {
+                    let _ = grants.unmap(target, reference);
+                    runtime.pending_result = HYPERCALL_INVALID_ARGUMENT;
+                    continue;
+                }
+                if let Err(error) = unsafe { runtime.virtualization.flush_nested(nested_root) } {
+                    halt_with_error("Grant translation flush", error)
+                }
+                log!(
+                    "Grant {} mapped: Domain {} GPA {:#x}",
+                    reference.get(),
+                    target.get(),
+                    target_page
+                );
+                runtime.pending_result = HYPERCALL_SUCCESS;
+            } else {
+                runtime_domains[index].pending_result = HYPERCALL_INVALID_ARGUMENT;
+            }
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::GrantUnmap as u64 {
+            let target = runtime_domains[index].domain.id();
+            let reference = u32::try_from(vm_exit.arg0).ok().and_then(GrantRef::new);
+            let mapping = if vm_exit.arg1 == 0 && vm_exit.arg2 == 0 {
+                reference.and_then(|reference| grants.unmap(target, reference).ok())
+            } else {
+                None
+            };
+            if let (Some(reference), Some(mapping)) = (reference, mapping) {
+                let runtime = &mut runtime_domains[index];
+                let nested_root = runtime.domain.nested_pages().hardware_root();
+                if let Err(error) = unsafe {
+                    runtime
+                        .domain
+                        .nested_pages()
+                        .restore_owned_page(mapping.target_page)
+                } {
+                    halt_with_error("Grant unmap", error)
+                }
+                if let Err(error) = unsafe { runtime.virtualization.flush_nested(nested_root) } {
+                    halt_with_error("Grant translation flush", error)
+                }
+                log!(
+                    "Grant {} unmapped from Domain {}",
+                    reference.get(),
+                    target.get()
+                );
+                runtime.pending_result = HYPERCALL_SUCCESS;
+            } else {
+                runtime_domains[index].pending_result = HYPERCALL_INVALID_ARGUMENT;
+            }
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::GrantRevoke as u64 {
+            let owner = runtime_domains[index].domain.id();
+            let reference = u32::try_from(vm_exit.arg0).ok().and_then(GrantRef::new);
+            runtime_domains[index].pending_result = if vm_exit.arg1 == 0
+                && vm_exit.arg2 == 0
+                && reference.is_some_and(|reference| grants.revoke(owner, reference).is_ok())
+            {
+                log!("Grant revoked by Domain {}", owner.get());
+                HYPERCALL_SUCCESS
+            } else {
+                HYPERCALL_INVALID_ARGUMENT
+            };
             continue;
         }
         if vm_exit.hypercall_number == HypercallNumber::EventSend as u64 {
@@ -610,6 +770,18 @@ fn abi_domain_role(role: DomainRole) -> u32 {
     }
 }
 
+fn grant_window_start(memory: &NestedPageTable) -> u64 {
+    memory.guest_memory_size() - GRANT_WINDOW_PAGES as u64 * 4096
+}
+
+fn grant_window_contains(memory: &NestedPageTable, guest_page: u64) -> bool {
+    guest_page & 0xfff == 0
+        && guest_page >= grant_window_start(memory)
+        && guest_page
+            .checked_add(4096)
+            .is_some_and(|end| end <= memory.guest_memory_size())
+}
+
 fn allocate_page(boot_services: &BootServices) -> Result<u64, Status> {
     boot_services
         .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
@@ -681,6 +853,9 @@ fn halt_error_code(stage: &str, error: mboot_hv::Error) -> u8 {
         "Domain Hypercall" => 53,
         "Domain stop" => 54,
         "Event Channel manifest" => 55,
+        "Grant translation flush" => 56,
+        "Grant unmap" => 57,
+        "Grant cleanup" => 58,
         _ => 10,
     }
 }

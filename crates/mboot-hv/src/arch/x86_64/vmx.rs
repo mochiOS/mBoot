@@ -433,6 +433,40 @@ impl Vmx {
         unsafe { self.decode_exit() }
     }
 
+    /// Invalidates cached translations for one EPT hierarchy.
+    ///
+    /// # Safety
+    /// The caller must run on the VMX-enabled CPU while no vCPU using this EPT
+    /// is executing.
+    pub unsafe fn flush_nested(&self, ept_pointer: u64) -> Result<(), Error> {
+        #[repr(C)]
+        struct InveptDescriptor {
+            ept_pointer: u64,
+            reserved: u64,
+        }
+        let descriptor = InveptDescriptor {
+            ept_pointer,
+            reserved: 0,
+        };
+        let kind = 1_u64;
+        let mut failed: u8;
+        unsafe {
+            asm!(
+                "invept {kind}, [{descriptor}]",
+                "setna {failed}",
+                kind = in(reg) kind,
+                descriptor = in(reg) &descriptor,
+                failed = lateout(reg_byte) failed,
+                options(nostack)
+            )
+        };
+        if failed == 0 {
+            Ok(())
+        } else {
+            Err(Error::ControlInstructionFailed)
+        }
+    }
+
     unsafe fn decode_exit(&self) -> Result<VmExit, Error> {
         // SAFETY: A VM exit returned through the configured host trampoline.
         let reason = unsafe { vmread(EXIT_REASON) } & 0xffff;
@@ -509,7 +543,14 @@ fn supports_ept(primary: u64, secondary: u64, ept: u64) -> bool {
     let ept_control = secondary >> 32 & (1 << 1) != 0;
     let four_level_walk = ept & (1 << 6) != 0;
     let write_back = ept & (1 << 14) != 0;
-    secondary_controls && ept_control && four_level_walk && write_back
+    let invept = ept & (1 << 20) != 0;
+    let single_context_invept = ept & (1 << 25) != 0;
+    secondary_controls
+        && ept_control
+        && four_level_walk
+        && write_back
+        && invept
+        && single_context_invept
 }
 
 unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
@@ -659,7 +700,7 @@ unsafe fn initialize_guest_state(config: GuestConfig) -> Result<(), Error> {
         vmwrite(GUEST_RIP, config.entry)?;
         vmwrite(GUEST_RFLAGS, 2)?;
         vmwrite(GUEST_DEBUGCTL, 0)?;
-        vmwrite(GUEST_EFER, (1 << 8) | (1 << 10))?;
+        vmwrite(GUEST_EFER, (1 << 8) | (1 << 10) | (1 << 11))?;
         vmwrite(VMCS_LINK_POINTER, u64::MAX)?;
         vmwrite(GUEST_INTERRUPTIBILITY, 0)?;
         vmwrite(GUEST_ACTIVITY_STATE, 0)?;
@@ -890,10 +931,12 @@ mod tests {
     fn ept_requires_secondary_control_four_levels_and_write_back() {
         let primary = (1u64 << 31) << 32;
         let secondary = (1u64 << 1) << 32;
-        let capabilities = (1 << 6) | (1 << 14);
+        let capabilities = (1 << 6) | (1 << 14) | (1 << 20) | (1 << 25);
         assert!(supports_ept(primary, secondary, capabilities));
         assert!(!supports_ept(primary, secondary, capabilities & !(1 << 6)));
         assert!(!supports_ept(primary, secondary, capabilities & !(1 << 14)));
+        assert!(!supports_ept(primary, secondary, capabilities & !(1 << 20)));
+        assert!(!supports_ept(primary, secondary, capabilities & !(1 << 25)));
         assert!(!supports_ept(0, secondary, capabilities));
         assert!(!supports_ept(primary, 0, capabilities));
     }

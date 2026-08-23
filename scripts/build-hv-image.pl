@@ -58,6 +58,10 @@ my %domain_images = (
         bin => 'event-bootstrap',
         path => "$mnu_dir/target/x86_64-unknown-none/release/event-bootstrap",
     },
+    'grant-bootstrap' => {
+        bin => 'grant-bootstrap',
+        path => "$mnu_dir/target/x86_64-unknown-none/release/grant-bootstrap",
+    },
     mochios => {
         bin => 'mochios-domain',
         path => "$mnu_dir/target/x86_64-unknown-none/release/mochios-domain",
