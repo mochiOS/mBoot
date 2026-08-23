@@ -1,0 +1,9 @@
+# mBoot Hypervisor
+
+このcrateは、LinuxをホストOSとして使わない新しいmBootの起動部分です。現在使われているLinuxベースのmBootとは別のバイナリとしてビルドされます。
+
+UEFIから起動し、ファームウェアのメモリマップを引き継いだあと、mBoot専用のGDTとIDTへ切り替えます。Intel CPUではVMX、AMD CPUではSVMを有効にします。ゲストの物理アドレス0にはmBootが所有する1ページだけを割り当て、IntelではEPT、AMDではNPTを使ってほかの物理メモリから隔離します。
+
+現在は仮想化機能を有効にしてDomainを実行直前の状態にするところまでです。VMCSとVMCBへゲストCPU状態を書き込み、実際にDomainへ入る処理は次の段階で追加します。既存のmBootイメージはまだこのバイナリへ切り替えません。
+
+ホスト上の単体テストは`make hv-test`、UEFIバイナリは`make hv-build`で生成します。KVMで仮想化機能を実際に有効化する試験は`make hv-qemu-test`で実行します。IntelホストではVMX、AMDホストではSVMが選ばれます。

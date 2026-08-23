@@ -1,5 +1,11 @@
 [workspace]
 members = [
+    "crates/mboot-hv",
+    "crates/mboot-protocol",
+    "crates/mbootd",
+    "crates/mock-mochios-agent",
+]
+default-members = [
     "crates/mboot-protocol",
     "crates/mbootd",
     "crates/mock-mochios-agent",
@@ -10,4 +16,3 @@ resolver = "2"
 edition = "2021"
 license = "MPL-2.0"
 version = "0.1.0"
-

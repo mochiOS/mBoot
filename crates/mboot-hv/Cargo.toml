@@ -1,0 +1,30 @@
+[package]
+name = "mboot-hv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Type-1 hypervisor for mochiOS"
+
+[lib]
+name = "mboot_hv"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mboot-hv"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["uefi-app"]
+
+[features]
+default = []
+uefi-app = ["dep:uefi"]
+
+[dependencies]
+uefi = { version = "0.30", default-features = false, optional = true }
+
+[lints.rust]
+unused = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

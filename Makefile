@@ -379,6 +379,8 @@ help:
 	@echo "  make build             Build disk.img and USB-writable mboot.iso with embedded mochiOS"
 	@echo "  make check             Run repository regression checks"
 	@echo "  make protocol-test     Test mBoot Control Protocol and Unix socket tools"
+	@echo "  make hv-test           Test the Type-1 hypervisor core on the host"
+	@echo "  make hv-build          Build the experimental Type-1 UEFI binary"
 	@echo "  make check-image       Validate the completed image and target"
 	@echo "  make check-reproducible  Build twice and compare the complete image hash"
 	@echo "  make check-qemu-usb    Boot the image through xHCI and EHCI USB storage"
@@ -387,3 +389,25 @@ help:
 	@echo "  make clean             Clean Buildroot outputs"
 	@echo "  make distclean         Remove the entire output directory"
 	@echo "  make rebuild           Clean and rebuild"
+HV_TOOLCHAIN ?= nightly-2026-05-14
+HV_TARGET_DIR ?= $(CURDIR)/output/hv-target
+
+.PHONY: hv-build hv-test hv-qemu-test
+
+hv-build:
+	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
+	RUSTFLAGS='-C panic=abort' $(HOST_CARGO) +$(HV_TOOLCHAIN) build \
+		--locked \
+		-Z build-std=core,compiler_builtins \
+		--release \
+		--target x86_64-unknown-uefi \
+		--target-dir $(HV_TARGET_DIR) \
+		--package mboot-hv \
+		--features uefi-app
+
+hv-test:
+	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
+	$(HOST_CARGO) test --locked --package mboot-hv --lib
+
+hv-qemu-test: hv-build
+	scripts/test-hv-qemu.sh
