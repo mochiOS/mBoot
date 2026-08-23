@@ -275,8 +275,9 @@ impl Vmx {
         if region_size == 0 || region_size > 4096 {
             return Err(Error::ControlRegionTooLarge);
         }
-        let supports_64_bit_phys = basic & (1 << 48) != 0;
-        if !supports_64_bit_phys && (vmxon_phys > u32::MAX as u64 || vmcs_phys > u32::MAX as u64) {
+        if !control_region_address_valid(basic, vmxon_phys)
+            || !control_region_address_valid(basic, vmcs_phys)
+        {
             return Err(Error::InvalidPage);
         }
         let revision_id = basic as u32 & 0x7fff_ffff;
@@ -346,8 +347,8 @@ impl Vmx {
             return Err(Error::InvalidState);
         }
         // SAFETY: VMX operation being active makes IA32_VMX_BASIC available.
-        let supports_64_bit_phys = unsafe { read_msr(IA32_VMX_BASIC) } & (1 << 48) != 0;
-        if !supports_64_bit_phys && vmcs_phys > u32::MAX as u64 {
+        let basic = unsafe { read_msr(IA32_VMX_BASIC) };
+        if !control_region_address_valid(basic, vmcs_phys) {
             return Err(Error::InvalidPage);
         }
         // SAFETY: VMX operation is active and this page has exclusive ownership.
@@ -473,6 +474,11 @@ fn validate_page(phys: u64) -> Result<(), Error> {
     } else {
         Ok(())
     }
+}
+
+fn control_region_address_valid(vmx_basic: u64, phys: u64) -> bool {
+    let restricted_to_32_bits = vmx_basic & (1 << 48) != 0;
+    !restricted_to_32_bits || phys <= u32::MAX as u64
 }
 
 fn adjusted_control_register(current: u64, fixed_zero: u64, fixed_one: u64) -> u64 {
@@ -860,6 +866,14 @@ mod tests {
         assert_eq!(validate_page(0), Err(Error::InvalidPage));
         assert_eq!(validate_page(0x1001), Err(Error::InvalidPage));
         assert_eq!(validate_page(0x2000), Ok(()));
+    }
+
+    #[test]
+    fn vmx_basic_bit_48_means_32_bit_address_restriction() {
+        let above_4_gib = 0x1_0000_0000;
+        assert!(control_region_address_valid(0, above_4_gib));
+        assert!(!control_region_address_valid(1 << 48, above_4_gib));
+        assert!(control_region_address_valid(1 << 48, u32::MAX as u64));
     }
 
     #[test]

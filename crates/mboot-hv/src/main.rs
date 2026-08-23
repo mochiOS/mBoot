@@ -516,8 +516,36 @@ fn load_file(boot_services: &BootServices, image: Handle, path: &str) -> Result<
 
 fn halt_with_error(stage: &str, error: mboot_hv::Error) -> ! {
     log!("{} initialization failed: {:?}", stage, error);
-    display::failure(10);
+    display::failure(halt_error_code(stage, error));
     halt()
+}
+
+fn halt_error_code(stage: &str, error: mboot_hv::Error) -> u8 {
+    match stage {
+        "nested page table" => 20,
+        "guest page tables" => 21,
+        "Domain image" => 22,
+        "virtualization" => match error {
+            mboot_hv::Error::VirtualizationDisabled => 31,
+            mboot_hv::Error::NestedPagingUnavailable => 32,
+            mboot_hv::Error::InvalidPage => 33,
+            mboot_hv::Error::ControlInstructionFailed => 34,
+            mboot_hv::Error::ControlRegionTooLarge => 35,
+            _ => 30,
+        },
+        "vCPU creation" => 36,
+        "Domain" => 40,
+        "Domain boot info" => 41,
+        "Domain start" => 42,
+        "vCPU entry" => match error {
+            mboot_hv::Error::GuestEntryFailed => 51,
+            mboot_hv::Error::ControlInstructionFailed => 52,
+            _ => 50,
+        },
+        "Domain Hypercall" => 53,
+        "Domain stop" => 54,
+        _ => 10,
+    }
 }
 
 fn halt() -> ! {
