@@ -117,6 +117,7 @@ const HOST_IDTR_BASE: u64 = 0x6c0e;
 const HOST_SYSENTER_ESP: u64 = 0x6c10;
 const HOST_SYSENTER_EIP: u64 = 0x6c12;
 const EXIT_REASON: u64 = 0x4402;
+const VM_INSTRUCTION_ERROR: u64 = 0x4400;
 const EXIT_INSTRUCTION_LENGTH: u64 = 0x440c;
 const HLT_EXIT_REASON: u64 = 12;
 const VMCALL_EXIT_REASON: u64 = 18;
@@ -383,7 +384,7 @@ impl Vmx {
             return Err(Error::InvalidState);
         }
         // SAFETY: This vCPU owns the VMCS and VMX operation is active.
-        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::ControlInstructionFailed)? };
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
         // SAFETY: VMX is active and all VMCS host/guest values are supplied here.
         unsafe { initialize_vmcs(config)? };
         self.run_context = VmxRunContext {
@@ -393,7 +394,11 @@ impl Vmx {
         };
         // SAFETY: The VMCS host RIP/RSP target the assembly return trampoline.
         if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
-            return Err(Error::GuestEntryFailed);
+            // SAFETY: VMfailValid leaves the current VMCS readable. A zero value
+            // is retained if the processor reported VMfailInvalid instead.
+            return Err(Error::GuestEntryFailed(unsafe {
+                vmread(VM_INSTRUCTION_ERROR)
+            }));
         }
         // SAFETY: VMLAUNCH returned only through a VM exit.
         unsafe { self.decode_exit() }
@@ -408,7 +413,7 @@ impl Vmx {
             return Err(Error::InvalidState);
         }
         // SAFETY: This reloads the stopped VMCS after another vCPU may have run.
-        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::ControlInstructionFailed)? };
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
         // SAFETY: VMEXIT left a current, stopped VMCS with readable exit fields.
         let (rip, instruction_len) =
             unsafe { (vmread(GUEST_RIP), vmread(EXIT_INSTRUCTION_LENGTH)) };
@@ -418,7 +423,11 @@ impl Vmx {
         self.run_context.resume = 1;
         // SAFETY: The VMCS and captured register state belong to this stopped vCPU.
         if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
-            return Err(Error::GuestEntryFailed);
+            // SAFETY: VMfailValid leaves the current VMCS readable. A zero value
+            // is retained if the processor reported VMfailInvalid instead.
+            return Err(Error::GuestEntryFailed(unsafe {
+                vmread(VM_INSTRUCTION_ERROR)
+            }));
         }
         // SAFETY: VMRESUME returned only through a VM exit.
         unsafe { self.decode_exit() }
@@ -765,7 +774,7 @@ unsafe fn vmwrite(field: u64, value: u64) -> Result<(), Error> {
     if failed == 0 {
         Ok(())
     } else {
-        Err(Error::ControlInstructionFailed)
+        Err(Error::VmcsWriteFailed(field))
     }
 }
 

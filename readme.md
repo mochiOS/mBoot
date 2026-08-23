@@ -152,6 +152,10 @@ make hv-image-test
 | 54 | Domainを停止できません |
 | 99 | mBoot内でpanicが発生しました |
 
+赤い画面に`VMCS`と4桁の16進数が表示された場合、その番号は書き込みに失敗した
+VMCSフィールドです。`VMX`と4桁の番号が表示された場合は、Intel CPUが返した
+VM-instruction errorです。
+
 ## USBまたはSSDから実機起動
 
 `output/images/mboot.iso`または`disk.img`を、ファイルとしてコピーするのではなく、

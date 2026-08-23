@@ -59,6 +59,30 @@ pub fn failure(code: u8) {
     draw_centered(&digits, line_y(2));
 }
 
+pub fn vmcs_failure(field: u64) {
+    show(0x006B_2028, b"MBOOT", b"VMCS");
+    draw_hex(field, line_y(2));
+}
+
+pub fn vm_entry_failure(instruction_error: u64) {
+    show(0x006B_2028, b"MBOOT", b"VMX");
+    draw_hex(instruction_error, line_y(2));
+}
+
+fn draw_hex(value: u64, y: usize) {
+    let mut digits = [b'0'; 4];
+    for (index, digit) in digits.iter_mut().enumerate() {
+        let shift = (3 - index) * 4;
+        let nibble = ((value >> shift) & 0xf) as u8;
+        *digit = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'A' + nibble - 10
+        };
+    }
+    draw_centered(&digits, y);
+}
+
 fn show(background: u32, title: &[u8], status: &[u8]) {
     if ADDRESS.load(Ordering::Acquire) == 0 {
         return;
@@ -163,8 +187,10 @@ fn glyph(character: u8) -> [u8; 7] {
         b'9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
         b'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
         b'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        b'C' => [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111],
         b'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
         b'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        b'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
         b'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
         b'I' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111],
         b'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],

@@ -516,7 +516,13 @@ fn load_file(boot_services: &BootServices, image: Handle, path: &str) -> Result<
 
 fn halt_with_error(stage: &str, error: mboot_hv::Error) -> ! {
     log!("{} initialization failed: {:?}", stage, error);
-    display::failure(halt_error_code(stage, error));
+    match error {
+        mboot_hv::Error::VmcsWriteFailed(field) => display::vmcs_failure(field),
+        mboot_hv::Error::GuestEntryFailed(instruction_error) => {
+            display::vm_entry_failure(instruction_error)
+        }
+        _ => display::failure(halt_error_code(stage, error)),
+    }
     halt()
 }
 
@@ -538,8 +544,8 @@ fn halt_error_code(stage: &str, error: mboot_hv::Error) -> u8 {
         "Domain boot info" => 41,
         "Domain start" => 42,
         "vCPU entry" => match error {
-            mboot_hv::Error::GuestEntryFailed => 51,
-            mboot_hv::Error::ControlInstructionFailed => 52,
+            mboot_hv::Error::GuestEntryFailed(_) => 51,
+            mboot_hv::Error::VmcsLoadFailed => 52,
             _ => 50,
         },
         "Domain Hypercall" => 53,
