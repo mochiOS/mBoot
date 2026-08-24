@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #define SYS_WRITE 1
+#define SYS_OPEN 2
 #define SYS_PAUSE 34
 #define SYS_MOUNT 165
 
@@ -27,9 +28,9 @@ static long syscall5(long number, long arg0, long arg1, long arg2, long arg3, lo
     return result;
 }
 
-static void write_message(const char *message, unsigned long length)
+static void write_message(long descriptor, const char *message, unsigned long length)
 {
-    syscall5(SYS_WRITE, 1, (long)message, (long)length, 0, 0);
+    syscall5(SYS_WRITE, descriptor, (long)message, (long)length, 0, 0);
 }
 
 static void mount_filesystem(const char *source, const char *target, const char *type)
@@ -40,15 +41,20 @@ static void mount_filesystem(const char *source, const char *target, const char 
 __attribute__((noreturn)) void _start(void)
 {
     static const char starting[] = "mDriver starting\n";
-    static const char thanks[] = "Linuxを作り、育ててきた皆さんに感謝します。\n";
     static const char ready[] = "mDriver OK\n";
+    long log;
 
-    write_message(starting, sizeof(starting) - 1);
-    write_message(thanks, sizeof(thanks) - 1);
     mount_filesystem("devtmpfs", "/dev", "devtmpfs");
+    log = syscall5(SYS_OPEN, (long)"/dev/kmsg", 1, 0, 0, 0);
+    if (log < 0)
+        log = syscall5(SYS_OPEN, (long)"/dev/console", 1, 0, 0, 0);
+    if (log < 0)
+        log = 1;
+
+    write_message(log, starting, sizeof(starting) - 1);
     mount_filesystem("proc", "/proc", "proc");
     mount_filesystem("sysfs", "/sys", "sysfs");
-    write_message(ready, sizeof(ready) - 1);
+    write_message(log, ready, sizeof(ready) - 1);
 
     for (;;)
         syscall1(SYS_PAUSE, 0);

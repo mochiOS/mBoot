@@ -30,7 +30,7 @@ image = "mdriver"
 path = '\EFI\MBOOT\MDRIVER.ELF'
 initramfs = "mdriver"
 initramfs_path = '\EFI\MBOOT\MDRIVER.CPIO'
-command_line = "earlycon=uart,io,0x3f8 ignore_loglevel rdinit=/init pci=off acpi=off maxcpus=0 panic=-1"
+command_line = "earlycon=uart,io,0x3f8 console=ttyS0 rdinit=/init pci=off acpi=off maxcpus=0 panic=-1"
 autostart = true
 required = true
 restart = "never"
