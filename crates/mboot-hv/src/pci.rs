@@ -307,6 +307,12 @@ impl AssignmentTable {
             .any(|assignment| assignment.valid && assignment.active)
     }
 
+    pub fn has_active_for_domain(&self, domain_id: u32) -> bool {
+        self.assignments.iter().any(|assignment| {
+            assignment.valid && assignment.active && assignment.domain_id == domain_id
+        })
+    }
+
     fn assignment(&self, domain_id: u32, requester: u16) -> Option<&Assignment> {
         self.assignments.iter().find(|assignment| {
             assignment.valid
@@ -501,10 +507,22 @@ pub unsafe fn probe_descriptor(requester: u16) -> Result<PciDescriptor, PciError
 /// Called by the common device interrupt entry installed for vectors 0x50..0x6f.
 pub fn acknowledge_device_interrupt() {
     if let Some(vector) = active_device_vector() {
-        PENDING_DEVICE_INTERRUPTS
-            .fetch_or(1_u32 << (vector - DEVICE_VECTOR_FIRST), Ordering::Release);
+        record_device_interrupt(vector);
     }
     timer::acknowledge();
+}
+
+/// Records a vector supplied by VMX's exit-interruption information and EOIs
+/// the physical interrupt that caused the VM exit.
+pub fn acknowledge_vmexit_interrupt(vector: u8) {
+    if (DEVICE_VECTOR_FIRST..=DEVICE_VECTOR_LAST).contains(&vector) {
+        record_device_interrupt(vector);
+    }
+    timer::acknowledge();
+}
+
+fn record_device_interrupt(vector: u8) {
+    PENDING_DEVICE_INTERRUPTS.fetch_or(1_u32 << (vector - DEVICE_VECTOR_FIRST), Ordering::Release);
 }
 
 pub fn take_pending_device_interrupts() -> u32 {
@@ -530,9 +548,9 @@ fn active_device_vector() -> Option<u8> {
         for bit in (0..32_u8).rev() {
             if bits & (1_u32 << bit) != 0 {
                 let vector = register as u8 * 32 + bit;
-                return (DEVICE_VECTOR_FIRST..=DEVICE_VECTOR_LAST)
-                    .contains(&vector)
-                    .then_some(vector);
+                if (DEVICE_VECTOR_FIRST..=DEVICE_VECTOR_LAST).contains(&vector) {
+                    return Some(vector);
+                }
             }
         }
     }
@@ -1100,8 +1118,11 @@ mod tests {
         assignments
             .insert(2, descriptor(0x10, &[0x1000]), 0x1b_0000, 0x4_0000)
             .unwrap();
+        assert!(!assignments.has_active_for_domain(2));
         assignments.assignments[0].active = true;
         assignments.assignments[0].guest_vector = 0x42;
+        assert!(assignments.has_active_for_domain(2));
+        assert!(!assignments.has_active_for_domain(3));
         let mut routed = assignments.route_pending(1);
         assert_eq!(routed.next(), Some((2, 0x42)));
         assert_eq!(routed.next(), None);

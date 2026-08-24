@@ -398,7 +398,7 @@ HV_LAUNCH_MANIFEST ?= $(CURDIR)/output/hv/launch.manifest
 HV_OUTPUT_IMAGE ?= $(CURDIR)/output/mochiOS.iso
 MNU_ABI_PATCH := --config 'patch."https://github.com/mochiOS/mnu".mnu-abi.path="$(MNU_DIR)/crates/abi"'
 
-.PHONY: hv-build hv-domain-build hv-image hv-image-test hv-manifest hv-test hv-qemu-test
+.PHONY: hv-build hv-device-io-test hv-domain-build hv-image hv-image-test hv-manifest hv-test hv-qemu-test
 
 hv-domain-build:
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
@@ -445,6 +445,10 @@ hv-image-test: hv-image
 	HV_CONFIG="$(HV_CONFIG)" \
 	HV_DISK_IMAGE="$(HV_OUTPUT_IMAGE)" \
 		scripts/test-hv-disk-image.sh
+
+hv-device-io-test:
+	MBOOT_HOST_CARGO="$(HOST_CARGO)" MBOOT_HOST_RUSTC="$(HOST_RUSTC)" \
+		MNU_DIR="$(MNU_DIR)" scripts/test-hv-device-io.sh
 
 hv-qemu-test: hv-domain-build hv-build
 	RING_BOOTSTRAP_DOMAIN_ELF="$(RING_BOOTSTRAP_DOMAIN_ELF)" \

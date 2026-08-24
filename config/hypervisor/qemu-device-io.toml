@@ -1,0 +1,39 @@
+version = 4
+toolchain = "nightly-2026-05-14"
+disk_size_mib = 96
+esp_size_mib = 64
+disk_guid = "6d426f6f-7400-4b00-8a00-000000000400"
+esp_guid = "6d426f6f-7400-4b00-8a00-000000000401"
+
+[[domains]]
+id = 1
+role = "system"
+memory_mib = 2
+vcpus = 1
+capabilities = 0
+image = "mochios"
+path = '\EFI\MBOOT\MOCHIOS.ELF'
+autostart = true
+required = true
+restart = "never"
+max_restarts = 0
+
+[[domains]]
+id = 2
+role = "hardware"
+memory_mib = 2
+vcpus = 1
+capabilities = 0x3
+image = "hardware-bootstrap"
+path = '\EFI\MBOOT\HARDWARE.ELF'
+autostart = true
+required = true
+restart = "never"
+max_restarts = 0
+
+[[devices]]
+segment = 0
+requester = 0x18
+kind = "block"
+domain = 2
+required = true

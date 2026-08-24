@@ -690,9 +690,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     let mut scheduler = CooperativeScheduler::new();
     loop {
         let pending_devices = pci::take_pending_device_interrupts();
-        let routed_interrupts: Vec<(u32, u8)> =
-            pci_assignments.route_pending(pending_devices).collect();
-        for (domain_id, vector) in routed_interrupts {
+        for (domain_id, vector) in pci_assignments.route_pending(pending_devices) {
             let Some(target) = runtime_domains
                 .iter()
                 .position(|runtime| runtime.domain.id().get() == domain_id)
@@ -804,6 +802,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             Err(error) => halt_with_error("vCPU entry", error),
         };
         if vm_exit.reason == VmExitReason::Preempted {
+            // VMX acknowledges the interrupt during VM exit and reports its
+            // vector here. SVM dispatches the pending interrupt through the
+            // host IDT before returning from its backend.
+            if vm_exit.fault_info & (1 << 31) != 0 {
+                pci::acknowledge_vmexit_interrupt(vm_exit.fault_info as u8);
+            }
             runtime.preemption_count += 1;
             if runtime.preemption_count <= 3 {
                 log!(
@@ -1350,7 +1354,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             let valid = vm_exit.arg0 == 0
                 && vm_exit.arg1 == 0
                 && vm_exit.arg2 == 0
-                && runtime_domains[index].event_irq_enabled;
+                && (runtime_domains[index].event_irq_enabled
+                    || pci_assignments.has_active_for_domain(receiver.get()));
             let completed = if valid {
                 runtime_domains[index].interrupts.eoi().ok()
             } else {
@@ -1586,21 +1591,28 @@ fn cleanup_domain_resources(
 ) {
     let domain_id = runtime_domains[index].domain.id();
     let crashed = runtime_domains[index].domain.state() == DomainState::Crashed;
-    let claimed_requesters: Vec<u16> = devices.claimed_requesters(domain_id.get()).collect();
-    for requester in &claimed_requesters {
+    let mut released_devices = 0;
+    loop {
+        let requester = {
+            let mut claimed = devices.claimed_requesters(domain_id.get());
+            claimed.next()
+        };
+        let Some(requester) = requester else {
+            break;
+        };
         if !release_pci_device(
             index,
             runtime_domains,
             devices,
             pci_assignments,
             dma_remapper,
-            *requester,
+            requester,
             true,
         ) {
             halt_with_error("PCI device cleanup", mboot_hv::Error::InvalidState)
         }
+        released_devices += 1;
     }
-    let released_devices = claimed_requesters.len();
     if released_devices != 0 {
         log!(
             "Domain {} returned {} PCI device(s)",

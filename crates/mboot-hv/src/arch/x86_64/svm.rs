@@ -113,6 +113,11 @@ global_asm!(
     "mov rax, [rsp + 8]",
     "sti",
     "vmrun rax",
+    // VMEXIT clears GIF. Briefly open it so the pending host interrupt is
+    // dispatched through mBoot's IDT, then close it before handling the exit.
+    "stgi",
+    "nop",
+    "clgi",
     "cli",
     "push rbx",
     "push rbp",
@@ -413,23 +418,20 @@ impl Svm {
         // SAFETY: VMEXIT saved guest RAX in the VMCB state area.
         self.run_context.rax = unsafe { read_u64(self.vmcb_phys, VMCB_RAX) };
         match exit_code {
-            SVM_EXIT_INTR => {
-                super::timer::acknowledge();
-                Ok(VmExit {
-                    reason: VmExitReason::Preempted,
-                    raw_reason: exit_code,
-                    hypercall_number: 0,
-                    arg0: 0,
-                    arg1: 0,
-                    arg2: 0,
-                    msr: 0,
-                    msr_value: 0,
-                    cpuid_leaf: 0,
-                    cpuid_subleaf: 0,
-                    fault_address: 0,
-                    fault_info: 0,
-                })
-            }
+            SVM_EXIT_INTR => Ok(VmExit {
+                reason: VmExitReason::Preempted,
+                raw_reason: exit_code,
+                hypercall_number: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+                msr: 0,
+                msr_value: 0,
+                cpuid_leaf: 0,
+                cpuid_subleaf: 0,
+                fault_address: 0,
+                fault_info: 0,
+            }),
             SVM_EXIT_HLT => Ok(VmExit {
                 reason: VmExitReason::Halt,
                 raw_reason: exit_code,

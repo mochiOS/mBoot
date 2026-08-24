@@ -645,8 +645,7 @@ impl Vmx {
             }),
             EXTERNAL_INTERRUPT_EXIT_REASON => {
                 let info = unsafe { vmread(EXIT_INTERRUPTION_INFO) };
-                if info & (1 << 31) != 0 && info as u8 == super::timer::VECTOR {
-                    super::timer::acknowledge();
+                if info & (1 << 31) != 0 && info & (7 << 8) == 0 {
                     Ok(VmExit {
                         reason: VmExitReason::Preempted,
                         raw_reason: reason,
@@ -659,7 +658,7 @@ impl Vmx {
                         cpuid_leaf: 0,
                         cpuid_subleaf: 0,
                         fault_address: 0,
-                        fault_info: 0,
+                        fault_info: info,
                     })
                 } else {
                     Err(Error::UnexpectedVmExit(reason))
