@@ -1,0 +1,45 @@
+MDRIVER_DIR := $(CURDIR)
+BUILDROOT_DIR := $(MDRIVER_DIR)/buildroot
+OUTPUT_DIR := $(MDRIVER_DIR)/output
+DL_DIR := $(MDRIVER_DIR)/dl
+BR2_EXTERNAL := $(MDRIVER_DIR)
+BR2_MAKE := $(MDRIVER_DIR)/scripts/buildroot-make.sh
+SETUP_STAMP := $(MDRIVER_DIR)/.cache/setup-complete
+JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+
+.PHONY: all build build-offline clean defconfig distclean legal-info setup source
+
+all: build
+
+setup:
+	@$(MDRIVER_DIR)/scripts/setup-buildroot.sh
+
+defconfig: setup
+	@$(BR2_MAKE) mdriver_x86_64_defconfig
+	@$(BR2_MAKE) check-dependencies
+
+source: defconfig
+	@$(BR2_MAKE) source
+
+$(SETUP_STAMP): $(MDRIVER_DIR)/../setup.sh \
+		$(MDRIVER_DIR)/configs/mdriver_x86_64_defconfig \
+		$(MDRIVER_DIR)/board/mdriver/linux.config
+	@MNU_DIR="$(abspath $(MDRIVER_DIR)/../../core)" $(MDRIVER_DIR)/../setup.sh
+
+build: $(SETUP_STAMP)
+	@$(BR2_MAKE) -j$(JOBS)
+	@$(MDRIVER_DIR)/scripts/publish-artifacts.sh
+
+build-offline: defconfig
+	@$(BR2_MAKE) BR2_PRIMARY_SITE_ONLY=y -j$(JOBS)
+	@$(MDRIVER_DIR)/scripts/publish-artifacts.sh
+
+legal-info: build
+	@$(BR2_MAKE) legal-info
+
+clean:
+	@$(BR2_MAKE) clean
+	@rm -f "$(SETUP_STAMP)"
+
+distclean:
+	@rm -rf "$(BUILDROOT_DIR)" "$(OUTPUT_DIR)" "$(DL_DIR)" "$(MDRIVER_DIR)/.cache"

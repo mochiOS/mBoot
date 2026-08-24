@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-IMAGE=${HV_DISK_IMAGE:-$ROOT/output/driver-linux.iso}
+IMAGE=${HV_DISK_IMAGE:-$ROOT/output/mdriver.iso}
 QEMU=${QEMU:-qemu-system-x86_64}
 ACCEL=${HV_ACCEL:-auto}
 if [[ $ACCEL == auto ]]; then
@@ -33,7 +33,7 @@ cleanup() {
 }
 trap cleanup EXIT
 cp "$OVMF_VARS" "$WORK/OVMF_VARS.fd"
-cp --sparse=always "$IMAGE" "$WORK/driver-linux.iso"
+cp --sparse=always "$IMAGE" "$WORK/mdriver.iso"
 
 "$QEMU" \
     -accel "$ACCEL" \
@@ -44,7 +44,7 @@ cp --sparse=always "$IMAGE" "$WORK/driver-linux.iso"
     -m 512 \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd" \
-    -drive "if=none,id=disk,format=raw,file=$WORK/driver-linux.iso" \
+    -drive "if=none,id=disk,format=raw,file=$WORK/mdriver.iso" \
     -device virtio-blk-pci,drive=disk,bootindex=1 \
     -display none \
     -monitor none \
@@ -55,9 +55,9 @@ cp --sparse=always "$IMAGE" "$WORK/driver-linux.iso"
 QEMU_PID=$!
 
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
-    if grep -Fq 'Driver Linux OK' "$WORK/serial.log" 2>/dev/null; then
-        grep -E '\[mBoot\]|Driver Linux OK|Linux version' "$WORK/serial.log"
-        echo 'test-driver-linux: PASS'
+    if grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null; then
+        grep -E '\[mBoot\]|mDriver OK|Linux version' "$WORK/serial.log"
+        echo 'test-mdriver: PASS'
         exit 0
     fi
     kill -0 "$QEMU_PID" 2>/dev/null || break
@@ -65,5 +65,5 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
 done
 
 sed -n '1,240p' "$WORK/serial.log" >&2
-echo 'test-driver-linux: Driver Linux did not reach init' >&2
+echo 'test-mdriver: mDriver did not reach init' >&2
 exit 1

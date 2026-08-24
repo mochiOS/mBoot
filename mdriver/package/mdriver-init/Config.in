@@ -1,0 +1,4 @@
+config BR2_PACKAGE_MDRIVER_INIT
+	bool "mDriver init"
+	help
+	  Install the minimal PID 1 used by the mDriver Hardware Domain.

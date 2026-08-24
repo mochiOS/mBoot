@@ -1,0 +1,2 @@
+# Linux headers use the same pinned kernel.org archive as the kernel.
+sha256  a62b6a2d207ff72510e5f47156b7078e1e71797357412411b8e4fff97fc8f4c7  linux-6.12.98.tar.xz

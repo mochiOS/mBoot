@@ -75,10 +75,10 @@ my %domain_images = (
         bin => 'hardware-bootstrap',
         path => "$mnu_dir/target/x86_64-unknown-none/release/hardware-bootstrap",
     },
-    'driver-linux' => { path => $ENV{MBOOT_DRIVER_LINUX_KERNEL} },
+    'mdriver' => { path => $ENV{MBOOT_MDRIVER_KERNEL} },
 );
 my %initramfs_images = (
-    'driver-linux' => $ENV{MBOOT_DRIVER_LINUX_INITRAMFS},
+    'mdriver' => $ENV{MBOOT_MDRIVER_INITRAMFS},
 );
 my %required_images;
 my %required_initramfs;
@@ -92,17 +92,17 @@ for my $domain (@{$config->{domains}}) {
         $required_initramfs{$domain->{initramfs}} = 1;
     }
 }
-if ($required_images{'driver-linux'}) {
-    defined $domain_images{'driver-linux'}->{path}
-        && length $domain_images{'driver-linux'}->{path}
-        or die "Driver Linux kernel is required; set DRIVER_LINUX_KERNEL=/path/to/vmlinux\n";
-    defined $initramfs_images{'driver-linux'}
-        && length $initramfs_images{'driver-linux'}
-        or die "Driver Linux initramfs is required; set DRIVER_LINUX_INITRAMFS=/path/to/initramfs.cpio\n";
-    $domain_images{'driver-linux'}->{path}
-        = absolute_existing($domain_images{'driver-linux'}->{path});
-    $initramfs_images{'driver-linux'}
-        = absolute_existing($initramfs_images{'driver-linux'});
+if ($required_images{'mdriver'}) {
+    defined $domain_images{'mdriver'}->{path}
+        && length $domain_images{'mdriver'}->{path}
+        or die "mDriver kernel is required; set MDRIVER_KERNEL=/path/to/vmlinux\n";
+    defined $initramfs_images{'mdriver'}
+        && length $initramfs_images{'mdriver'}
+        or die "mDriver initramfs is required; set MDRIVER_INITRAMFS=/path/to/initramfs.cpio\n";
+    $domain_images{'mdriver'}->{path}
+        = absolute_existing($domain_images{'mdriver'}->{path});
+    $initramfs_images{'mdriver'}
+        = absolute_existing($initramfs_images{'mdriver'});
 }
 my @native_images = grep { defined $domain_images{$_}->{bin} } sort keys %required_images;
 if (@native_images) {

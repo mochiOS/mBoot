@@ -1,6 +1,6 @@
 # mBoot
 
-mBootは、mnuのABIを使ってmochiOSとDriver Linuxを動かすx86_64向けType-1ハイパーバイザーです。UEFIから直接起動します。LinuxをホストOSとして起動する旧方式は、このリポジトリから削除しました。
+mBootは、mnuのABIを使ってmochiOSとmDriverを動かすx86_64向けType-1ハイパーバイザーです。UEFIから直接起動します。LinuxをホストOSとして起動する旧方式は、このリポジトリから削除しました。
 
 Intel CPUではVMXとEPT、AMD CPUではSVMとNPTを使います。mBootが管理するのはCPU、RAM、IOMMU、PCIデバイス、割り込み、Domain間の共有ページです。ファイルシステム、ネットワーク、GUI、一般的なデバイスドライバは持ちません。
 
@@ -33,17 +33,17 @@ make image MNU_DIR=/path/to/mnu CONFIG=config/intel-hardware.toml
 
 mochiOSワークスペースからは、ルートで`make mboot`を実行します。通常の出力先は`out/mochiOS.iso`です。
 
-## Driver Linux
+## mDriver
 
-Driver LinuxはmBootの外でビルドします。mBootは署名やハッシュを確認できる完成済みのkernelとinitramfsだけを受け取ります。この分離により、mBootのクリーンビルドにBuildrootやLinuxのソースツリーは要りません。
+mDriverはmBootの外でビルドします。mBootは署名やハッシュを確認できる完成済みのkernelとinitramfsだけを受け取ります。この分離により、mBootのクリーンビルドにBuildrootやLinuxのソースツリーは要りません。
 
-Driver Linuxを含む設定でイメージを作る場合は、2つの成果物を渡します。
+mDriverを含む設定でイメージを作る場合は、2つの成果物を渡します。
 
 ```sh
 make image \
-  CONFIG=config/qemu-driver-linux.toml \
-  DRIVER_LINUX_KERNEL=/path/to/vmlinux \
-  DRIVER_LINUX_INITRAMFS=/path/to/initramfs.cpio
+  CONFIG=config/qemu-mdriver.toml \
+  MDRIVER_KERNEL=/path/to/vmlinux \
+  MDRIVER_INITRAMFS=/path/to/initramfs.cpio
 ```
 
 指定したファイルがない場合、mBootは代わりのLinuxを自動生成せず、その場でエラーにします。古いBuildrootの出力を黙って使うこともありません。
