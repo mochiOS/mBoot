@@ -432,16 +432,37 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             );
         }
     }
+    let deferred_display = quarantine.display_requester.filter(|requester| {
+        !quarantine.active_requesters().contains(requester)
+            && iommu_topology.is_some_and(|topology| {
+                topology
+                    .units()
+                    .iter()
+                    .any(|unit| unit.covers_requester(*requester))
+            })
+    });
+    if let Some(requester) = deferred_display {
+        log!(
+            "PCI display {:02x}:{:02x}.{} keeps its firmware VT-d unit until the Hardware Domain takes ownership",
+            requester >> 8,
+            requester >> 3 & 0x1f,
+            requester & 7
+        );
+    }
     if let Some(topology) = iommu_topology {
         // SAFETY: Tables were allocated and zeroed before ExitBootServices, PCI
         // bus mastering is disabled, and mBoot now exclusively owns IOMMU MMIO.
-        if let Err(error) = unsafe { iommu::enable_deny_all(&topology, &iommu_tables) } {
+        if let Err(error) =
+            unsafe { iommu::enable_deny_all(&topology, &iommu_tables, deferred_display) }
+        {
             halt_with_error("IOMMU protection", iommu_error(error))
         }
         log!(
             "IOMMU DMA protection enabled: {:?} {}",
             topology.kind(),
-            if topology.reserved_mappings().is_empty() {
+            if deferred_display.is_some() {
+                "non-display protected; firmware display deferred"
+            } else if topology.reserved_mappings().is_empty() {
                 "deny-all"
             } else {
                 "firmware-reserved-only"

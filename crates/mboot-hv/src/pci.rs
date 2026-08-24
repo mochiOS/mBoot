@@ -11,6 +11,7 @@ pub struct QuarantineReport {
     pub bus_masters_disabled: u32,
     pub bus_masters_active: u32,
     pub first_active_requester: Option<u16>,
+    pub display_requester: Option<u16>,
     active_requesters: [u16; MAX_ACTIVE_REQUESTERS],
     active_requester_count: usize,
 }
@@ -95,6 +96,9 @@ unsafe fn quarantine_function(
     } else {
         None
     };
+    if class == 0x03 && report.display_requester.is_none() {
+        report.display_requester = Some(requester_id(bus, device, function));
+    }
     // Host bridges are the boundary between the CPU/memory fabric and PCI, not
     // PCI requester endpoints. Some Intel host bridges return a hardwired one
     // for Command.BusMaster and ignore attempts to clear it.

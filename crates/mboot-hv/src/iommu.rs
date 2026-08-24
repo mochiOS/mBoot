@@ -9,6 +9,7 @@ const ACPI_HEADER_SIZE: usize = 36;
 const IOMMU_TABLE_HEADER_SIZE: usize = 48;
 const MAX_ACPI_TABLE_SIZE: usize = 1024 * 1024;
 const MAX_IOMMU_UNITS: usize = 16;
+const MAX_UNIT_SCOPES: usize = 8;
 const MAX_RESERVED_MAPPINGS: usize = 32;
 const INTEL_TABLE_PAGES: usize = 64;
 const AMD_DEVICE_TABLE_PAGES: usize = 512;
@@ -37,6 +38,14 @@ pub struct IommuUnit {
     pub segment: u16,
     pub register_base: u64,
     pub include_all: bool,
+    scope_requesters: [u16; MAX_UNIT_SCOPES],
+    scope_count: usize,
+}
+
+impl IommuUnit {
+    pub fn covers_requester(&self, requester: u16) -> bool {
+        self.scope_requesters[..self.scope_count].contains(&requester)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +67,8 @@ const EMPTY_UNIT: IommuUnit = IommuUnit {
     segment: 0,
     register_base: 0,
     include_all: false,
+    scope_requesters: [0; MAX_UNIT_SCOPES],
+    scope_count: 0,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,11 +163,17 @@ pub const fn deny_all_table_pages(kind: IommuKind) -> usize {
 pub unsafe fn enable_deny_all(
     topology: &IommuTopology,
     table_addresses: &[u64],
+    deferred_requester: Option<u16>,
 ) -> Result<(), Error> {
     if table_addresses.len() != topology.unit_count {
         return Err(Error::InvalidResources);
     }
     for (unit, table_address) in topology.units().iter().zip(table_addresses) {
+        if topology.kind == IommuKind::IntelVtd
+            && deferred_requester.is_some_and(|requester| unit.covers_requester(requester))
+        {
+            continue;
+        }
         if unit.segment != 0 || *table_address == 0 || *table_address & 0xfff != 0 {
             return Err(Error::InvalidResources);
         }
@@ -471,6 +488,8 @@ pub fn parse_dmar(table: &[u8]) -> Result<IommuTopology, Error> {
                     segment: read_u16(structure, 6)?,
                     register_base: read_u64(structure, 8)?,
                     include_all: structure[4] & 1 != 0,
+                    scope_requesters: parse_direct_scopes(&structure[16..])?,
+                    scope_count: count_direct_scopes(&structure[16..])?,
                 })
             }
             1 => parse_rmrr(structure, &mut topology),
@@ -481,6 +500,55 @@ pub fn parse_dmar(table: &[u8]) -> Result<IommuTopology, Error> {
         return Err(Error::InvalidTable);
     }
     Ok(topology)
+}
+
+fn parse_direct_scopes(scopes: &[u8]) -> Result<[u16; MAX_UNIT_SCOPES], Error> {
+    let mut requesters = [0_u16; MAX_UNIT_SCOPES];
+    let mut count = 0;
+    walk_device_scopes(scopes, |requester| {
+        if count == requesters.len() {
+            return Err(Error::TooManyUnits);
+        }
+        requesters[count] = requester;
+        count += 1;
+        Ok(())
+    })?;
+    Ok(requesters)
+}
+
+fn count_direct_scopes(scopes: &[u8]) -> Result<usize, Error> {
+    let mut count = 0;
+    walk_device_scopes(scopes, |_| {
+        count += 1;
+        Ok(())
+    })?;
+    Ok(count)
+}
+
+fn walk_device_scopes(
+    mut scopes: &[u8],
+    mut visit: impl FnMut(u16) -> Result<(), Error>,
+) -> Result<(), Error> {
+    while !scopes.is_empty() {
+        if scopes.len() < 6 {
+            return Err(Error::InvalidTable);
+        }
+        let length = usize::from(scopes[1]);
+        if length < 8 || length > scopes.len() || !(length - 6).is_multiple_of(2) {
+            return Err(Error::InvalidTable);
+        }
+        if matches!(scopes[0], 1 | 2) && length == 8 {
+            let bus = u16::from(scopes[5]);
+            let device = u16::from(scopes[6]);
+            let function = u16::from(scopes[7]);
+            if device >= 32 || function >= 8 {
+                return Err(Error::InvalidTable);
+            }
+            visit(bus << 8 | device << 3 | function)?;
+        }
+        scopes = &scopes[length..];
+    }
+    Ok(())
 }
 
 fn parse_rmrr(structure: &[u8], topology: &mut IommuTopology) -> Result<(), Error> {
@@ -538,6 +606,8 @@ pub fn parse_ivrs(table: &[u8]) -> Result<IommuTopology, Error> {
             segment: read_u16(structure, 16)?,
             register_base: read_u64(structure, 8)?,
             include_all: true,
+            scope_requesters: [0; MAX_UNIT_SCOPES],
+            scope_count: 0,
         })
     })?;
     if topology.unit_count == 0 {
@@ -654,6 +724,23 @@ mod tests {
         assert_eq!(topology.kind(), IommuKind::IntelVtd);
         assert_eq!(topology.units()[0].segment, 2);
         assert!(topology.units()[0].include_all);
+    }
+
+    #[test]
+    fn parses_a_direct_requester_scope_for_an_intel_unit() {
+        let mut table = [0_u8; 72];
+        table[48..50].copy_from_slice(&0_u16.to_le_bytes());
+        table[50..52].copy_from_slice(&24_u16.to_le_bytes());
+        table[56..64].copy_from_slice(&0xfed9_0000_u64.to_le_bytes());
+        table[64] = 1;
+        table[65] = 8;
+        table[69] = 0;
+        table[70] = 2;
+        table[71] = 0;
+        finish_table(&mut table, b"DMAR");
+        let topology = parse_dmar(&table).unwrap();
+        assert!(topology.units()[0].covers_requester(0x0010));
+        assert!(!topology.units()[0].covers_requester(0x0018));
     }
 
     #[test]
