@@ -994,6 +994,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             stopped_domains,
             crashed_domains
         );
+        display::isolation_success();
     } else {
         log!(
             "{} resident Domain(s) waiting; {} crash(es) isolated",

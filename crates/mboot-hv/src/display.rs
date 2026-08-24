@@ -53,6 +53,10 @@ pub fn bootstrap_success() {
     show(0x0017_4F35, b"MBOOT", b"MNU OK");
 }
 
+pub fn isolation_success() {
+    show(0x0017_4F35, b"MBOOT", b"ISOLATION OK");
+}
+
 pub fn mochios_ready() {
     show(0x0017_4F35, b"MBOOT", b"MOCHIOS OK");
 }
