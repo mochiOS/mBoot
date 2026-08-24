@@ -208,9 +208,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             return Status::SECURITY_VIOLATION;
         }
         log!(
-            "IOMMU description {:?}: {} remapping unit(s)",
+            "IOMMU description {:?}: {} remapping unit(s), {} reserved mapping(s)",
             topology.kind(),
-            topology.unit_count()
+            topology.unit_count(),
+            topology.reserved_mappings().len()
         );
         for unit in topology.units() {
             log!(
@@ -399,18 +400,37 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         );
     }
     if quarantine.bus_masters_active != 0 {
-        if let Some(requester) = quarantine.first_active_requester {
-            display::pci_dma_failure(requester);
-            log!(
-                "PCI DMA quarantine initialization failed: {:?}",
-                mboot_hv::Error::DeviceQuarantineFailed
-            );
-            halt()
+        let every_active_requester_is_reserved = quarantine.recorded_every_active_requester()
+            && iommu_topology.is_some_and(|topology| {
+                quarantine.active_requesters().iter().all(|requester| {
+                    topology
+                        .reserved_mappings()
+                        .iter()
+                        .any(|mapping| mapping.segment == 0 && mapping.requester == *requester)
+                })
+            });
+        if !every_active_requester_is_reserved {
+            if let Some(requester) = quarantine.first_active_requester {
+                display::pci_dma_failure(requester);
+                log!(
+                    "PCI DMA quarantine initialization failed: {:?}",
+                    mboot_hv::Error::DeviceQuarantineFailed
+                );
+                halt()
+            }
+            halt_with_error(
+                "PCI DMA quarantine",
+                mboot_hv::Error::DeviceQuarantineFailed,
+            )
         }
-        halt_with_error(
-            "PCI DMA quarantine",
-            mboot_hv::Error::DeviceQuarantineFailed,
-        )
+        for requester in quarantine.active_requesters() {
+            log!(
+                "PCI {:02x}:{:02x}.{} remains active only for its reserved DMA mapping",
+                requester >> 8,
+                requester >> 3 & 0x1f,
+                requester & 7
+            );
+        }
     }
     if let Some(topology) = iommu_topology {
         // SAFETY: Tables were allocated and zeroed before ExitBootServices, PCI
@@ -419,8 +439,13 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             halt_with_error("IOMMU protection", iommu_error(error))
         }
         log!(
-            "IOMMU DMA protection enabled: {:?} deny-all",
-            topology.kind()
+            "IOMMU DMA protection enabled: {:?} {}",
+            topology.kind(),
+            if topology.reserved_mappings().is_empty() {
+                "deny-all"
+            } else {
+                "firmware-reserved-only"
+            }
         );
     }
     let preemption_timer = unsafe { timer::initialize() };

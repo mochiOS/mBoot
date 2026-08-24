@@ -9,7 +9,8 @@ const ACPI_HEADER_SIZE: usize = 36;
 const IOMMU_TABLE_HEADER_SIZE: usize = 48;
 const MAX_ACPI_TABLE_SIZE: usize = 1024 * 1024;
 const MAX_IOMMU_UNITS: usize = 16;
-const INTEL_ROOT_TABLE_PAGES: usize = 1;
+const MAX_RESERVED_MAPPINGS: usize = 32;
+const INTEL_TABLE_PAGES: usize = 64;
 const AMD_DEVICE_TABLE_PAGES: usize = 512;
 const INTEL_VERSION: u64 = 0x00;
 const INTEL_CAPABILITY: u64 = 0x08;
@@ -38,6 +39,21 @@ pub struct IommuUnit {
     pub include_all: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReservedMapping {
+    pub segment: u16,
+    pub requester: u16,
+    pub base: u64,
+    pub limit: u64,
+}
+
+const EMPTY_RESERVED_MAPPING: ReservedMapping = ReservedMapping {
+    segment: 0,
+    requester: 0,
+    base: 0,
+    limit: 0,
+};
+
 const EMPTY_UNIT: IommuUnit = IommuUnit {
     segment: 0,
     register_base: 0,
@@ -49,6 +65,8 @@ pub struct IommuTopology {
     kind: IommuKind,
     units: [IommuUnit; MAX_IOMMU_UNITS],
     unit_count: usize,
+    reserved_mappings: [ReservedMapping; MAX_RESERVED_MAPPINGS],
+    reserved_mapping_count: usize,
 }
 
 impl IommuTopology {
@@ -57,6 +75,8 @@ impl IommuTopology {
             kind,
             units: [EMPTY_UNIT; MAX_IOMMU_UNITS],
             unit_count: 0,
+            reserved_mappings: [EMPTY_RESERVED_MAPPING; MAX_RESERVED_MAPPINGS],
+            reserved_mapping_count: 0,
         }
     }
 
@@ -70,6 +90,10 @@ impl IommuTopology {
 
     pub fn units(&self) -> &[IommuUnit] {
         &self.units[..self.unit_count]
+    }
+
+    pub fn reserved_mappings(&self) -> &[ReservedMapping] {
+        &self.reserved_mappings[..self.reserved_mapping_count]
     }
 
     fn push(&mut self, unit: IommuUnit) -> Result<(), Error> {
@@ -89,6 +113,14 @@ impl IommuTopology {
         self.unit_count += 1;
         Ok(())
     }
+    fn push_reserved_mapping(&mut self, mapping: ReservedMapping) -> Result<(), Error> {
+        if self.reserved_mapping_count == self.reserved_mappings.len() {
+            return Err(Error::TooManyReservedMappings);
+        }
+        self.reserved_mappings[self.reserved_mapping_count] = mapping;
+        self.reserved_mapping_count += 1;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +128,7 @@ pub enum Error {
     InvalidRsdp,
     InvalidTable,
     TooManyUnits,
+    TooManyReservedMappings,
     InvalidResources,
     UnsupportedHardware,
     RegisterWriteFailed,
@@ -104,7 +137,7 @@ pub enum Error {
 
 pub const fn deny_all_table_pages(kind: IommuKind) -> usize {
     match kind {
-        IommuKind::IntelVtd => INTEL_ROOT_TABLE_PAGES,
+        IommuKind::IntelVtd => INTEL_TABLE_PAGES,
         IommuKind::AmdVi => AMD_DEVICE_TABLE_PAGES,
     }
 }
@@ -114,7 +147,8 @@ pub const fn deny_all_table_pages(kind: IommuKind) -> usize {
 /// # Safety
 /// Each table address must name the zeroed, contiguous number of pages returned
 /// by [`deny_all_table_pages`]. IOMMU MMIO ranges must remain identity-mapped,
-/// PCI bus mastering must be disabled, and no other agent may program the units.
+/// PCI bus mastering must be disabled except for requesters covered by a parsed
+/// reserved mapping, and no other agent may program the units.
 pub unsafe fn enable_deny_all(
     topology: &IommuTopology,
     table_addresses: &[u64],
@@ -130,7 +164,9 @@ pub unsafe fn enable_deny_all(
         // matching remapping unit and its correctly sized zeroed table.
         unsafe {
             match topology.kind {
-                IommuKind::IntelVtd => enable_intel_deny_all(unit, *table_address)?,
+                IommuKind::IntelVtd => {
+                    enable_intel_protection(unit, *table_address, topology.reserved_mappings())?
+                }
                 IommuKind::AmdVi => enable_amd_deny_all(unit, *table_address)?,
             }
         }
@@ -138,7 +174,11 @@ pub unsafe fn enable_deny_all(
     Ok(())
 }
 
-unsafe fn enable_intel_deny_all(unit: &IommuUnit, root_table: u64) -> Result<(), Error> {
+unsafe fn enable_intel_protection(
+    unit: &IommuUnit,
+    root_table: u64,
+    mappings: &[ReservedMapping],
+) -> Result<(), Error> {
     if root_table >> 52 != 0 {
         return Err(Error::InvalidResources);
     }
@@ -148,12 +188,15 @@ unsafe fn enable_intel_deny_all(unit: &IommuUnit, root_table: u64) -> Result<(),
     // guest-address width in CAP.SAGAW.
     // SAFETY: The capability register belongs to the same mapped unit.
     let capability = unsafe { mmio_read_u64(unit.register_base, INTEL_CAPABILITY) };
-    if version == 0 || capability >> 8 & 0x1f == 0 {
+    if version == 0 || capability >> 8 & 0x04 == 0 {
         return Err(Error::UnsupportedHardware);
     }
 
-    // Start from a known state. All PCI requesters are already unable to issue
-    // new DMA while the old firmware translation state is removed.
+    // SAFETY: The caller supplied INTEL_TABLE_PAGES zeroed contiguous pages.
+    unsafe { build_intel_tables(root_table, mappings)? };
+
+    // Start from a known state. Requesters without an RMRR are unable to issue
+    // new DMA; firmware-reserved requesters are immediately restored below.
     // SAFETY: GCMD is the command register of this exclusively owned unit.
     unsafe { mmio_write_u32(unit.register_base, INTEL_GLOBAL_COMMAND, 0) };
     // SAFETY: GSTS is readable while the unit processes the disable command.
@@ -178,6 +221,125 @@ unsafe fn enable_intel_deny_all(unit: &IommuUnit, root_table: u64) -> Result<(),
         wait_intel_status(unit.register_base, INTEL_TRANSLATION_ENABLE, true)?;
     }
     Ok(())
+}
+
+struct IntelTableArena {
+    base: u64,
+    next_page: usize,
+}
+
+impl IntelTableArena {
+    unsafe fn allocate(&mut self) -> Result<u64, Error> {
+        if self.next_page == INTEL_TABLE_PAGES {
+            return Err(Error::InvalidResources);
+        }
+        let address = self.base + self.next_page as u64 * 4096;
+        self.next_page += 1;
+        Ok(address)
+    }
+}
+
+unsafe fn build_intel_tables(root_table: u64, mappings: &[ReservedMapping]) -> Result<(), Error> {
+    let mut arena = IntelTableArena {
+        base: root_table,
+        next_page: 1,
+    };
+    for mapping in mappings.iter().filter(|mapping| mapping.segment == 0) {
+        if mapping.base & 0xfff != 0
+            || mapping.limit & 0xfff != 0xfff
+            || mapping.limit < mapping.base
+            || mapping.limit >> 52 != 0
+        {
+            return Err(Error::InvalidTable);
+        }
+        let bus = usize::from(mapping.requester >> 8);
+        let device_function = usize::from(mapping.requester & 0xff);
+        // SAFETY: Root and context entries are inside the caller-owned arena.
+        let context_table = unsafe { ensure_root_entry(root_table, bus, &mut arena)? };
+        let context_low = (context_table + device_function as u64 * 16) as *mut u64;
+        // SAFETY: A PCI requester indexes one of 256 16-byte context entries.
+        let mut second_level = unsafe { read_volatile(context_low) } & !0xfff;
+        if second_level == 0 {
+            // SAFETY: The arena returns a fresh zeroed page.
+            second_level = unsafe { arena.allocate()? };
+            // Present, multi-level translation. The upper word selects a
+            // 48-bit adjusted guest-address width and Domain ID 1.
+            unsafe {
+                write_volatile(context_low.add(1), (1_u64 << 8) | 2);
+                write_volatile(context_low, second_level | 1);
+            }
+        }
+        // SAFETY: The second-level root and all children belong to this arena.
+        unsafe { identity_map_intel(second_level, mapping.base, mapping.limit + 1, &mut arena)? };
+    }
+    Ok(())
+}
+
+unsafe fn ensure_root_entry(
+    root_table: u64,
+    bus: usize,
+    arena: &mut IntelTableArena,
+) -> Result<u64, Error> {
+    let root_low = (root_table + bus as u64 * 16) as *mut u64;
+    // SAFETY: A PCI bus indexes one of 256 16-byte root entries.
+    let mut context_table = unsafe { read_volatile(root_low) } & !0xfff;
+    if context_table == 0 {
+        // SAFETY: The arena returns a fresh zeroed page.
+        context_table = unsafe { arena.allocate()? };
+        // SAFETY: The root entry is within the first arena page.
+        unsafe { write_volatile(root_low, context_table | 1) };
+    }
+    Ok(context_table)
+}
+
+unsafe fn identity_map_intel(
+    level4: u64,
+    mut address: u64,
+    end: u64,
+    arena: &mut IntelTableArena,
+) -> Result<(), Error> {
+    while address < end {
+        let level3 = unsafe { ensure_page_entry(level4, (address >> 39) & 0x1ff, arena)? };
+        let level2 = unsafe { ensure_page_entry(level3, (address >> 30) & 0x1ff, arena)? };
+        let level2_index = (address >> 21) & 0x1ff;
+        let level2_entry = (level2 + level2_index * 8) as *mut u64;
+        let remaining = end - address;
+        // Use a 2 MiB second-level leaf for aligned interiors. RMRR edges that
+        // are only 4 KiB aligned use a final page table.
+        if address & 0x1f_ffff == 0 && remaining >= 0x20_0000 {
+            // SAFETY: The entry is in the mapped level-two table.
+            let current = unsafe { read_volatile(level2_entry) };
+            if current == 0 || current & (1 << 7) != 0 {
+                unsafe { write_volatile(level2_entry, address | 0x83) };
+                address += 0x20_0000;
+                continue;
+            }
+        }
+        // SAFETY: The level-two entry either is empty or points to our page table.
+        let level1 = unsafe { ensure_page_entry(level2, level2_index, arena)? };
+        let level1_entry = (level1 + ((address >> 12) & 0x1ff) * 8) as *mut u64;
+        // SAFETY: The leaf entry is inside the level-one page table.
+        unsafe { write_volatile(level1_entry, address | 3) };
+        address += 4096;
+    }
+    Ok(())
+}
+
+unsafe fn ensure_page_entry(
+    table: u64,
+    index: u64,
+    arena: &mut IntelTableArena,
+) -> Result<u64, Error> {
+    let entry = (table + index * 8) as *mut u64;
+    // SAFETY: Every x86 page-table index is in 0..512.
+    let mut child = unsafe { read_volatile(entry) } & !0xfff;
+    if child == 0 {
+        // SAFETY: The arena returns a fresh zeroed page.
+        child = unsafe { arena.allocate()? };
+        // Read and write permissions are required at every second-level table.
+        unsafe { write_volatile(entry, child | 3) };
+    }
+    Ok(child)
 }
 
 unsafe fn enable_amd_deny_all(unit: &IommuUnit, device_table: u64) -> Result<(), Error> {
@@ -298,23 +460,68 @@ pub unsafe fn discover(rsdp_address: u64) -> Result<Option<IommuTopology>, Error
 pub fn parse_dmar(table: &[u8]) -> Result<IommuTopology, Error> {
     validate_acpi_table(table, b"DMAR", IOMMU_TABLE_HEADER_SIZE)?;
     let mut topology = IommuTopology::new(IommuKind::IntelVtd);
-    walk_structures(&table[IOMMU_TABLE_HEADER_SIZE..], |kind, structure| {
-        if kind != 0 {
-            return Ok(());
-        }
-        if structure.len() < 16 {
-            return Err(Error::InvalidTable);
-        }
-        topology.push(IommuUnit {
-            segment: read_u16(structure, 6)?,
-            register_base: read_u64(structure, 8)?,
-            include_all: structure[4] & 1 != 0,
-        })
-    })?;
+    walk_structures(
+        &table[IOMMU_TABLE_HEADER_SIZE..],
+        |kind, structure| match kind {
+            0 => {
+                if structure.len() < 16 {
+                    return Err(Error::InvalidTable);
+                }
+                topology.push(IommuUnit {
+                    segment: read_u16(structure, 6)?,
+                    register_base: read_u64(structure, 8)?,
+                    include_all: structure[4] & 1 != 0,
+                })
+            }
+            1 => parse_rmrr(structure, &mut topology),
+            _ => Ok(()),
+        },
+    )?;
     if topology.unit_count == 0 {
         return Err(Error::InvalidTable);
     }
     Ok(topology)
+}
+
+fn parse_rmrr(structure: &[u8], topology: &mut IommuTopology) -> Result<(), Error> {
+    if structure.len() < 24 {
+        return Err(Error::InvalidTable);
+    }
+    let segment = read_u16(structure, 6)?;
+    let base = read_u64(structure, 8)?;
+    let limit = read_u64(structure, 16)?;
+    if base & 0xfff != 0 || limit & 0xfff != 0xfff || limit < base {
+        return Err(Error::InvalidTable);
+    }
+    let mut scopes = &structure[24..];
+    while !scopes.is_empty() {
+        if scopes.len() < 6 {
+            return Err(Error::InvalidTable);
+        }
+        let length = usize::from(scopes[1]);
+        if length < 8 || length > scopes.len() || !(length - 6).is_multiple_of(2) {
+            return Err(Error::InvalidTable);
+        }
+        // A direct endpoint scope is sufficient for integrated graphics and
+        // other devices attached to the root bus. Multi-hop paths remain denied
+        // until PCI bridge resolution is available.
+        if scopes[0] == 1 && length == 8 {
+            let bus = u16::from(scopes[5]);
+            let device = u16::from(scopes[6]);
+            let function = u16::from(scopes[7]);
+            if device >= 32 || function >= 8 {
+                return Err(Error::InvalidTable);
+            }
+            topology.push_reserved_mapping(ReservedMapping {
+                segment,
+                requester: bus << 8 | device << 3 | function,
+                base,
+                limit,
+            })?;
+        }
+        scopes = &scopes[length..];
+    }
+    Ok(())
 }
 
 pub fn parse_ivrs(table: &[u8]) -> Result<IommuTopology, Error> {
@@ -450,6 +657,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_intel_rmrr_for_a_direct_pci_endpoint() {
+        let mut table = [0_u8; 96];
+        table[48..50].copy_from_slice(&0_u16.to_le_bytes());
+        table[50..52].copy_from_slice(&16_u16.to_le_bytes());
+        table[52] = 1;
+        table[56..64].copy_from_slice(&0xfed9_0000_u64.to_le_bytes());
+        table[64..66].copy_from_slice(&1_u16.to_le_bytes());
+        table[66..68].copy_from_slice(&32_u16.to_le_bytes());
+        table[72..80].copy_from_slice(&0x7a00_0000_u64.to_le_bytes());
+        table[80..88].copy_from_slice(&0x7bff_ffff_u64.to_le_bytes());
+        table[88] = 1;
+        table[89] = 8;
+        table[93] = 0;
+        table[94] = 2;
+        table[95] = 0;
+        finish_table(&mut table, b"DMAR");
+        let topology = parse_dmar(&table).unwrap();
+        assert_eq!(
+            topology.reserved_mappings(),
+            &[ReservedMapping {
+                segment: 0,
+                requester: 0x0010,
+                base: 0x7a00_0000,
+                limit: 0x7bff_ffff,
+            }]
+        );
+    }
+
+    #[test]
     fn parses_amd_ivrs_units() {
         let mut table = [0_u8; 72];
         table[48..50].copy_from_slice(&0x10_u16.to_le_bytes());
@@ -479,8 +715,30 @@ mod tests {
 
     #[test]
     fn deny_all_tables_cover_each_architectures_requester_space() {
-        assert_eq!(deny_all_table_pages(IommuKind::IntelVtd), 1);
+        assert_eq!(deny_all_table_pages(IommuKind::IntelVtd), 64);
         assert_eq!(deny_all_table_pages(IommuKind::AmdVi), 512);
         assert_eq!(AMD_DEVICE_TABLE_SIZE, 0x1ff);
+    }
+
+    #[test]
+    fn intel_tables_map_only_the_reserved_requester_range() {
+        #[repr(align(4096))]
+        struct Tables([u8; INTEL_TABLE_PAGES * 4096]);
+        let mut tables = Tables([0; INTEL_TABLE_PAGES * 4096]);
+        let base = tables.0.as_mut_ptr() as u64;
+        let mapping = ReservedMapping {
+            segment: 0,
+            requester: 0x0010,
+            base: 0x2000_0000,
+            limit: 0x203f_ffff,
+        };
+        unsafe { build_intel_tables(base, &[mapping]).unwrap() };
+        let root = unsafe { read_volatile(base as *const u64) };
+        assert_ne!(root & 1, 0);
+        let context = root & !0xfff;
+        let display_context = unsafe { read_volatile((context + 0x10 * 16) as *const u64) };
+        let unrelated_context = unsafe { read_volatile((context + 0x18 * 16) as *const u64) };
+        assert_ne!(display_context & 1, 0);
+        assert_eq!(unrelated_context, 0);
     }
 }

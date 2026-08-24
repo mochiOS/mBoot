@@ -3,6 +3,7 @@ use core::arch::asm;
 const CONFIG_ADDRESS: u16 = 0x0cf8;
 const CONFIG_DATA: u16 = 0x0cfc;
 const COMMAND_BUS_MASTER: u16 = 1 << 2;
+const MAX_ACTIVE_REQUESTERS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QuarantineReport {
@@ -10,6 +11,18 @@ pub struct QuarantineReport {
     pub bus_masters_disabled: u32,
     pub bus_masters_active: u32,
     pub first_active_requester: Option<u16>,
+    active_requesters: [u16; MAX_ACTIVE_REQUESTERS],
+    active_requester_count: usize,
+}
+
+impl QuarantineReport {
+    pub fn active_requesters(&self) -> &[u16] {
+        &self.active_requesters[..self.active_requester_count]
+    }
+
+    pub const fn recorded_every_active_requester(&self) -> bool {
+        self.active_requester_count as u32 == self.bus_masters_active
+    }
 }
 
 /// Stops PCI functions in segment zero from initiating new DMA transactions.
@@ -95,6 +108,11 @@ unsafe fn quarantine_function(
             report.bus_masters_active = report.bus_masters_active.saturating_add(1);
             if report.first_active_requester.is_none() {
                 report.first_active_requester = Some(requester_id(bus, device, function));
+            }
+            if report.active_requester_count < report.active_requesters.len() {
+                report.active_requesters[report.active_requester_count] =
+                    requester_id(bus, device, function);
+                report.active_requester_count += 1;
             }
         }
     }
