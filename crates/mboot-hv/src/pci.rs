@@ -95,6 +95,12 @@ unsafe fn quarantine_function(
     } else {
         None
     };
+    // Host bridges are the boundary between the CPU/memory fabric and PCI, not
+    // PCI requester endpoints. Some Intel host bridges return a hardwired one
+    // for Command.BusMaster and ignore attempts to clear it.
+    if !function_has_bus_master_control(class, subclass) {
+        return next_bus.filter(|bus| *bus != 0);
+    }
     // SAFETY: The command register exists for every PCI function.
     let command = unsafe { read_u16(bus, device, function, 4) };
     let quarantined = without_bus_master(command);
@@ -117,6 +123,10 @@ unsafe fn quarantine_function(
         }
     }
     next_bus.filter(|bus| *bus != 0)
+}
+
+const fn function_has_bus_master_control(class: u8, subclass: u8) -> bool {
+    !(class == 0x06 && subclass == 0x00)
 }
 
 const fn requester_id(bus: u8, device: u8, function: u8) -> u16 {
@@ -197,5 +207,12 @@ mod tests {
     #[test]
     fn requester_id_uses_the_pci_bdf_layout() {
         assert_eq!(requester_id(0x12, 0x1f, 7), 0x12ff);
+    }
+
+    #[test]
+    fn host_bridges_are_not_dma_requester_endpoints() {
+        assert!(!function_has_bus_master_control(0x06, 0x00));
+        assert!(function_has_bus_master_control(0x06, 0x04));
+        assert!(function_has_bus_master_control(0x03, 0x00));
     }
 }
