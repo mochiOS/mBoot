@@ -113,7 +113,8 @@ impl EventChannelTable {
     pub fn disconnect_domain(&mut self, domain: DomainId) -> usize {
         let mut disconnected = 0;
         for slot in &mut self.channels {
-            if slot.is_some_and(|channel| channel.a.domain == domain || channel.b.domain == domain) {
+            if slot.is_some_and(|channel| channel.a.domain == domain || channel.b.domain == domain)
+            {
                 *slot = None;
                 disconnected += 1;
             }

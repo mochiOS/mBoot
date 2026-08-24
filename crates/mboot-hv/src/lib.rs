@@ -96,13 +96,21 @@ pub struct VmExit {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestBootMode {
+    Long64,
+    LinuxPvh32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuestConfig {
+    pub boot_mode: GuestBootMode,
     pub nested_root: u64,
     pub page_table_root: u64,
     pub entry: u64,
     pub stack: u64,
     pub boot_info: u64,
     pub msr_permission_map: u64,
+    pub msr_state_page: u64,
 }
 
 impl Virtualization {
@@ -214,6 +222,17 @@ impl Virtualization {
         match self {
             Virtualization::Intel(vmx) => unsafe { vmx.resume_preempted() },
             Virtualization::Amd(svm) => unsafe { svm.resume_preempted() },
+        }
+    }
+
+    /// Completes an intercepted HLT and resumes after the instruction.
+    ///
+    /// # Safety
+    /// The previous exit must have been `VmExitReason::Halt` from this vCPU.
+    pub unsafe fn resume_halted(&mut self) -> Result<VmExit, Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.resume_halted() },
+            Virtualization::Amd(svm) => unsafe { svm.resume_halted() },
         }
     }
 

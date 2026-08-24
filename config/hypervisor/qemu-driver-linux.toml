@@ -1,0 +1,37 @@
+version = 5
+toolchain = "nightly-2026-05-14"
+disk_size_mib = 128
+esp_size_mib = 96
+disk_guid = "6d426f6f-7400-4b00-8a00-000000000500"
+esp_guid = "6d426f6f-7400-4b00-8a00-000000000501"
+
+[[domains]]
+id = 1
+role = "system"
+memory_mib = 2
+vcpus = 1
+capabilities = 0
+format = "native-elf"
+image = "mochios"
+path = '\EFI\MBOOT\MOCHIOS.ELF'
+autostart = true
+required = true
+restart = "never"
+max_restarts = 0
+
+[[domains]]
+id = 2
+role = "hardware"
+memory_mib = 64
+vcpus = 1
+capabilities = 0x3
+format = "linux-pvh"
+image = "driver-linux"
+path = '\EFI\MBOOT\DRIVER.ELF'
+initramfs = "driver-linux"
+initramfs_path = '\EFI\MBOOT\DRIVER.CPIO'
+command_line = "earlycon=uart,io,0x3f8 ignore_loglevel rdinit=/init pci=off acpi=off maxcpus=0 panic=-1"
+autostart = true
+required = true
+restart = "never"
+max_restarts = 0

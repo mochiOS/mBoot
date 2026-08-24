@@ -21,6 +21,7 @@ pub struct NestedPageResources {
     pub level3: u64,
     pub level2: u64,
     pub level1: u64,
+    pub level1_pages: usize,
     pub guest_base: u64,
     pub guest_pages: usize,
 }
@@ -38,7 +39,11 @@ impl NestedPageResources {
                 return Err(Error::InvalidPage);
             }
         }
-        if self.guest_pages == 0 || self.guest_pages > ENTRY_COUNT {
+        let required_level1_pages = self.guest_pages.div_ceil(ENTRY_COUNT);
+        if self.guest_pages == 0
+            || required_level1_pages > ENTRY_COUNT
+            || self.level1_pages != required_level1_pages
+        {
             return Err(Error::InvalidPage);
         }
         Ok(())
@@ -50,6 +55,7 @@ pub struct NestedPageTable {
     backend: BackendKind,
     root: u64,
     level1: u64,
+    level1_pages: usize,
     guest_base: u64,
     guest_pages: usize,
 }
@@ -66,15 +72,18 @@ impl NestedPageTable {
         resources: NestedPageResources,
     ) -> Result<Self, Error> {
         resources.validate()?;
-        for page in [
-            resources.root,
-            resources.level3,
-            resources.level2,
-            resources.level1,
-        ] {
+        for page in [resources.root, resources.level3, resources.level2] {
             // SAFETY: The function contract gives mBoot exclusive writable ownership.
             unsafe { write_bytes(page as *mut u8, 0, PAGE_SIZE as usize) };
         }
+        // SAFETY: The complete contiguous leaf-table allocation is exclusively owned.
+        unsafe {
+            write_bytes(
+                resources.level1 as *mut u8,
+                0,
+                resources.level1_pages * PAGE_SIZE as usize,
+            )
+        };
 
         let link_flags = match backend {
             BackendKind::IntelVmx => EPT_READ_WRITE_EXECUTE,
@@ -84,15 +93,22 @@ impl NestedPageTable {
         unsafe {
             write_entry(resources.root, 0, resources.level3 | link_flags);
             write_entry(resources.level3, 0, resources.level2 | link_flags);
-            write_entry(resources.level2, 0, resources.level1 | link_flags);
+            for index in 0..resources.level1_pages {
+                write_entry(
+                    resources.level2,
+                    index,
+                    (resources.level1 + index as u64 * PAGE_SIZE) | link_flags,
+                );
+            }
             let leaf_flags = match backend {
                 BackendKind::IntelVmx => EPT_LEAF_WRITE_BACK,
                 BackendKind::AmdSvm => NPT_PRESENT_WRITE_USER,
             };
             for index in 0..resources.guest_pages {
+                let table = resources.level1 + (index / ENTRY_COUNT) as u64 * PAGE_SIZE;
                 write_entry(
-                    resources.level1,
-                    index,
+                    table,
+                    index % ENTRY_COUNT,
                     (resources.guest_base + index as u64 * PAGE_SIZE) | leaf_flags,
                 );
             }
@@ -107,6 +123,7 @@ impl NestedPageTable {
             backend,
             root: resources.root,
             level1: resources.level1,
+            level1_pages: resources.level1_pages,
             guest_base: resources.guest_base,
             guest_pages: resources.guest_pages,
         })
@@ -152,7 +169,7 @@ impl NestedPageTable {
         host_page: u64,
         writable: bool,
     ) -> Result<(), Error> {
-        let index = self.page_index(guest_page)?;
+        let (table, index) = self.page_entry(guest_page)?;
         if host_page == 0 || host_page & (PAGE_SIZE - 1) != 0 {
             return Err(Error::InvalidPage);
         }
@@ -160,7 +177,7 @@ impl NestedPageTable {
             BackendKind::IntelVmx => (6 << 3) | 1 | if writable { 1 << 1 } else { 0 },
             BackendKind::AmdSvm => NPT_PRESENT_USER_NO_EXECUTE | if writable { 1 << 1 } else { 0 },
         };
-        unsafe { write_entry(self.level1, index, host_page | flags) };
+        unsafe { write_entry(table, index, host_page | flags) };
         Ok(())
     }
 
@@ -169,7 +186,7 @@ impl NestedPageTable {
     /// # Safety
     /// The vCPU must be stopped until the backend translation cache is invalidated.
     pub unsafe fn restore_owned_page(&self, guest_page: u64) -> Result<(), Error> {
-        let index = self.page_index(guest_page)?;
+        let (table, index) = self.page_entry(guest_page)?;
         let host_page = self
             .guest_base
             .checked_add(guest_page)
@@ -178,7 +195,7 @@ impl NestedPageTable {
             BackendKind::IntelVmx => EPT_LEAF_WRITE_BACK,
             BackendKind::AmdSvm => NPT_PRESENT_WRITE_USER,
         };
-        unsafe { write_entry(self.level1, index, host_page | flags) };
+        unsafe { write_entry(table, index, host_page | flags) };
         Ok(())
     }
 
@@ -189,7 +206,7 @@ impl NestedPageTable {
     /// `host_page` must be a validated device MMIO page. The vCPU must remain
     /// stopped until the nested translation cache has been invalidated.
     pub unsafe fn map_device_page(&self, guest_page: u64, host_page: u64) -> Result<(), Error> {
-        let index = self.page_index(guest_page)?;
+        let (table, index) = self.page_entry(guest_page)?;
         if host_page == 0 || host_page & (PAGE_SIZE - 1) != 0 || host_page >> 52 != 0 {
             return Err(Error::InvalidPage);
         }
@@ -197,17 +214,25 @@ impl NestedPageTable {
             BackendKind::IntelVmx => EPT_DEVICE_READ_WRITE,
             BackendKind::AmdSvm => NPT_DEVICE_READ_WRITE,
         };
-        unsafe { write_entry(self.level1, index, host_page | flags) };
+        unsafe { write_entry(table, index, host_page | flags) };
         Ok(())
     }
 
-    fn page_index(&self, guest_page: u64) -> Result<usize, Error> {
+    fn page_entry(&self, guest_page: u64) -> Result<(u64, usize), Error> {
         self.owned_page_host_address(guest_page)
             .ok_or(Error::InvalidPage)?;
-        usize::try_from(guest_page / PAGE_SIZE).map_err(|_| Error::InvalidPage)
+        let page = usize::try_from(guest_page / PAGE_SIZE).map_err(|_| Error::InvalidPage)?;
+        let table_index = page / ENTRY_COUNT;
+        if table_index >= self.level1_pages {
+            return Err(Error::InvalidPage);
+        }
+        Ok((
+            self.level1 + table_index as u64 * PAGE_SIZE,
+            page % ENTRY_COUNT,
+        ))
     }
 
-    /// Creates a guest-owned four-level table that identity maps the first 2 MiB.
+    /// Creates a guest-owned four-level table that identity maps all Domain RAM.
     /// The PML4 starts at GPA 0 and is suitable for CR3.
     ///
     /// # Safety
@@ -224,7 +249,13 @@ impl NestedPageTable {
             write_bytes(pml4 as *mut u8, 0, (3 * PAGE_SIZE) as usize);
             write_entry(pml4, 0, PAGE_SIZE | GUEST_PAGE_TABLE_FLAGS);
             write_entry(pdpt, 0, (2 * PAGE_SIZE) | GUEST_PAGE_TABLE_FLAGS);
-            write_entry(directory, 0, GUEST_LARGE_PAGE_FLAGS);
+            for index in 0..self.guest_pages.div_ceil(ENTRY_COUNT) {
+                write_entry(
+                    directory,
+                    index,
+                    index as u64 * 2 * 1024 * 1024 | GUEST_LARGE_PAGE_FLAGS,
+                );
+            }
         }
         Ok(0)
     }
@@ -261,6 +292,7 @@ impl NestedPageTable {
             backend,
             root,
             level1: root,
+            level1_pages: guest_pages.div_ceil(ENTRY_COUNT),
             guest_base,
             guest_pages,
         }
@@ -279,6 +311,9 @@ mod tests {
 
     #[repr(align(4096))]
     struct Page([u64; ENTRY_COUNT]);
+
+    #[repr(align(4096))]
+    struct TwoPages([u64; ENTRY_COUNT * 2]);
 
     #[test]
     fn ept_maps_only_configured_guest_pages() {
@@ -354,6 +389,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mappings_cross_a_two_megabyte_leaf_table_boundary() {
+        let mut leaves = TwoPages([0; ENTRY_COUNT * 2]);
+        let table = NestedPageTable::test_new(
+            BackendKind::IntelVmx,
+            leaves.0.as_mut_ptr() as u64,
+            0x20_0000,
+            ENTRY_COUNT + 1,
+        );
+        unsafe { table.map_device_page(2 * 1024 * 1024, 0x40_0000).unwrap() };
+        assert_eq!(leaves.0[ENTRY_COUNT], 0x40_0000 | EPT_DEVICE_READ_WRITE);
+    }
+
     fn resources(
         root: &mut Page,
         level3: &mut Page,
@@ -366,6 +414,7 @@ mod tests {
             level3: level3.0.as_mut_ptr() as u64,
             level2: level2.0.as_mut_ptr() as u64,
             level1: level1.0.as_mut_ptr() as u64,
+            level1_pages: 1,
             guest_base: guest.0.as_mut_ptr() as u64,
             guest_pages: 1,
         }

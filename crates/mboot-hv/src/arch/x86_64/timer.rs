@@ -129,7 +129,7 @@ pub fn now() -> u64 {
     unsafe { _rdtsc() }
 }
 
-fn tsc_frequency_hz() -> Option<u64> {
+pub fn tsc_frequency_hz() -> Option<u64> {
     let maximum_leaf = __cpuid(0).eax;
     if maximum_leaf >= 0x15 {
         let ratio = __cpuid(0x15);

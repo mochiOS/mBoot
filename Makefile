@@ -15,6 +15,7 @@ BOOT_CONFIG_SOURCES := \
 	board/mboot/grub-builtin.cfg.in \
 	board/mboot/busybox.config \
 	board/mboot/linux.config.in \
+	$(wildcard board/mboot/patches/linux/*.patch) \
 	configs/mboot_x86_64_defconfig.in \
 	scripts/generate-boot-config.sh
 MOCHIOS ?= $(CURDIR)/mochiOS.img
@@ -40,9 +41,9 @@ QEMU_CONFIG_STAMP := $(OUTPUT_DIR)/.mboot-qemu-config.sha256
 LINUX_FIRMWARE_CONFIG_STAMP := $(OUTPUT_DIR)/.mboot-linux-firmware-config.sha256
 
 JOBS ?= $(shell nproc)
-HOST_CARGO := $(shell command -v cargo)
+HOST_CARGO := $(firstword $(wildcard $(HOME)/.cargo/bin/cargo) $(wildcard /usr/bin/cargo))
 HOST_CARGO_HOME := $(if $(CARGO_HOME),$(CARGO_HOME),$(HOME)/.cargo)
-HOST_RUSTC := $(shell command -v rustc)
+HOST_RUSTC := $(firstword $(wildcard $(HOME)/.cargo/bin/rustc) $(wildcard /usr/bin/rustc))
 RUSTC_SYSROOT := $(shell $(HOST_RUSTC) --print sysroot 2>/dev/null)
 MBOOTD_TARGET := x86_64-unknown-linux-gnu
 MBOOTD_BINARY := $(CURDIR)/target/$(MBOOTD_TARGET)/release/mbootd
@@ -398,7 +399,24 @@ HV_LAUNCH_MANIFEST ?= $(CURDIR)/output/hv/launch.manifest
 HV_OUTPUT_IMAGE ?= $(CURDIR)/output/mochiOS.iso
 MNU_ABI_PATCH := --config 'patch."https://github.com/mochiOS/mnu".mnu-abi.path="$(MNU_DIR)/crates/abi"'
 
-.PHONY: hv-build hv-device-io-test hv-domain-build hv-image hv-image-test hv-manifest hv-test hv-qemu-test
+.PHONY: driver-linux driver-linux-artifacts hv-build hv-device-io-test hv-domain-build hv-driver-linux-test hv-image hv-image-test hv-manifest hv-test hv-qemu-test
+
+driver-linux: configure
+	$(MAKE) -C "$(BUILDROOT_DIR)" O="$(OUTPUT_DIR)" linux-reconfigure
+	OUTPUT_DIR="$(OUTPUT_DIR)" scripts/build-driver-linux.sh
+
+driver-linux-artifacts:
+	@set -eu; kernel_config=; \
+	for candidate in "$(OUTPUT_DIR)"/build/linux-*/.config; do \
+		if [ -f "$$candidate" ]; then kernel_config=$$candidate; break; fi; \
+	done; \
+	[ -n "$$kernel_config" ] || { \
+		echo 'Driver Linux kernel is not built; run make driver-linux' >&2; exit 1; \
+	}; \
+	grep -Fqx 'CONFIG_PVH=y' "$$kernel_config" || { \
+		echo 'Driver Linux kernel lacks CONFIG_PVH=y; run make driver-linux' >&2; exit 1; \
+	}
+	OUTPUT_DIR="$(OUTPUT_DIR)" scripts/build-driver-linux.sh
 
 hv-domain-build:
 	@test -n "$(HOST_CARGO)" || { echo "host cargo was not found" >&2; exit 1; }
@@ -449,6 +467,12 @@ hv-image-test: hv-image
 hv-device-io-test:
 	MBOOT_HOST_CARGO="$(HOST_CARGO)" MBOOT_HOST_RUSTC="$(HOST_RUSTC)" \
 		MNU_DIR="$(MNU_DIR)" scripts/test-hv-device-io.sh
+
+hv-driver-linux-test:
+	$(MAKE) hv-image \
+		HV_CONFIG="$(CURDIR)/config/hypervisor/qemu-driver-linux.toml" \
+		HV_OUTPUT_IMAGE="$(CURDIR)/output/driver-linux.iso"
+	HV_DISK_IMAGE="$(CURDIR)/output/driver-linux.iso" scripts/test-hv-driver-linux.sh
 
 hv-qemu-test: hv-domain-build hv-build
 	RING_BOOTSTRAP_DOMAIN_ELF="$(RING_BOOTSTRAP_DOMAIN_ELF)" \

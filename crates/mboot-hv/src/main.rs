@@ -7,6 +7,7 @@ mod display;
 mod panic;
 mod serial;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::mem::size_of;
@@ -18,13 +19,15 @@ use mboot_hv::event::EventChannelTable;
 use mboot_hv::grant::{GrantRef, GrantTable};
 use mboot_hv::interrupt::VirtualLocalApic;
 use mboot_hv::iommu::{self, IommuKind};
-use mboot_hv::manifest::{LaunchManifest, ManifestDomainRole, ManifestRestartPolicy};
+use mboot_hv::manifest::{
+    LaunchManifest, ManifestDomainRole, ManifestImageFormat, ManifestRestartPolicy,
+};
 use mboot_hv::memory::{NestedPageResources, NestedPageTable};
 use mboot_hv::pci;
 use mboot_hv::scheduler::CooperativeScheduler;
 use mboot_hv::{
-    cpuid, image, BackendKind, CpuidResult, GuestConfig, Virtualization, VirtualizationResources,
-    VmExitReason,
+    cpuid, image, BackendKind, CpuidResult, GuestBootMode, GuestConfig, Virtualization,
+    VirtualizationResources, VmExitReason,
 };
 use mnu_abi::hypervisor::{
     DomainBootInfo, DomainCrashInfo, HypercallNumber, PciDeviceInfo, PciDeviceResource,
@@ -41,7 +44,7 @@ use uefi::table::cfg::ACPI2_GUID;
 use uefi::CString16;
 
 const MAX_MEMORY_REGIONS: usize = 256;
-const MAX_GUEST_MEMORY_PAGES: usize = 512;
+const MAX_GUEST_MEMORY_PAGES: usize = 65_536;
 const GRANT_WINDOW_PAGES: usize = 16;
 const DEVICE_WINDOW_PAGES: usize = 64;
 const DOMAIN_BOOT_INFO_GPA: u64 = 0x3000;
@@ -86,15 +89,20 @@ struct PreparedDomain {
     restart_policy: ManifestRestartPolicy,
     max_restarts: u8,
     image: Vec<u8>,
+    image_format: ManifestImageFormat,
+    initramfs: Option<Vec<u8>>,
+    command_line: String,
     nested_pages: NestedPageResources,
     vcpu_control_page: u64,
     msr_permission_map: u64,
+    msr_state_page: u64,
 }
 
 #[derive(Clone, Copy)]
 enum ResumeKind {
     Hypercall,
     WithoutAdvance,
+    Halted,
     MsrRead(u64),
     MsrWrite,
     Cpuid(CpuidResult),
@@ -119,6 +127,9 @@ struct RuntimeDomain {
     restart_count: u32,
     crash_info: Option<DomainCrashInfo>,
     image: Vec<u8>,
+    image_format: ManifestImageFormat,
+    initramfs: Option<Vec<u8>>,
+    command_line: String,
 }
 
 impl BootMemoryMap {
@@ -348,6 +359,34 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             display::failure(8);
             return Status::SECURITY_VIOLATION;
         }
+        let initramfs = match config.initramfs_path {
+            Some(path) => {
+                let image = match load_file(boot_services, image_handle, path) {
+                    Ok(image) => image,
+                    Err(status) => {
+                        log!(
+                            "failed to load Domain {} initramfs {}: {:?}",
+                            config.id,
+                            path,
+                            status
+                        );
+                        display::failure(7);
+                        return status;
+                    }
+                };
+                if let Err(error) = config.verify_initramfs(&image) {
+                    log!(
+                        "Domain {} initramfs verification failed: {:?}",
+                        config.id,
+                        error
+                    );
+                    display::failure(8);
+                    return Status::SECURITY_VIOLATION;
+                }
+                Some(image)
+            }
+            None => None,
+        };
         let vcpu_control_page = match allocate_page(boot_services) {
             Ok(page) => page,
             Err(status) => {
@@ -355,8 +394,16 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 return status;
             }
         };
-        let msr_permission_map = match allocate_msr_permission_map(boot_services) {
-            Ok(map) => map,
+        let msr_permission_map =
+            match allocate_msr_permission_map(boot_services, backend, config.image_format) {
+                Ok(map) => map,
+                Err(status) => {
+                    display::failure(14);
+                    return status;
+                }
+            };
+        let msr_state_page = match allocate_page(boot_services) {
+            Ok(page) => page,
             Err(status) => {
                 display::failure(14);
                 return status;
@@ -376,9 +423,13 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             restart_policy: config.restart_policy,
             max_restarts: config.max_restarts,
             image,
+            image_format: config.image_format,
+            initramfs,
+            command_line: String::from(config.command_line),
             nested_pages,
             vcpu_control_page,
             msr_permission_map,
+            msr_state_page,
         });
         runnable.push(true);
     }
@@ -544,12 +595,27 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             Err(error) => halt_with_error("nested page table", error),
         };
         // SAFETY: This stopped Domain exclusively owns its guest pages.
-        let guest_cr3 = match unsafe { nested.initialize_guest_page_tables() } {
-            Ok(root) => root,
-            Err(error) => halt_with_error("guest page tables", error),
+        let guest_cr3 = if prepared.image_format == ManifestImageFormat::NativeElf {
+            match unsafe { nested.initialize_guest_page_tables() } {
+                Ok(root) => root,
+                Err(error) => halt_with_error("guest page tables", error),
+            }
+        } else {
+            0
         };
         // SAFETY: The Domain is stopped and its RAM is exclusively owned by mBoot.
-        let guest_image = match unsafe { image::load_elf(&prepared.image, &nested) } {
+        let guest_image = match unsafe {
+            match prepared.image_format {
+                ManifestImageFormat::NativeElf => image::load_elf(&prepared.image, &nested),
+                ManifestImageFormat::LinuxPvh => image::load_linux_pvh(
+                    &prepared.image,
+                    prepared.initramfs.as_deref(),
+                    &prepared.command_line,
+                    0,
+                    &nested,
+                ),
+            }
+        } {
             Ok(image) => image,
             Err(error) => halt_with_error("Domain image", error),
         };
@@ -634,12 +700,21 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         );
         runtime_domains.push(RuntimeDomain {
             guest: GuestConfig {
+                boot_mode: match prepared.image_format {
+                    ManifestImageFormat::NativeElf => GuestBootMode::Long64,
+                    ManifestImageFormat::LinuxPvh => GuestBootMode::LinuxPvh32,
+                },
                 nested_root: domain.nested_pages().hardware_root(),
                 page_table_root: guest_cr3,
                 entry: guest_image.entry(),
                 stack: device_window_start(domain.nested_pages()) - 16,
-                boot_info: DOMAIN_BOOT_INFO_GPA,
+                boot_info: if prepared.image_format == ManifestImageFormat::NativeElf {
+                    DOMAIN_BOOT_INFO_GPA
+                } else {
+                    guest_image.boot_info()
+                },
                 msr_permission_map: prepared.msr_permission_map,
+                msr_state_page: prepared.msr_state_page,
             },
             domain,
             virtualization,
@@ -651,12 +726,19 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             waiting: false,
             resume_kind: ResumeKind::Hypercall,
             event_irq_enabled: false,
-            interrupts: VirtualLocalApic::new(),
+            interrupts: if prepared.image_format == ManifestImageFormat::LinuxPvh {
+                VirtualLocalApic::new_x2apic()
+            } else {
+                VirtualLocalApic::new()
+            },
             restart_policy: prepared.restart_policy,
             max_restarts: prepared.max_restarts,
             restart_count: 0,
             crash_info: None,
             image: prepared.image,
+            image_format: prepared.image_format,
+            initramfs: prepared.initramfs,
+            command_line: prepared.command_line,
         });
     }
 
@@ -752,6 +834,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     // SAFETY: No guest instruction completed at the previous exit.
                     unsafe { runtime.virtualization.resume_preempted() }
                 }
+                ResumeKind::Halted => {
+                    // SAFETY: This vCPU stopped on an intercepted HLT.
+                    unsafe { runtime.virtualization.resume_halted() }
+                }
                 ResumeKind::MsrRead(value) => {
                     // SAFETY: The value completes the preceding intercepted RDMSR.
                     unsafe { runtime.virtualization.resume_msr_read(value) }
@@ -823,6 +909,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             runtime.resume_kind = ResumeKind::WithoutAdvance;
             continue;
         }
+        if vm_exit.reason == VmExitReason::Halt {
+            runtime.resume_kind = ResumeKind::Halted;
+            continue;
+        }
         if vm_exit.reason == VmExitReason::MsrRead {
             if runtime.interrupts.update_timer(timer::now()).is_err() {
                 halt_with_error("Virtual APIC timer", mboot_hv::Error::InvalidState)
@@ -849,12 +939,16 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             continue;
         }
         if vm_exit.reason == VmExitReason::Cpuid {
-            runtime.resume_kind = ResumeKind::Cpuid(cpuid::query(
+            let result = cpuid::query(
                 vm_exit.cpuid_leaf,
                 vm_exit.cpuid_subleaf,
                 0,
                 1,
-            ));
+                timer::tsc_frequency_hz()
+                    .and_then(|frequency| u32::try_from(frequency / 1_000).ok())
+                    .unwrap_or(1_000_000),
+            );
+            runtime.resume_kind = ResumeKind::Cpuid(result);
             continue;
         }
         if vm_exit.reason == VmExitReason::NestedPageFault {
@@ -1667,16 +1761,31 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
         halt_with_error("vCPU reset", error)
     }
     unsafe { runtime.domain.nested_pages().clear_guest_memory() };
-    let page_table_root =
+    let page_table_root = if runtime.image_format == ManifestImageFormat::NativeElf {
         match unsafe { runtime.domain.nested_pages().initialize_guest_page_tables() } {
             Ok(root) => root,
             Err(error) => halt_with_error("guest page table restart", error),
-        };
-    let guest_image =
-        match unsafe { image::load_elf(&runtime.image, runtime.domain.nested_pages()) } {
-            Ok(image) => image,
-            Err(error) => halt_with_error("Domain image restart", error),
-        };
+        }
+    } else {
+        0
+    };
+    let guest_image = match unsafe {
+        match runtime.image_format {
+            ManifestImageFormat::NativeElf => {
+                image::load_elf(&runtime.image, runtime.domain.nested_pages())
+            }
+            ManifestImageFormat::LinuxPvh => image::load_linux_pvh(
+                &runtime.image,
+                runtime.initramfs.as_deref(),
+                &runtime.command_line,
+                0,
+                runtime.domain.nested_pages(),
+            ),
+        }
+    } {
+        Ok(image) => image,
+        Err(error) => halt_with_error("Domain image restart", error),
+    };
     runtime.restart_count = runtime.restart_count.saturating_add(1);
     let backend = match runtime.domain.backend() {
         BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
@@ -1717,6 +1826,11 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
     }
     runtime.guest.page_table_root = page_table_root;
     runtime.guest.entry = guest_image.entry();
+    runtime.guest.boot_info = if runtime.image_format == ManifestImageFormat::NativeElf {
+        DOMAIN_BOOT_INFO_GPA
+    } else {
+        guest_image.boot_info()
+    };
     runtime.started = false;
     runtime.pending_result = HYPERCALL_SUCCESS;
     runtime.yield_count = 0;
@@ -1725,7 +1839,11 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
     runtime.waiting = false;
     runtime.resume_kind = ResumeKind::Hypercall;
     runtime.event_irq_enabled = false;
-    runtime.interrupts = VirtualLocalApic::new();
+    runtime.interrupts = if runtime.image_format == ManifestImageFormat::LinuxPvh {
+        VirtualLocalApic::new_x2apic()
+    } else {
+        VirtualLocalApic::new()
+    };
     if let Some(info) = &mut runtime.crash_info {
         info.restart_count = runtime.restart_count;
         info.status = DOMAIN_CRASH_STATUS_RESTARTED;
@@ -2098,25 +2216,92 @@ fn allocate_page(boot_services: &BootServices) -> Result<u64, Status> {
         .map_err(|error| error.status())
 }
 
-fn allocate_msr_permission_map(boot_services: &BootServices) -> Result<u64, Status> {
+fn allocate_msr_permission_map(
+    boot_services: &BootServices,
+    backend: BackendKind,
+    image_format: ManifestImageFormat,
+) -> Result<u64, Status> {
     let address = boot_services
         .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 2)
         .map_err(|error| error.status())?;
     // AMD's MSRPM occupies two contiguous pages. Setting every bit intercepts
     // every covered RDMSR and WRMSR until mBoot explicitly emulates it.
     unsafe { write_bytes(address as *mut u8, 0xff, 8192) };
+    if image_format == ManifestImageFormat::LinuxPvh {
+        for msr in [
+            0x174,
+            0x175,
+            0x176,
+            0x277,
+            0xc000_0080,
+            0xc000_0081,
+            0xc000_0082,
+            0xc000_0083,
+            0xc000_0084,
+            0xc000_0100,
+            0xc000_0101,
+            0xc000_0102,
+            0xc000_0103,
+        ] {
+            unsafe { allow_guest_msr(address, backend, msr) };
+        }
+    }
     Ok(address)
+}
+
+unsafe fn allow_guest_msr(bitmap: u64, backend: BackendKind, msr: u32) {
+    match backend {
+        BackendKind::IntelVmx => {
+            let (index, read_base, write_base) = if msr <= 0x1fff {
+                (msr as usize, 0usize, 2048usize)
+            } else if (0xc000_0000..=0xc000_1fff).contains(&msr) {
+                ((msr - 0xc000_0000) as usize, 1024usize, 3072usize)
+            } else {
+                return;
+            };
+            let mask = !(1 << (index & 7));
+            unsafe {
+                let read = (bitmap as *mut u8).add(read_base + index / 8);
+                read.write(read.read() & mask);
+                let write = (bitmap as *mut u8).add(write_base + index / 8);
+                write.write(write.read() & mask);
+            }
+        }
+        BackendKind::AmdSvm => {
+            let index = if msr <= 0x1fff {
+                msr as usize
+            } else if (0xc000_0000..=0xc000_1fff).contains(&msr) {
+                8192 + (msr - 0xc000_0000) as usize
+            } else if (0xc001_0000..=0xc001_1fff).contains(&msr) {
+                16_384 + (msr - 0xc001_0000) as usize
+            } else {
+                return;
+            };
+            let bit = index * 2;
+            let byte = unsafe { (bitmap as *mut u8).add(bit / 8) };
+            let mask = !(0b11 << (bit & 7));
+            unsafe { byte.write(byte.read() & mask) };
+        }
+    }
 }
 
 fn allocate_nested_pages(
     boot_services: &BootServices,
     guest_pages: usize,
 ) -> Result<NestedPageResources, Status> {
+    let level1_pages = guest_pages.div_ceil(512);
     Ok(NestedPageResources {
         root: allocate_page(boot_services)?,
         level3: allocate_page(boot_services)?,
         level2: allocate_page(boot_services)?,
-        level1: allocate_page(boot_services)?,
+        level1: boot_services
+            .allocate_pages(
+                AllocateType::AnyPages,
+                MemoryType::LOADER_DATA,
+                level1_pages,
+            )
+            .map_err(|error| error.status())?,
+        level1_pages,
         guest_base: boot_services
             .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, guest_pages)
             .map_err(|error| error.status())?,

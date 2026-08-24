@@ -23,11 +23,18 @@ const LEAF1_EDX_BASELINE: u32 = (1 << 0)
     | (1 << 26);
 const EXTENDED_EDX_NX: u32 = 1 << 20;
 const EXTENDED_EDX_LONG_MODE: u32 = 1 << 29;
+const EXTENDED_EDX_SYSCALL: u32 = 1 << 11;
 
 /// Returns the stable CPU model exposed to a mochiOS domain.
 ///
 /// `apic_id` and `vcpu_count` describe the domain, not the physical host.
-pub fn query(leaf: u32, subleaf: u32, apic_id: u32, vcpu_count: u32) -> CpuidResult {
+pub fn query(
+    leaf: u32,
+    subleaf: u32,
+    apic_id: u32,
+    vcpu_count: u32,
+    tsc_frequency_khz: u32,
+) -> CpuidResult {
     match leaf {
         0 => vendor_leaf(MAX_BASIC_LEAF, CPU_VENDOR, false),
         1 => CpuidResult {
@@ -40,6 +47,7 @@ pub fn query(leaf: u32, subleaf: u32, apic_id: u32, vcpu_count: u32) -> CpuidRes
         0x4000_0000 => vendor_leaf(MAX_HYPERVISOR_LEAF, HYPERVISOR_VENDOR, true),
         0x4000_0001 => CpuidResult {
             eax: 1,
+            ebx: tsc_frequency_khz,
             ..CpuidResult::default()
         },
         0x8000_0000 => CpuidResult {
@@ -47,7 +55,7 @@ pub fn query(leaf: u32, subleaf: u32, apic_id: u32, vcpu_count: u32) -> CpuidRes
             ..CpuidResult::default()
         },
         0x8000_0001 => CpuidResult {
-            edx: EXTENDED_EDX_NX | EXTENDED_EDX_LONG_MODE,
+            edx: EXTENDED_EDX_SYSCALL | EXTENDED_EDX_NX | EXTENDED_EDX_LONG_MODE,
             ..CpuidResult::default()
         },
         0x8000_0002..=0x8000_0004 => brand_leaf(leaf),
@@ -127,13 +135,13 @@ mod tests {
 
     #[test]
     fn hides_nested_virtualization_and_identifies_mboot() {
-        let features = query(1, 0, 0, 1);
+        let features = query(1, 0, 0, 1, 2_400_000);
         assert_eq!(features.ecx & (1 << 5), 0);
         assert_ne!(features.ecx & LEAF1_ECX_HYPERVISOR, 0);
         assert_ne!(features.ecx & LEAF1_ECX_X2APIC, 0);
-        assert_eq!(query(0x8000_0001, 0, 0, 1).ecx & (1 << 2), 0);
+        assert_eq!(query(0x8000_0001, 0, 0, 1, 2_400_000).ecx & (1 << 2), 0);
 
-        let vendor = query(0x4000_0000, 0, 0, 1);
+        let vendor = query(0x4000_0000, 0, 0, 1, 2_400_000);
         let bytes = [vendor.ebx, vendor.ecx, vendor.edx]
             .map(u32::to_le_bytes)
             .concat();
@@ -142,7 +150,7 @@ mod tests {
 
     #[test]
     fn reports_domain_topology_instead_of_host_topology() {
-        let leaf = query(0x0b, 1, 3, 4);
+        let leaf = query(0x0b, 1, 3, 4, 2_400_000);
         assert_eq!(leaf.eax, 2);
         assert_eq!(leaf.ebx, 4);
         assert_eq!(leaf.edx, 3);
@@ -150,7 +158,15 @@ mod tests {
 
     #[test]
     fn unsupported_leaves_are_empty() {
-        assert_eq!(query(0x1234_5678, 0, 0, 1), CpuidResult::default());
-        assert_eq!(query(7, 0, 0, 1), CpuidResult::default());
+        assert_eq!(
+            query(0x1234_5678, 0, 0, 1, 2_400_000),
+            CpuidResult::default()
+        );
+        assert_eq!(query(7, 0, 0, 1, 2_400_000), CpuidResult::default());
+    }
+
+    #[test]
+    fn reports_the_virtual_tsc_frequency_to_guests() {
+        assert_eq!(query(0x4000_0001, 0, 0, 1, 2_400_000).ebx, 2_400_000);
     }
 }

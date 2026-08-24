@@ -202,8 +202,8 @@ impl GrantTable {
                 continue;
             };
             let owner_is_stopping = grant.owner == domain;
-            let target_is_stopping = grant.target == domain
-                && (revoke_unmapped_target || grant.target_page.is_some());
+            let target_is_stopping =
+                grant.target == domain && (revoke_unmapped_target || grant.target_page.is_some());
             if !owner_is_stopping && !target_is_stopping {
                 continue;
             }

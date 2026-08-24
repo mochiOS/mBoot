@@ -2,7 +2,7 @@ use core::arch::global_asm;
 use core::ptr::write_bytes;
 
 use crate::arch::x86_64::{cpu, read_msr, write_msr};
-use crate::{BackendKind, CpuidResult, Error, GuestConfig, VmExit, VmExitReason};
+use crate::{BackendKind, CpuidResult, Error, GuestBootMode, GuestConfig, VmExit, VmExitReason};
 
 const EFER: u32 = 0xc000_0080;
 const VM_CR: u32 = 0xc001_0114;
@@ -292,7 +292,16 @@ impl Svm {
         unsafe { initialize_guest(self.vmcb_phys, self.guest_asid, config) };
 
         self.run_context = SvmRunContext {
-            rdi: config.boot_info,
+            rdi: if config.boot_mode == GuestBootMode::Long64 {
+                config.boot_info
+            } else {
+                0
+            },
+            rbx: if config.boot_mode == GuestBootMode::LinuxPvh32 {
+                config.boot_info
+            } else {
+                0
+            },
             ..SvmRunContext::default()
         };
         self.started = true;
@@ -321,6 +330,16 @@ impl Svm {
         if !self.active || !self.started {
             return Err(Error::InvalidState);
         }
+        unsafe { self.enter() }
+    }
+
+    pub unsafe fn resume_halted(&mut self) -> Result<VmExit, Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        let rip = unsafe { read_u64(self.vmcb_phys, VMCB_RIP) };
+        // SAFETY: HLT is a one-byte instruction and this vCPU is stopped on it.
+        unsafe { write_u64(self.vmcb_phys, VMCB_RIP, rip + 1) };
         unsafe { self.enter() }
     }
 
@@ -559,7 +578,18 @@ unsafe fn initialize_guest(vmcb: u64, guest_asid: u32, config: GuestConfig) {
         for offset in [VMCB_ES, VMCB_SS, VMCB_DS, VMCB_FS, VMCB_GS] {
             write_segment(vmcb, offset, 0x10, SEGMENT_DATA_LONG_MODE, 0xffff_ffff, 0);
         }
-        write_segment(vmcb, VMCB_CS, 0x08, SEGMENT_CODE_LONG_MODE, 0xffff_ffff, 0);
+        write_segment(
+            vmcb,
+            VMCB_CS,
+            0x08,
+            if config.boot_mode == GuestBootMode::Long64 {
+                SEGMENT_CODE_LONG_MODE
+            } else {
+                0x0c9b
+            },
+            0xffff_ffff,
+            0,
+        );
         write_segment(vmcb, VMCB_GDTR, 0, 0, 0, 0);
         write_segment(vmcb, VMCB_IDTR, 0, 0, 0, 0);
         write_segment(vmcb, VMCB_LDTR, 0, 0, 0, 0);
@@ -567,14 +597,24 @@ unsafe fn initialize_guest(vmcb: u64, guest_asid: u32, config: GuestConfig) {
 
         // SVME remains set in guest EFER while SVM is active. LME and LMA start
         // the Domain directly in 64-bit mode.
+        let long_mode = config.boot_mode == GuestBootMode::Long64;
         write_u64(
             vmcb,
             VMCB_EFER,
-            EFER_SVME | (1 << 8) | (1 << 10) | (1 << 11),
+            EFER_SVME
+                | if long_mode {
+                    (1 << 8) | (1 << 10) | (1 << 11)
+                } else {
+                    0
+                },
         );
-        write_u64(vmcb, VMCB_CR4, 1 << 5);
-        write_u64(vmcb, VMCB_CR3, config.page_table_root);
-        write_u64(vmcb, VMCB_CR0, 0x8001_0033);
+        write_u64(vmcb, VMCB_CR4, if long_mode { 1 << 5 } else { 0 });
+        write_u64(
+            vmcb,
+            VMCB_CR3,
+            if long_mode { config.page_table_root } else { 0 },
+        );
+        write_u64(vmcb, VMCB_CR0, if long_mode { 0x8001_0033 } else { 0x11 });
         write_u64(vmcb, VMCB_DR7, 0x400);
         write_u64(vmcb, VMCB_DR6, 0xffff_0ff0);
         write_u64(vmcb, VMCB_RFLAGS, 2);

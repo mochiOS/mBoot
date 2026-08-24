@@ -48,7 +48,7 @@ sub read_hv_config {
     for my $key (qw(version toolchain disk_size_mib esp_size_mib disk_guid esp_guid)) {
         exists $root{$key} or die "$path: missing $key\n";
     }
-    $root{version} == 4 or die "$path: unsupported version $root{version}\n";
+    $root{version} == 5 or die "$path: unsupported version $root{version}\n";
     $root{disk_size_mib} > $root{esp_size_mib} + 2
         or die "$path: disk_size_mib must exceed esp_size_mib by at least 2 MiB\n";
     @domains && @domains <= 8 or die "$path: domains must contain 1 to 8 entries\n";
@@ -56,19 +56,35 @@ sub read_hv_config {
     my %ids;
     my $system_domains = 0;
     for my $domain (@domains) {
-        for my $key (qw(id role memory_mib vcpus capabilities image path autostart required restart max_restarts)) {
+        for my $key (qw(id role memory_mib vcpus capabilities format image path autostart required restart max_restarts)) {
             exists $domain->{$key} or die "$path: Domain is missing $key\n";
         }
         $domain->{id} > 0 && !$ids{$domain->{id}}++
             or die "$path: Domain IDs must be nonzero and unique\n";
         role_id($domain->{role});
         ++$system_domains if $domain->{role} eq 'system';
-        $domain->{memory_mib} > 0 && $domain->{memory_mib} <= 2
-            or die "$path: current Domain memory_mib range is 1 to 2\n";
+        $domain->{memory_mib} > 0 && $domain->{memory_mib} <= 256
+            or die "$path: Domain memory_mib range is 1 to 256\n";
         $domain->{vcpus} == 1
             or die "$path: current hypervisor supports one vCPU per Domain\n";
         $domain->{path} =~ m{^\\EFI\\MBOOT\\[A-Za-z0-9._-]+$}
             or die "$path: Domain path must stay below \\EFI\\MBOOT\n";
+        $domain->{format} =~ /^(?:native-elf|linux-pvh)$/
+            or die "$path: unsupported Domain image format\n";
+        if ($domain->{format} eq 'linux-pvh') {
+            $domain->{role} eq 'hardware'
+                or die "$path: Linux PVH is only supported for a Hardware Domain\n";
+            for my $key (qw(initramfs initramfs_path command_line)) {
+                exists $domain->{$key} or die "$path: Linux PVH Domain is missing $key\n";
+            }
+            $domain->{initramfs_path} =~ m{^\\EFI\\MBOOT\\[A-Za-z0-9._-]+$}
+                or die "$path: initramfs_path must stay below \\EFI\\MBOOT\n";
+            length($domain->{command_line}) <= 96 && $domain->{command_line} !~ /[^\x20-\x7e]/
+                or die "$path: Linux PVH command_line must be at most 96 ASCII characters\n";
+        }
+        elsif (grep { exists $domain->{$_} } qw(initramfs initramfs_path command_line)) {
+            die "$path: native ELF Domain cannot define Linux PVH boot fields\n";
+        }
         $domain->{autostart}
             or die "$path: current bootstrap requires autostart Domains\n";
         $domain->{restart} =~ /^(?:never|on-failure|always)$/

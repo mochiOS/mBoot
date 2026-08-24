@@ -35,8 +35,9 @@ my $mboot_dir = abs_path("$FindBin::Bin/..");
 $output_file = absolute_output($output_file);
 my $config = read_hv_config($config_file);
 my $cargo = $ENV{MBOOT_HOST_CARGO} // 'cargo';
+my $make = $ENV{MBOOT_HOST_MAKE} // 'make';
 
-for my $command ($cargo, qw(truncate mkfs.vfat mmd mcopy sgdisk dd)) {
+for my $command ($cargo, $make, qw(truncate mkfs.vfat mmd mcopy sgdisk dd)) {
     command_path($command) or die "required command was not found: $command\n";
 }
 
@@ -74,20 +75,38 @@ my %domain_images = (
         bin => 'hardware-bootstrap',
         path => "$mnu_dir/target/x86_64-unknown-none/release/hardware-bootstrap",
     },
+    'driver-linux' => {
+        path => "$mboot_dir/output/driver-linux/vmlinux",
+    },
+);
+my %initramfs_images = (
+    'driver-linux' => "$mboot_dir/output/driver-linux/initramfs.cpio",
 );
 my %required_images;
+my %required_initramfs;
 for my $domain (@{$config->{domains}}) {
     exists $domain_images{$domain->{image}}
         or die "no builder is available for Domain image '$domain->{image}'\n";
     $required_images{$domain->{image}} = 1;
+    if ($domain->{format} eq 'linux-pvh') {
+        exists $initramfs_images{$domain->{initramfs}}
+            or die "no builder is available for initramfs '$domain->{initramfs}'\n";
+        $required_initramfs{$domain->{initramfs}} = 1;
+    }
 }
-my @bins = map { ('--bin', $domain_images{$_}->{bin}) } sort keys %required_images;
-run_env(
-    { RUSTFLAGS => '-C relocation-model=static -C link-arg=-no-pie --cfg curve25519_dalek_backend="serial"' },
-    $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc', '--release',
-    '--target', 'x86_64-unknown-none', '--manifest-path', $mnu_manifest,
-    '--no-default-features', '--features', 'domain-guest', @bins,
-);
+if ($required_images{'driver-linux'}) {
+    run($make, '-C', $mboot_dir, 'driver-linux-artifacts');
+}
+my @native_images = grep { defined $domain_images{$_}->{bin} } sort keys %required_images;
+if (@native_images) {
+    my @bins = map { ('--bin', $domain_images{$_}->{bin}) } @native_images;
+    run_env(
+        { RUSTFLAGS => '-C relocation-model=static -C link-arg=-no-pie --cfg curve25519_dalek_backend="serial"' },
+        $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc', '--release',
+        '--target', 'x86_64-unknown-none', '--manifest-path', $mnu_manifest,
+        '--no-default-features', '--features', 'domain-guest', @bins,
+    );
+}
 for my $name (keys %required_images) {
     my $path = $domain_images{$name}->{path};
     -s $path or die "Domain image was not produced: $path\n";
@@ -97,6 +116,7 @@ run(
     "$mboot_dir/scripts/create-hv-launch-manifest.pl",
     '--config', $config_file,
     map({ ('--image', "$_=$domain_images{$_}->{path}") } sort keys %required_images),
+    map({ ('--initramfs', "$_=$initramfs_images{$_}") } sort keys %required_initramfs),
     '--output', $manifest,
 );
 
@@ -130,6 +150,11 @@ for my $domain (@{$config->{domains}}) {
     next if $copied_paths{$domain->{path}}++;
     (my $destination = $domain->{path}) =~ s{\\}{/}g;
     run('mcopy', '-i', $esp, $source, "::$destination");
+    if ($domain->{format} eq 'linux-pvh') {
+        my $initramfs_source = $initramfs_images{$domain->{initramfs}};
+        (my $initramfs_destination = $domain->{initramfs_path}) =~ s{\\}{/}g;
+        run('mcopy', '-o', '-i', $esp, $initramfs_source, "::$initramfs_destination");
+    }
 }
 
 my $temporary = "$output_file.new";

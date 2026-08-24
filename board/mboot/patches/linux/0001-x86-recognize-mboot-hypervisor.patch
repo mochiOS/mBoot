@@ -1,0 +1,133 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/hypervisor: recognize the mBoot hypervisor
+
+mBoot exposes x2APIC to its guests and identifies itself through the
+standard hypervisor CPUID leaf. Teach Linux about that vendor so early
+APIC setup does not fall back to the physical xAPIC MMIO page.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+ arch/x86/include/asm/hypervisor.h |  2 ++
+ arch/x86/kernel/cpu/Makefile      |  1 +
+ arch/x86/kernel/cpu/hypervisor.c  |  1 +
+ arch/x86/kernel/cpu/mboot.c       | 67 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 71 insertions(+)
+ create mode 100644 arch/x86/kernel/cpu/mboot.c
+
+diff --git a/arch/x86/include/asm/hypervisor.h b/arch/x86/include/asm/hypervisor.h
+index 7048dfacc..38ef0c9b0 100644
+--- a/arch/x86/include/asm/hypervisor.h
++++ b/arch/x86/include/asm/hypervisor.h
+@@ -31,6 +31,7 @@ enum x86_hypervisor_type {
+ 	X86_HYPER_KVM,
+ 	X86_HYPER_JAILHOUSE,
+ 	X86_HYPER_ACRN,
++	X86_HYPER_MBOOT,
+ };
+ 
+ #ifdef CONFIG_HYPERVISOR_GUEST
+@@ -65,5 +66,6 @@ extern const struct hypervisor_x86 x86_hyper_kvm;
+ extern const struct hypervisor_x86 x86_hyper_jailhouse;
+ extern const struct hypervisor_x86 x86_hyper_acrn;
++extern const struct hypervisor_x86 x86_hyper_mboot;
+ extern struct hypervisor_x86 x86_hyper_xen_hvm;
+ 
+ extern bool nopv;
+diff --git a/arch/x86/kernel/cpu/Makefile b/arch/x86/kernel/cpu/Makefile
+index 5857a0f5d..2d1e0222e 100644
+--- a/arch/x86/kernel/cpu/Makefile
++++ b/arch/x86/kernel/cpu/Makefile
+@@ -64,5 +64,6 @@ obj-$(CONFIG_X86_LOCAL_APIC)		+= perfctr-watchdog.o
+ 
+ obj-$(CONFIG_HYPERVISOR_GUEST)		+= vmware.o hypervisor.o mshyperv.o
++obj-$(CONFIG_HYPERVISOR_GUEST)		+= mboot.o
+ obj-$(CONFIG_ACRN_GUEST)		+= acrn.o
+ 
+ obj-$(CONFIG_DEBUG_FS)			+= debugfs.o
+diff --git a/arch/x86/kernel/cpu/hypervisor.c b/arch/x86/kernel/cpu/hypervisor.c
+index 553bfbfc3..b251bf80f 100644
+--- a/arch/x86/kernel/cpu/hypervisor.c
++++ b/arch/x86/kernel/cpu/hypervisor.c
+@@ -45,6 +45,7 @@ static const __initconst struct hypervisor_x86 * const hypervisors[] =
+ #ifdef CONFIG_ACRN_GUEST
+ 	&x86_hyper_acrn,
+ #endif
++	&x86_hyper_mboot,
+ };
+ 
+ enum x86_hypervisor_type x86_hyper_type;
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+new file mode 100644
+index 000000000..e2c85c822
+--- /dev/null
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -0,0 +1,67 @@
++// SPDX-License-Identifier: GPL-2.0
++/* mBoot hypervisor detection support. */
++
++#include <linux/init.h>
++
++#include <asm/cpuid.h>
++#include <asm/cpufeature.h>
++#include <asm/hypervisor.h>
++#include <asm/apic.h>
++#include <asm/mpspec.h>
++
++#define MBOOT_SIGNATURE "MochiOSmBoot"
++
++static u32 __init mboot_detect(void)
++{
++	return hypervisor_cpuid_base(MBOOT_SIGNATURE, 0);
++}
++
++static bool __init mboot_x2apic_available(void)
++{
++	return boot_cpu_has(X86_FEATURE_X2APIC);
++}
++
++static unsigned long mboot_tsc_khz(void)
++{
++	u32 eax, ebx, ecx, edx;
++
++	cpuid(0x40000001, &eax, &ebx, &ecx, &edx);
++	return ebx;
++}
++
++static void __init mboot_init_platform(void)
++{
++	unsigned long tsc_khz = mboot_tsc_khz();
++
++	smp_found_config = 1;
++
++	if (tsc_khz) {
++		x86_platform.calibrate_cpu = mboot_tsc_khz;
++		x86_platform.calibrate_tsc = mboot_tsc_khz;
++		lapic_timer_period = (tsc_khz * 1000) / HZ;
++	}
++
++#ifdef CONFIG_X86_X2APIC
++	if (!x2apic_enabled())
++		return;
++
++	/* mBoot exposes physical x2APIC destinations without an I/O APIC. */
++	x2apic_phys = 1;
++	default_acpi_madt_oem_check("", "");
++#endif
++}
++
++const __initconst struct hypervisor_x86 x86_hyper_mboot = {
++	.name			= "mBoot",
++	.detect			= mboot_detect,
++	.type			= X86_HYPER_MBOOT,
++	.init.init_platform	= mboot_init_platform,
++	.init.x2apic_available	= mboot_x2apic_available,
++};
++
++static int __init mboot_guest_ready(void)
++{
++	pr_info("Driver Linux OK\n");
++	return 0;
++}
++late_initcall(mboot_guest_ready);
+-- 
+2.47.2

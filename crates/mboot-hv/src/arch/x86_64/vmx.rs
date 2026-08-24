@@ -5,7 +5,8 @@ use crate::arch::x86_64::{
     descriptor, read_cr0, read_cr3, read_cr4, read_msr, write_cr0, write_cr4, write_msr,
 };
 use crate::{
-    arch::x86_64::cpu, BackendKind, CpuidResult, Error, GuestConfig, VmExit, VmExitReason,
+    arch::x86_64::cpu, BackendKind, CpuidResult, Error, GuestBootMode, GuestConfig, VmExit,
+    VmExitReason,
 };
 
 const IA32_FEATURE_CONTROL: u32 = 0x3a;
@@ -49,11 +50,16 @@ const ENTRY_INTERRUPTION_INFO: u64 = 0x4016;
 const ENTRY_EXCEPTION_ERROR_CODE: u64 = 0x4018;
 const SECONDARY_CONTROLS: u64 = 0x401e;
 const MSR_BITMAP: u64 = 0x2004;
+const EXIT_MSR_STORE_ADDRESS: u64 = 0x2006;
+const EXIT_MSR_LOAD_ADDRESS: u64 = 0x2008;
+const ENTRY_MSR_LOAD_ADDRESS: u64 = 0x200a;
 const EPT_POINTER: u64 = 0x201a;
 const GUEST_PHYSICAL_ADDRESS: u64 = 0x2400;
 const VMCS_LINK_POINTER: u64 = 0x2800;
 const GUEST_DEBUGCTL: u64 = 0x2802;
+const GUEST_PAT: u64 = 0x2804;
 const GUEST_EFER: u64 = 0x2806;
+const HOST_PAT: u64 = 0x2c00;
 const HOST_EFER: u64 = 0x2c02;
 const GUEST_ES_SELECTOR: u64 = 0x0800;
 const GUEST_CS_SELECTOR: u64 = 0x0802;
@@ -134,6 +140,23 @@ const VMCALL_EXIT_REASON: u64 = 18;
 const RDMSR_EXIT_REASON: u64 = 31;
 const WRMSR_EXIT_REASON: u64 = 32;
 const EPT_VIOLATION_EXIT_REASON: u64 = 48;
+const IA32_PAT: u32 = 0x277;
+const GUEST_MSR_LIST: [u32; 6] = [
+    0xc000_0081,
+    0xc000_0082,
+    0xc000_0083,
+    0xc000_0084,
+    0xc000_0102,
+    0xc000_0103,
+];
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct VmEntryMsr {
+    index: u32,
+    reserved: u32,
+    value: u64,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -446,7 +469,16 @@ impl Vmx {
         unsafe { initialize_vmcs(config)? };
         self.run_context = VmxRunContext {
             rax: 0,
-            rdi: config.boot_info,
+            rdi: if config.boot_mode == GuestBootMode::Long64 {
+                config.boot_info
+            } else {
+                0
+            },
+            rbx: if config.boot_mode == GuestBootMode::LinuxPvh32 {
+                config.boot_info
+            } else {
+                0
+            },
             ..VmxRunContext::default()
         };
         super::timer::prepare_entry();
@@ -505,6 +537,10 @@ impl Vmx {
             }));
         }
         unsafe { self.decode_exit() }
+    }
+
+    pub unsafe fn resume_halted(&mut self) -> Result<VmExit, Error> {
+        unsafe { self.resume_instruction() }
     }
 
     pub unsafe fn resume_msr_read(&mut self, value: u64) -> Result<VmExit, Error> {
@@ -843,17 +879,34 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
         return Err(Error::InterruptVirtualizationUnavailable);
     }
     // SAFETY: Capability MSRs are available after VMX CPUID detection.
+    let pvh = config.boot_mode == GuestBootMode::LinuxPvh32;
     let (pin, primary, secondary, exit, entry) = unsafe {
         (
             adjusted_vm_control(1, read_msr(pin_msr)),
             adjusted_vm_control((1 << 7) | (1 << 31), read_msr(primary_msr)),
-            adjusted_vm_control(1 << 1, read_msr(IA32_VMX_PROCBASED_CTLS2)),
-            adjusted_vm_control((1 << 9) | (1 << 15) | (1 << 21), read_msr(exit_msr)),
-            adjusted_vm_control((1 << 9) | (1 << 15), read_msr(entry_msr)),
+            adjusted_vm_control(
+                (1 << 1) | if pvh { 1 << 7 } else { 0 },
+                read_msr(IA32_VMX_PROCBASED_CTLS2),
+            ),
+            adjusted_vm_control(
+                (1 << 9)
+                    | (1 << 15)
+                    | (1 << 20)
+                    | (1 << 21)
+                    | if pvh { (1 << 18) | (1 << 19) } else { 0 },
+                read_msr(exit_msr),
+            ),
+            adjusted_vm_control(
+                (if pvh { 1 << 14 } else { 1 << 9 }) | (1 << 15),
+                read_msr(entry_msr),
+            ),
         )
     };
     if secondary & (1 << 1) == 0 {
         return Err(Error::NestedPagingUnavailable);
+    }
+    if pvh && secondary & (1 << 7) == 0 {
+        return Err(Error::UnsupportedCpu);
     }
     if pin & 1 == 0 || exit & (1 << 15) == 0 {
         return Err(Error::InterruptVirtualizationUnavailable);
@@ -869,9 +922,18 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
         (PAGE_FAULT_ERROR_MASK, 0),
         (PAGE_FAULT_ERROR_MATCH, 0),
         (CR3_TARGET_COUNT, 0),
-        (EXIT_MSR_STORE_COUNT, 0),
-        (EXIT_MSR_LOAD_COUNT, 0),
-        (ENTRY_MSR_LOAD_COUNT, 0),
+        (
+            EXIT_MSR_STORE_COUNT,
+            if pvh { GUEST_MSR_LIST.len() as u64 } else { 0 },
+        ),
+        (
+            EXIT_MSR_LOAD_COUNT,
+            if pvh { GUEST_MSR_LIST.len() as u64 } else { 0 },
+        ),
+        (
+            ENTRY_MSR_LOAD_COUNT,
+            if pvh { GUEST_MSR_LIST.len() as u64 } else { 0 },
+        ),
         (ENTRY_INTERRUPTION_INFO, 0),
     ] {
         // SAFETY: Each field is a writable control field of the current VMCS.
@@ -880,6 +942,16 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
     if primary & (1 << 28) != 0 {
         validate_page(config.msr_permission_map)?;
         unsafe { vmwrite(MSR_BITMAP, config.msr_permission_map)? };
+    }
+    if pvh {
+        unsafe { initialize_guest_msr_lists(config.msr_state_page)? };
+        let host_list = config.msr_state_page
+            + (GUEST_MSR_LIST.len() * core::mem::size_of::<VmEntryMsr>()) as u64;
+        unsafe {
+            vmwrite(EXIT_MSR_STORE_ADDRESS, config.msr_state_page)?;
+            vmwrite(ENTRY_MSR_LOAD_ADDRESS, config.msr_state_page)?;
+            vmwrite(EXIT_MSR_LOAD_ADDRESS, host_list)?;
+        }
     }
     // SAFETY: `ept_pointer` was constructed from validated EPT capabilities.
     unsafe {
@@ -891,6 +963,7 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
 }
 
 unsafe fn initialize_guest_state(config: GuestConfig) -> Result<(), Error> {
+    let pvh = config.boot_mode == GuestBootMode::LinuxPvh32;
     for (field, selector) in [
         (GUEST_ES_SELECTOR, 0x10),
         (GUEST_CS_SELECTOR, 0x08),
@@ -928,7 +1001,7 @@ unsafe fn initialize_guest_state(config: GuestConfig) -> Result<(), Error> {
     }
     // SAFETY: These are architectural long-mode segment encodings.
     unsafe {
-        vmwrite(GUEST_CS_AR, 0xa09b)?;
+        vmwrite(GUEST_CS_AR, if pvh { 0xc09b } else { 0xa09b })?;
         vmwrite(GUEST_LDTR_AR, 0x1_0000)?;
         vmwrite(GUEST_TR_AR, 0x8b)?;
         vmwrite(GUEST_TR_LIMIT, 0x67)?;
@@ -954,25 +1027,39 @@ unsafe fn initialize_guest_state(config: GuestConfig) -> Result<(), Error> {
     }
     // SAFETY: All remaining values satisfy IA-32e guest VM-entry checks.
     unsafe {
-        let guest_cr0 = adjusted_control_register(
-            0x8001_0033,
+        let mut guest_cr0 = adjusted_control_register(
+            if pvh { 0x11 } else { 0x8001_0033 },
             read_msr(IA32_VMX_CR0_FIXED0),
             read_msr(IA32_VMX_CR0_FIXED1),
         );
+        if pvh {
+            guest_cr0 &= !(1 << 31);
+            guest_cr0 |= 1;
+        }
         let guest_cr4 = adjusted_control_register(
-            1 << 5,
+            if pvh { 0 } else { 1 << 5 },
             read_msr(IA32_VMX_CR4_FIXED0),
             read_msr(IA32_VMX_CR4_FIXED1),
         );
         vmwrite(GUEST_CR0, guest_cr0)?;
-        vmwrite(GUEST_CR3, config.page_table_root)?;
+        vmwrite(GUEST_CR3, if pvh { 0 } else { config.page_table_root })?;
         vmwrite(GUEST_CR4, guest_cr4)?;
         vmwrite(GUEST_DR7, 0x400)?;
         vmwrite(GUEST_RSP, config.stack)?;
         vmwrite(GUEST_RIP, config.entry)?;
         vmwrite(GUEST_RFLAGS, 2)?;
         vmwrite(GUEST_DEBUGCTL, 0)?;
-        vmwrite(GUEST_EFER, (1 << 8) | (1 << 10) | (1 << 11))?;
+        vmwrite(
+            GUEST_EFER,
+            if pvh {
+                0
+            } else {
+                (1 << 8) | (1 << 10) | (1 << 11)
+            },
+        )?;
+        if pvh {
+            vmwrite(GUEST_PAT, read_msr(IA32_PAT))?;
+        }
         vmwrite(VMCS_LINK_POINTER, u64::MAX)?;
         vmwrite(GUEST_INTERRUPTIBILITY, 0)?;
         vmwrite(GUEST_ACTIVITY_STATE, 0)?;
@@ -1010,6 +1097,29 @@ unsafe fn initialize_host_state() -> Result<(), Error> {
         vmwrite(HOST_SYSENTER_ESP, read_msr(IA32_SYSENTER_ESP))?;
         vmwrite(HOST_SYSENTER_EIP, read_msr(IA32_SYSENTER_EIP))?;
         vmwrite(HOST_EFER, read_msr(IA32_EFER))?;
+        vmwrite(HOST_PAT, read_msr(IA32_PAT))?;
+    }
+    Ok(())
+}
+
+unsafe fn initialize_guest_msr_lists(page: u64) -> Result<(), Error> {
+    validate_page(page)?;
+    unsafe { write_bytes(page as *mut u8, 0, 4096) };
+    let guest = page as *mut VmEntryMsr;
+    let host = unsafe { guest.add(GUEST_MSR_LIST.len()) };
+    for (index, msr) in GUEST_MSR_LIST.iter().copied().enumerate() {
+        unsafe {
+            guest.add(index).write(VmEntryMsr {
+                index: msr,
+                reserved: 0,
+                value: 0,
+            });
+            host.add(index).write(VmEntryMsr {
+                index: msr,
+                reserved: 0,
+                value: read_msr(msr),
+            });
+        }
     }
     Ok(())
 }

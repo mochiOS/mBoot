@@ -34,6 +34,8 @@ const X2APIC_IRR_BASE: u32 = 0x820;
 const X2APIC_ESR: u32 = 0x828;
 const X2APIC_ICR: u32 = 0x830;
 const X2APIC_LVT_TIMER: u32 = 0x832;
+const X2APIC_LVT_THERMAL: u32 = 0x833;
+const X2APIC_LVT_ERROR: u32 = 0x837;
 const X2APIC_INITIAL_COUNT: u32 = 0x838;
 const X2APIC_CURRENT_COUNT: u32 = 0x839;
 const X2APIC_DIVIDE_CONFIGURATION: u32 = 0x83e;
@@ -58,6 +60,7 @@ pub struct VirtualLocalApic {
     spurious_vector: u16,
     icr: u64,
     lvt_timer: u32,
+    lvt_local: [u32; 5],
     timer_initial_count: u32,
     timer_current_count: u32,
     timer_divide_configuration: u8,
@@ -76,12 +79,19 @@ impl VirtualLocalApic {
             spurious_vector: 0xff,
             icr: 0,
             lvt_timer: LVT_MASKED,
+            lvt_local: [LVT_MASKED; 5],
             timer_initial_count: 0,
             timer_current_count: 0,
             timer_divide_configuration: 0,
             timer_last_tsc: 0,
             timer_remainder: 0,
         }
+    }
+
+    pub const fn new_x2apic() -> Self {
+        let mut apic = Self::new();
+        apic.apic_base |= APIC_BASE_X2APIC;
+        apic
     }
 
     pub fn raise(&mut self, vector: u8) -> Result<(), InterruptError> {
@@ -160,6 +170,9 @@ impl VirtualLocalApic {
             X2APIC_ESR => Ok(0),
             X2APIC_ICR => Ok(self.icr),
             X2APIC_LVT_TIMER => Ok(u64::from(self.lvt_timer)),
+            X2APIC_LVT_THERMAL..=X2APIC_LVT_ERROR => Ok(u64::from(
+                self.lvt_local[(msr - X2APIC_LVT_THERMAL) as usize],
+            )),
             X2APIC_INITIAL_COUNT => Ok(u64::from(self.timer_initial_count)),
             X2APIC_CURRENT_COUNT => Ok(u64::from(self.timer_current_count)),
             X2APIC_DIVIDE_CONFIGURATION => Ok(u64::from(self.timer_divide_configuration)),
@@ -191,7 +204,7 @@ impl VirtualLocalApic {
                 Err(InterruptError::NotInService) => Ok(ApicMsrEffect::None),
                 Err(error) => Err(ApicMsrError::Interrupt(error)),
             },
-            X2APIC_SIVR if value & !0x1ff == 0 && value as u8 >= 0x10 => {
+            X2APIC_SIVR if value & !0x3ff == 0 && value as u8 >= 0x10 => {
                 self.spurious_vector = value as u16;
                 Ok(ApicMsrEffect::None)
             }
@@ -206,6 +219,10 @@ impl VirtualLocalApic {
                     return Err(ApicMsrError::InvalidValue);
                 }
                 self.lvt_timer = value;
+                Ok(ApicMsrEffect::None)
+            }
+            X2APIC_LVT_THERMAL..=X2APIC_LVT_ERROR if value <= u32::MAX.into() => {
+                self.lvt_local[(msr - X2APIC_LVT_THERMAL) as usize] = value as u32;
                 Ok(ApicMsrEffect::None)
             }
             X2APIC_INITIAL_COUNT if value <= u32::MAX.into() => {
@@ -435,6 +452,17 @@ mod tests {
     fn x2apic_registers_require_x2apic_mode() {
         let apic = VirtualLocalApic::new();
         assert_eq!(apic.read_msr(X2APIC_TPR), Err(ApicMsrError::Disabled));
+    }
+
+    #[test]
+    fn x2apic_local_vector_table_state_round_trips() {
+        let mut apic = x2apic();
+        for msr in X2APIC_LVT_THERMAL..=X2APIC_LVT_ERROR {
+            assert_eq!(apic.read_msr(msr), Ok(u64::from(LVT_MASKED)));
+            let value = u64::from(LVT_MASKED | 0xfe);
+            assert_eq!(apic.write_msr(msr, value), Ok(ApicMsrEffect::None));
+            assert_eq!(apic.read_msr(msr), Ok(value));
+        }
     }
 
     #[test]

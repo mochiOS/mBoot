@@ -4,9 +4,9 @@ use sha2::{Digest, Sha256};
 use crate::Error;
 
 pub const MANIFEST_MAGIC: &[u8; 8] = b"MBLHV1\0\0";
-pub const MANIFEST_VERSION: u16 = 4;
+pub const MANIFEST_VERSION: u16 = 5;
 pub const MANIFEST_HEADER_SIZE: usize = 32;
-pub const DOMAIN_ENTRY_SIZE: usize = 160;
+pub const DOMAIN_ENTRY_SIZE: usize = 384;
 pub const EVENT_CHANNEL_ENTRY_SIZE: usize = 32;
 pub const DEVICE_ENTRY_SIZE: usize = 32;
 pub const MAX_DOMAIN_COUNT: usize = 8;
@@ -36,6 +36,13 @@ pub enum ManifestRestartPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ManifestImageFormat {
+    NativeElf = 0,
+    LinuxPvh = 1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum ManifestDeviceKind {
     Other = 0,
@@ -55,9 +62,13 @@ pub struct ManifestDomain<'a> {
     pub vcpu_count: u16,
     pub restart_policy: ManifestRestartPolicy,
     pub max_restarts: u8,
+    pub image_format: ManifestImageFormat,
     pub capabilities: u64,
     pub image_sha256: [u8; 32],
     pub image_path: &'a str,
+    pub initramfs_sha256: [u8; 32],
+    pub initramfs_path: Option<&'a str>,
+    pub command_line: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +106,18 @@ impl ManifestDomain<'_> {
     pub fn verify_image(self, image: &[u8]) -> Result<(), Error> {
         let actual: [u8; 32] = Sha256::digest(image).into();
         if actual == self.image_sha256 {
+            Ok(())
+        } else {
+            Err(Error::ImageDigestMismatch)
+        }
+    }
+
+    pub fn verify_initramfs(self, image: &[u8]) -> Result<(), Error> {
+        if self.initramfs_path.is_none() {
+            return Err(Error::InvalidManifest);
+        }
+        let actual: [u8; 32] = Sha256::digest(image).into();
+        if actual == self.initramfs_sha256 {
             Ok(())
         } else {
             Err(Error::ImageDigestMismatch)
@@ -243,6 +266,11 @@ impl<'a> LaunchManifest<'a> {
             _ => return Err(Error::InvalidManifest),
         };
         let max_restarts = entry[19];
+        let image_format = match entry[20] {
+            0 => ManifestImageFormat::NativeElf,
+            1 => ManifestImageFormat::LinuxPvh,
+            _ => return Err(Error::InvalidManifest),
+        };
         if id == 0
             || flags & !DOMAIN_FLAGS_KNOWN != 0
             || memory_size == 0
@@ -250,8 +278,8 @@ impl<'a> LaunchManifest<'a> {
             || vcpu_count == 0
             || restart_policy == ManifestRestartPolicy::Never && max_restarts != 0
             || restart_policy != ManifestRestartPolicy::Never && max_restarts == 0
-            || entry[20..32].iter().any(|byte| *byte != 0)
-            || entry[74..80].iter().any(|byte| *byte != 0)
+            || entry[21..32].iter().any(|byte| *byte != 0)
+            || entry[78..80].iter().any(|byte| *byte != 0)
         {
             return Err(Error::InvalidManifest);
         }
@@ -266,12 +294,50 @@ impl<'a> LaunchManifest<'a> {
             .try_into()
             .map_err(|_| Error::InvalidManifest)?;
         let path_len = usize::from(read_u16(entry, 72)?);
-        let path_bytes = entry.get(80..80 + path_len).ok_or(Error::InvalidManifest)?;
-        if path_len == 0 || entry[80 + path_len..].iter().any(|byte| *byte != 0) {
+        let initramfs_path_len = usize::from(read_u16(entry, 74)?);
+        let command_line_len = usize::from(read_u16(entry, 76)?);
+        let initramfs_sha256 = entry[80..112]
+            .try_into()
+            .map_err(|_| Error::InvalidManifest)?;
+        let path_bytes = entry
+            .get(112..112 + path_len)
+            .ok_or(Error::InvalidManifest)?;
+        let initramfs_path_bytes = entry
+            .get(192..192 + initramfs_path_len)
+            .ok_or(Error::InvalidManifest)?;
+        let command_line_bytes = entry
+            .get(272..272 + command_line_len)
+            .ok_or(Error::InvalidManifest)?;
+        if path_len == 0
+            || path_len > 80
+            || initramfs_path_len > 80
+            || command_line_len > 96
+            || entry[112 + path_len..192].iter().any(|byte| *byte != 0)
+            || entry[192 + initramfs_path_len..272]
+                .iter()
+                .any(|byte| *byte != 0)
+            || entry[272 + command_line_len..]
+                .iter()
+                .any(|byte| *byte != 0)
+        {
             return Err(Error::InvalidManifest);
         }
         let image_path = core::str::from_utf8(path_bytes).map_err(|_| Error::InvalidManifest)?;
-        if !valid_uefi_path(image_path) {
+        let initramfs_path = if initramfs_path_len == 0 {
+            None
+        } else {
+            Some(core::str::from_utf8(initramfs_path_bytes).map_err(|_| Error::InvalidManifest)?)
+        };
+        let command_line =
+            core::str::from_utf8(command_line_bytes).map_err(|_| Error::InvalidManifest)?;
+        if !valid_uefi_path(image_path)
+            || initramfs_path.is_some_and(|path| !valid_uefi_path(path))
+            || !command_line.is_ascii()
+            || image_format == ManifestImageFormat::NativeElf
+                && (initramfs_path.is_some() || !command_line.is_empty())
+            || image_format == ManifestImageFormat::LinuxPvh && role != ManifestDomainRole::Hardware
+            || initramfs_path.is_none() && initramfs_sha256 != [0; 32]
+        {
             return Err(Error::InvalidManifest);
         }
         Ok(ManifestDomain {
@@ -282,9 +348,13 @@ impl<'a> LaunchManifest<'a> {
             vcpu_count,
             restart_policy,
             max_restarts,
+            image_format,
             capabilities,
             image_sha256,
             image_path,
+            initramfs_sha256,
+            initramfs_path,
+            command_line,
         })
     }
 
@@ -427,7 +497,7 @@ mod tests {
         entry[18] = ManifestRestartPolicy::Never as u8;
         let path = b"\\EFI\\MBOOT\\MNU.ELF";
         entry[72..74].copy_from_slice(&(path.len() as u16).to_le_bytes());
-        entry[80..80 + path.len()].copy_from_slice(path);
+        entry[112..112 + path.len()].copy_from_slice(path);
         bytes
     }
 
@@ -470,6 +540,7 @@ mod tests {
         assert_eq!(domain.role, ManifestDomainRole::System);
         assert_eq!(domain.memory_size, 2 * 1024 * 1024);
         assert_eq!(domain.restart_policy, ManifestRestartPolicy::Never);
+        assert_eq!(domain.image_format, ManifestImageFormat::NativeElf);
         assert_eq!(domain.image_path, "\\EFI\\MBOOT\\MNU.ELF");
         assert!(domain.auto_starts());
         assert!(domain.is_required());
@@ -492,8 +563,8 @@ mod tests {
         let path = b"\\EFI\\..\\MNU.ELF";
         bytes[MANIFEST_HEADER_SIZE + 72..MANIFEST_HEADER_SIZE + 74]
             .copy_from_slice(&(path.len() as u16).to_le_bytes());
-        bytes[MANIFEST_HEADER_SIZE + 80..].fill(0);
-        bytes[MANIFEST_HEADER_SIZE + 80..MANIFEST_HEADER_SIZE + 80 + path.len()]
+        bytes[MANIFEST_HEADER_SIZE + 112..192].fill(0);
+        bytes[MANIFEST_HEADER_SIZE + 112..MANIFEST_HEADER_SIZE + 112 + path.len()]
             .copy_from_slice(path);
         let digest = Sha256::digest(bytes).into();
         assert_eq!(
@@ -553,5 +624,29 @@ mod tests {
             domain.verify_image(b"changed image"),
             Err(Error::ImageDigestMismatch)
         );
+    }
+
+    #[test]
+    fn parses_linux_pvh_boot_assets() {
+        let mut bytes = manifest();
+        let entry = &mut bytes[MANIFEST_HEADER_SIZE..];
+        entry[4..6].copy_from_slice(&(ManifestDomainRole::Hardware as u16).to_le_bytes());
+        entry[20] = ManifestImageFormat::LinuxPvh as u8;
+        let initramfs = br"\EFI\MBOOT\DRIVER.CPIO";
+        let command_line = b"console=ttyS0 init=/init";
+        entry[74..76].copy_from_slice(&(initramfs.len() as u16).to_le_bytes());
+        entry[76..78].copy_from_slice(&(command_line.len() as u16).to_le_bytes());
+        entry[80..112].copy_from_slice(&Sha256::digest(b"initramfs"));
+        entry[192..192 + initramfs.len()].copy_from_slice(initramfs);
+        entry[272..272 + command_line.len()].copy_from_slice(command_line);
+        let digest = Sha256::digest(bytes).into();
+        let domain = LaunchManifest::parse(&bytes, digest)
+            .unwrap()
+            .domain(0)
+            .unwrap();
+        assert_eq!(domain.image_format, ManifestImageFormat::LinuxPvh);
+        assert_eq!(domain.initramfs_path, Some("\\EFI\\MBOOT\\DRIVER.CPIO"));
+        assert_eq!(domain.command_line, "console=ttyS0 init=/init");
+        assert_eq!(domain.verify_initramfs(b"initramfs"), Ok(()));
     }
 }
