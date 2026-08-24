@@ -61,6 +61,10 @@ pub fn mochios_ready() {
     show(0x0017_4F35, b"MBOOT", b"MOCHIOS OK");
 }
 
+pub fn hardware_ready() {
+    show(0x0017_4F35, b"MBOOT", b"HARDWARE OK");
+}
+
 pub fn failure(code: u8) {
     show(0x006B_2028, b"MBOOT", b"ERROR");
     let digits = [b'0' + (code / 10) % 10, b'0' + code % 10];

@@ -1208,6 +1208,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                         display::mochios_ready();
                     } else {
                         log!("Hardware Domain {} ready", runtime.domain.id().get());
+                        display::hardware_ready();
                     }
                     HYPERCALL_SUCCESS
                 }
