@@ -225,6 +225,17 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
 
     let boot_services = system_table.boot_services();
+    let iommu_tables = match iommu_topology {
+        Some(topology) => match allocate_iommu_tables(boot_services, topology) {
+            Ok(tables) => tables,
+            Err(status) => {
+                log!("failed to allocate deny-all IOMMU tables: {:?}", status);
+                display::failure(18);
+                return status;
+            }
+        },
+        None => Vec::new(),
+    };
     let manifest_bytes = match load_file(boot_services, image_handle, LAUNCH_MANIFEST_PATH) {
         Ok(bytes) => bytes,
         Err(status) => {
@@ -384,6 +395,17 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             "PCI DMA quarantine",
             mboot_hv::Error::DeviceQuarantineFailed,
         )
+    }
+    if let Some(topology) = iommu_topology {
+        // SAFETY: Tables were allocated and zeroed before ExitBootServices, PCI
+        // bus mastering is disabled, and mBoot now exclusively owns IOMMU MMIO.
+        if let Err(error) = unsafe { iommu::enable_deny_all(&topology, &iommu_tables) } {
+            halt_with_error("IOMMU protection", iommu_error(error))
+        }
+        log!(
+            "IOMMU DMA protection enabled: {:?} deny-all",
+            topology.kind()
+        );
     }
     let preemption_timer = unsafe { timer::initialize() };
     log!(
@@ -1422,6 +1444,31 @@ fn grant_window_contains(memory: &NestedPageTable, guest_page: u64) -> bool {
             .is_some_and(|end| end <= memory.guest_memory_size())
 }
 
+fn allocate_iommu_tables(
+    boot_services: &BootServices,
+    topology: iommu::IommuTopology,
+) -> Result<Vec<u64>, Status> {
+    let pages = iommu::deny_all_table_pages(topology.kind());
+    let mut tables = Vec::with_capacity(topology.unit_count());
+    for _ in topology.units() {
+        let address = boot_services
+            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
+            .map_err(|error| error.status())?;
+        // SAFETY: UEFI returned `pages` contiguous writable pages exclusively to mBoot.
+        unsafe { write_bytes(address as *mut u8, 0, pages * 4096) };
+        tables.push(address);
+    }
+    Ok(tables)
+}
+
+fn iommu_error(error: iommu::Error) -> mboot_hv::Error {
+    match error {
+        iommu::Error::UnsupportedHardware => mboot_hv::Error::UnsupportedIommu,
+        iommu::Error::CommandTimeout => mboot_hv::Error::IommuCommandTimeout,
+        _ => mboot_hv::Error::IommuInitializationFailed,
+    }
+}
+
 fn allocate_page(boot_services: &BootServices) -> Result<u64, Status> {
     boot_services
         .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
@@ -1507,6 +1554,7 @@ fn halt_error_code(stage: &str, error: mboot_hv::Error) -> u8 {
         "Grant unmap" => 57,
         "Grant cleanup" => 58,
         "PCI DMA quarantine" => 17,
+        "IOMMU protection" => 19,
         _ => 10,
     }
 }

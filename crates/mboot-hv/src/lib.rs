@@ -36,6 +36,9 @@ pub enum Error {
     AddressSpaceIdUnavailable,
     InterruptVirtualizationUnavailable,
     DeviceQuarantineFailed,
+    UnsupportedIommu,
+    IommuInitializationFailed,
+    IommuCommandTimeout,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

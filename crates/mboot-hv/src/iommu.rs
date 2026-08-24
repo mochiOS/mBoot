@@ -1,9 +1,29 @@
 use core::slice;
+use core::{
+    arch::asm,
+    hint::spin_loop,
+    ptr::{read_volatile, write_volatile},
+};
 
 const ACPI_HEADER_SIZE: usize = 36;
 const IOMMU_TABLE_HEADER_SIZE: usize = 48;
 const MAX_ACPI_TABLE_SIZE: usize = 1024 * 1024;
 const MAX_IOMMU_UNITS: usize = 16;
+const INTEL_ROOT_TABLE_PAGES: usize = 1;
+const AMD_DEVICE_TABLE_PAGES: usize = 512;
+const INTEL_VERSION: u64 = 0x00;
+const INTEL_CAPABILITY: u64 = 0x08;
+const INTEL_GLOBAL_COMMAND: u64 = 0x18;
+const INTEL_GLOBAL_STATUS: u64 = 0x1c;
+const INTEL_ROOT_TABLE_ADDRESS: u64 = 0x20;
+const INTEL_TRANSLATION_ENABLE: u32 = 1 << 31;
+const INTEL_SET_ROOT_POINTER: u32 = 1 << 30;
+const AMD_DEVICE_TABLE_BASE: u64 = 0x00;
+const AMD_CONTROL: u64 = 0x18;
+const AMD_IOMMU_ENABLE: u64 = 1;
+const AMD_DEVICE_TABLE_SEGMENT_ENABLE: u64 = 0b111 << 34;
+const AMD_DEVICE_TABLE_SIZE: u64 = AMD_DEVICE_TABLE_PAGES as u64 - 1;
+const REGISTER_WAIT_LIMIT: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IommuKind {
@@ -76,6 +96,159 @@ pub enum Error {
     InvalidRsdp,
     InvalidTable,
     TooManyUnits,
+    InvalidResources,
+    UnsupportedHardware,
+    RegisterWriteFailed,
+    CommandTimeout,
+}
+
+pub const fn deny_all_table_pages(kind: IommuKind) -> usize {
+    match kind {
+        IommuKind::IntelVtd => INTEL_ROOT_TABLE_PAGES,
+        IommuKind::AmdVi => AMD_DEVICE_TABLE_PAGES,
+    }
+}
+
+/// Enables DMA remapping with no valid device mappings.
+///
+/// # Safety
+/// Each table address must name the zeroed, contiguous number of pages returned
+/// by [`deny_all_table_pages`]. IOMMU MMIO ranges must remain identity-mapped,
+/// PCI bus mastering must be disabled, and no other agent may program the units.
+pub unsafe fn enable_deny_all(
+    topology: &IommuTopology,
+    table_addresses: &[u64],
+) -> Result<(), Error> {
+    if table_addresses.len() != topology.unit_count {
+        return Err(Error::InvalidResources);
+    }
+    for (unit, table_address) in topology.units().iter().zip(table_addresses) {
+        if unit.segment != 0 || *table_address == 0 || *table_address & 0xfff != 0 {
+            return Err(Error::InvalidResources);
+        }
+        // SAFETY: The public function contract grants exclusive access to the
+        // matching remapping unit and its correctly sized zeroed table.
+        unsafe {
+            match topology.kind {
+                IommuKind::IntelVtd => enable_intel_deny_all(unit, *table_address)?,
+                IommuKind::AmdVi => enable_amd_deny_all(unit, *table_address)?,
+            }
+        }
+    }
+    Ok(())
+}
+
+unsafe fn enable_intel_deny_all(unit: &IommuUnit, root_table: u64) -> Result<(), Error> {
+    if root_table >> 52 != 0 {
+        return Err(Error::InvalidResources);
+    }
+    // SAFETY: The caller guarantees that this unit's MMIO range is mapped.
+    let version = unsafe { mmio_read_u32(unit.register_base, INTEL_VERSION) };
+    // Legacy root/context translation requires at least one supported adjusted
+    // guest-address width in CAP.SAGAW.
+    // SAFETY: The capability register belongs to the same mapped unit.
+    let capability = unsafe { mmio_read_u64(unit.register_base, INTEL_CAPABILITY) };
+    if version == 0 || capability >> 8 & 0x1f == 0 {
+        return Err(Error::UnsupportedHardware);
+    }
+
+    // Start from a known state. All PCI requesters are already unable to issue
+    // new DMA while the old firmware translation state is removed.
+    // SAFETY: GCMD is the command register of this exclusively owned unit.
+    unsafe { mmio_write_u32(unit.register_base, INTEL_GLOBAL_COMMAND, 0) };
+    // SAFETY: GSTS is readable while the unit processes the disable command.
+    unsafe {
+        wait_intel_status(unit.register_base, INTEL_TRANSLATION_ENABLE, false)?;
+        mmio_write_u64(unit.register_base, INTEL_ROOT_TABLE_ADDRESS, root_table);
+        if mmio_read_u64(unit.register_base, INTEL_ROOT_TABLE_ADDRESS) & !0xfff != root_table {
+            return Err(Error::RegisterWriteFailed);
+        }
+        dma_table_fence();
+        mmio_write_u32(
+            unit.register_base,
+            INTEL_GLOBAL_COMMAND,
+            INTEL_SET_ROOT_POINTER,
+        );
+        wait_intel_status(unit.register_base, INTEL_SET_ROOT_POINTER, true)?;
+        mmio_write_u32(
+            unit.register_base,
+            INTEL_GLOBAL_COMMAND,
+            INTEL_TRANSLATION_ENABLE,
+        );
+        wait_intel_status(unit.register_base, INTEL_TRANSLATION_ENABLE, true)?;
+    }
+    Ok(())
+}
+
+unsafe fn enable_amd_deny_all(unit: &IommuUnit, device_table: u64) -> Result<(), Error> {
+    if device_table >> 52 != 0 {
+        return Err(Error::InvalidResources);
+    }
+    // Disable translation and table segmentation before replacing firmware
+    // state with one invalid entry for every possible DeviceID.
+    // SAFETY: The caller exclusively owns this mapped AMD-Vi MMIO range.
+    unsafe { mmio_write_u64(unit.register_base, AMD_CONTROL, 0) };
+    // SAFETY: Read-back detects locked or non-writable control registers.
+    let disabled = unsafe { mmio_read_u64(unit.register_base, AMD_CONTROL) };
+    if disabled & (AMD_IOMMU_ENABLE | AMD_DEVICE_TABLE_SEGMENT_ENABLE) != 0 {
+        return Err(Error::RegisterWriteFailed);
+    }
+    let table_register = device_table | AMD_DEVICE_TABLE_SIZE;
+    // SAFETY: The 2 MiB zeroed Device Table is contiguous and exclusively owned.
+    unsafe {
+        mmio_write_u64(unit.register_base, AMD_DEVICE_TABLE_BASE, table_register);
+        dma_table_fence();
+    }
+    // SAFETY: Read-back verifies both the base and the 4 KiB size count.
+    let installed = unsafe { mmio_read_u64(unit.register_base, AMD_DEVICE_TABLE_BASE) };
+    if installed & 0x000f_ffff_ffff_f1ff != table_register {
+        return Err(Error::RegisterWriteFailed);
+    }
+    // SAFETY: Bit zero enables translation with the installed invalid DTE table.
+    unsafe { mmio_write_u64(unit.register_base, AMD_CONTROL, AMD_IOMMU_ENABLE) };
+    // SAFETY: Read-back verifies that translation was accepted.
+    if unsafe { mmio_read_u64(unit.register_base, AMD_CONTROL) } & AMD_IOMMU_ENABLE == 0 {
+        return Err(Error::RegisterWriteFailed);
+    }
+    Ok(())
+}
+
+unsafe fn wait_intel_status(base: u64, mask: u32, set: bool) -> Result<(), Error> {
+    for _ in 0..REGISTER_WAIT_LIMIT {
+        // SAFETY: The caller guarantees the Intel VT-d register range is mapped.
+        let status = unsafe { mmio_read_u32(base, INTEL_GLOBAL_STATUS) };
+        if (status & mask != 0) == set {
+            return Ok(());
+        }
+        spin_loop();
+    }
+    Err(Error::CommandTimeout)
+}
+
+unsafe fn mmio_read_u32(base: u64, offset: u64) -> u32 {
+    // SAFETY: The caller provides a mapped register base and valid aligned offset.
+    unsafe { read_volatile((base + offset) as *const u32) }
+}
+
+unsafe fn mmio_read_u64(base: u64, offset: u64) -> u64 {
+    // SAFETY: The caller provides a mapped register base and valid aligned offset.
+    unsafe { read_volatile((base + offset) as *const u64) }
+}
+
+unsafe fn mmio_write_u32(base: u64, offset: u64, value: u32) {
+    // SAFETY: The caller provides a mapped register base and writable aligned offset.
+    unsafe { write_volatile((base + offset) as *mut u32, value) };
+}
+
+unsafe fn mmio_write_u64(base: u64, offset: u64, value: u64) {
+    // SAFETY: The caller provides a mapped register base and writable aligned offset.
+    unsafe { write_volatile((base + offset) as *mut u64, value) };
+}
+
+unsafe fn dma_table_fence() {
+    // SAFETY: MFENCE is available in x86_64 mode and serializes prior table writes
+    // before the following MMIO command.
+    unsafe { asm!("mfence", options(nostack, preserves_flags)) };
 }
 
 /// Finds and copies the IOMMU description from ACPI-owned memory.
@@ -302,5 +475,12 @@ mod tests {
         let mut table = [0_u8; 52];
         finish_table(&mut table, b"DMAR");
         assert_eq!(parse_dmar(&table), Err(Error::InvalidTable));
+    }
+
+    #[test]
+    fn deny_all_tables_cover_each_architectures_requester_space() {
+        assert_eq!(deny_all_table_pages(IommuKind::IntelVtd), 1);
+        assert_eq!(deny_all_table_pages(IommuKind::AmdVi), 512);
+        assert_eq!(AMD_DEVICE_TABLE_SIZE, 0x1ff);
     }
 }

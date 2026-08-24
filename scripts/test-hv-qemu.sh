@@ -92,7 +92,8 @@ if [[ $IOMMU_PROBE_ONLY == 1 ]]; then
     PROBED=0
     for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
         if grep -Fq "IOMMU description $EXPECT_IOMMU:" "$SERIAL" 2>/dev/null \
-            && grep -Fq 'PCI DMA quarantine:' "$SERIAL" 2>/dev/null; then
+            && grep -Fq 'PCI DMA quarantine:' "$SERIAL" 2>/dev/null \
+            && grep -Fq "IOMMU DMA protection enabled: $EXPECT_IOMMU deny-all" "$SERIAL" 2>/dev/null; then
             PROBED=1
             break
         fi
@@ -104,7 +105,7 @@ if [[ $IOMMU_PROBE_ONLY == 1 ]]; then
         echo "test-hv-qemu: IOMMU probe failed: $EXPECT_IOMMU" >&2
         exit 1
     fi
-    grep -E 'IOMMU description|IOMMU unit|PCI DMA quarantine' "$SERIAL"
+    grep -E 'IOMMU description|IOMMU unit|PCI DMA quarantine|IOMMU DMA protection' "$SERIAL"
     echo 'test-hv-qemu: IOMMU probe PASS'
     exit 0
 fi
