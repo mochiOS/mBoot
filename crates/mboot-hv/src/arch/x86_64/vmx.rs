@@ -4,7 +4,9 @@ use core::ptr::write_bytes;
 use crate::arch::x86_64::{
     descriptor, read_cr0, read_cr3, read_cr4, read_msr, write_cr0, write_cr4, write_msr,
 };
-use crate::{arch::x86_64::cpu, BackendKind, Error, GuestConfig, VmExit, VmExitReason};
+use crate::{
+    arch::x86_64::cpu, BackendKind, CpuidResult, Error, GuestConfig, VmExit, VmExitReason,
+};
 
 const IA32_FEATURE_CONTROL: u32 = 0x3a;
 const IA32_VMX_BASIC: u32 = 0x480;
@@ -124,6 +126,7 @@ const EXIT_INSTRUCTION_LENGTH: u64 = 0x440c;
 const EXIT_INTERRUPTION_INFO: u64 = 0x4404;
 const EXTERNAL_INTERRUPT_EXIT_REASON: u64 = 1;
 const INTERRUPT_WINDOW_EXIT_REASON: u64 = 7;
+const CPUID_EXIT_REASON: u64 = 10;
 const HLT_EXIT_REASON: u64 = 12;
 const VMCALL_EXIT_REASON: u64 = 18;
 const RDMSR_EXIT_REASON: u64 = 31;
@@ -144,6 +147,10 @@ struct VmxRunContext {
     r15: u64,
     resume: u64,
     rcx: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
 }
 
 global_asm!(
@@ -175,6 +182,10 @@ global_asm!(
     "mov rsi, [rax + 16]",
     "mov rdx, [rax + 24]",
     "mov rcx, [rax + 88]",
+    "mov r8, [rax + 96]",
+    "mov r9, [rax + 104]",
+    "mov r10, [rax + 112]",
+    "mov r11, [rax + 120]",
     "mov rax, [rax]",
     "sti",
     "vmlaunch",
@@ -191,6 +202,10 @@ global_asm!(
     "mov rsi, [rax + 16]",
     "mov rdx, [rax + 24]",
     "mov rcx, [rax + 88]",
+    "mov r8, [rax + 96]",
+    "mov r9, [rax + 104]",
+    "mov r10, [rax + 112]",
+    "mov r11, [rax + 120]",
     "mov rax, [rax]",
     "sti",
     "vmresume",
@@ -211,30 +226,42 @@ global_asm!(
     "push rsi",
     "push rdx",
     "push rcx",
-    "mov rcx, [rsp + 88]",
-    "mov rax, [rsp + 80]",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "mov rcx, [rsp + 120]",
+    "mov rax, [rsp + 112]",
     "mov [rcx], rax",
-    "mov rax, [rsp + 24]",
-    "mov [rcx + 8], rax",
-    "mov rax, [rsp + 16]",
-    "mov [rcx + 16], rax",
-    "mov rax, [rsp + 8]",
-    "mov [rcx + 24], rax",
-    "mov rax, [rsp + 72]",
-    "mov [rcx + 32], rax",
-    "mov rax, [rsp + 64]",
-    "mov [rcx + 40], rax",
     "mov rax, [rsp + 56]",
-    "mov [rcx + 48], rax",
+    "mov [rcx + 8], rax",
     "mov rax, [rsp + 48]",
-    "mov [rcx + 56], rax",
+    "mov [rcx + 16], rax",
     "mov rax, [rsp + 40]",
+    "mov [rcx + 24], rax",
+    "mov rax, [rsp + 104]",
+    "mov [rcx + 32], rax",
+    "mov rax, [rsp + 96]",
+    "mov [rcx + 40], rax",
+    "mov rax, [rsp + 88]",
+    "mov [rcx + 48], rax",
+    "mov rax, [rsp + 80]",
+    "mov [rcx + 56], rax",
+    "mov rax, [rsp + 72]",
     "mov [rcx + 64], rax",
-    "mov rax, [rsp + 32]",
+    "mov rax, [rsp + 64]",
     "mov [rcx + 72], rax",
-    "mov rax, [rsp]",
+    "mov rax, [rsp + 32]",
     "mov [rcx + 88], rax",
-    "add rsp, 88",
+    "mov rax, [rsp + 24]",
+    "mov [rcx + 96], rax",
+    "mov rax, [rsp + 16]",
+    "mov [rcx + 104], rax",
+    "mov rax, [rsp + 8]",
+    "mov [rcx + 112], rax",
+    "mov rax, [rsp]",
+    "mov [rcx + 120], rax",
+    "add rsp, 120",
     "xor eax, eax",
     "mboot_vmx_return:",
     "add rsp, 8",
@@ -471,14 +498,22 @@ impl Vmx {
     pub unsafe fn resume_msr_read(&mut self, value: u64) -> Result<VmExit, Error> {
         self.run_context.rax = u64::from(value as u32);
         self.run_context.rdx = u64::from((value >> 32) as u32);
-        unsafe { self.resume_msr() }
+        unsafe { self.resume_instruction() }
     }
 
     pub unsafe fn resume_msr_write(&mut self) -> Result<VmExit, Error> {
-        unsafe { self.resume_msr() }
+        unsafe { self.resume_instruction() }
     }
 
-    unsafe fn resume_msr(&mut self) -> Result<VmExit, Error> {
+    pub unsafe fn resume_cpuid(&mut self, result: CpuidResult) -> Result<VmExit, Error> {
+        self.run_context.rax = u64::from(result.eax);
+        self.run_context.rbx = u64::from(result.ebx);
+        self.run_context.rcx = u64::from(result.ecx);
+        self.run_context.rdx = u64::from(result.edx);
+        unsafe { self.resume_instruction() }
+    }
+
+    unsafe fn resume_instruction(&mut self) -> Result<VmExit, Error> {
         if !self.active {
             return Err(Error::InvalidState);
         }
@@ -591,6 +626,8 @@ impl Vmx {
                 arg2: 0,
                 msr: 0,
                 msr_value: 0,
+                cpuid_leaf: 0,
+                cpuid_subleaf: 0,
             }),
             EXTERNAL_INTERRUPT_EXIT_REASON => {
                 let info = unsafe { vmread(EXIT_INTERRUPTION_INFO) };
@@ -605,6 +642,8 @@ impl Vmx {
                         arg2: 0,
                         msr: 0,
                         msr_value: 0,
+                        cpuid_leaf: 0,
+                        cpuid_subleaf: 0,
                     })
                 } else {
                     Err(Error::UnexpectedVmExit(reason))
@@ -619,6 +658,8 @@ impl Vmx {
                 arg2: 0,
                 msr: 0,
                 msr_value: 0,
+                cpuid_leaf: 0,
+                cpuid_subleaf: 0,
             }),
             VMCALL_EXIT_REASON => Ok(VmExit {
                 reason: VmExitReason::Hypercall,
@@ -629,6 +670,8 @@ impl Vmx {
                 arg2: self.run_context.rdx,
                 msr: 0,
                 msr_value: 0,
+                cpuid_leaf: 0,
+                cpuid_subleaf: 0,
             }),
             RDMSR_EXIT_REASON => Ok(VmExit {
                 reason: VmExitReason::MsrRead,
@@ -639,6 +682,8 @@ impl Vmx {
                 arg2: 0,
                 msr: self.run_context.rcx as u32,
                 msr_value: 0,
+                cpuid_leaf: 0,
+                cpuid_subleaf: 0,
             }),
             WRMSR_EXIT_REASON => Ok(VmExit {
                 reason: VmExitReason::MsrWrite,
@@ -650,6 +695,20 @@ impl Vmx {
                 msr: self.run_context.rcx as u32,
                 msr_value: u64::from(self.run_context.rax as u32)
                     | (u64::from(self.run_context.rdx as u32) << 32),
+                cpuid_leaf: 0,
+                cpuid_subleaf: 0,
+            }),
+            CPUID_EXIT_REASON => Ok(VmExit {
+                reason: VmExitReason::Cpuid,
+                raw_reason: reason,
+                hypercall_number: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+                msr: 0,
+                msr_value: 0,
+                cpuid_leaf: self.run_context.rax as u32,
+                cpuid_subleaf: self.run_context.rcx as u32,
             }),
             _ => Err(Error::UnexpectedVmExit(reason)),
         }
@@ -1094,10 +1153,12 @@ mod tests {
     }
 
     #[test]
-    fn assembly_context_offsets_include_guest_rcx() {
+    fn assembly_context_offsets_include_all_guest_scratch_registers() {
         assert_eq!(core::mem::offset_of!(VmxRunContext, resume), 80);
         assert_eq!(core::mem::offset_of!(VmxRunContext, rcx), 88);
-        assert_eq!(core::mem::size_of::<VmxRunContext>(), 96);
+        assert_eq!(core::mem::offset_of!(VmxRunContext, r8), 96);
+        assert_eq!(core::mem::offset_of!(VmxRunContext, r11), 120);
+        assert_eq!(core::mem::size_of::<VmxRunContext>(), 128);
     }
 
     #[test]

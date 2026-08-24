@@ -20,7 +20,8 @@ use mboot_hv::manifest::{LaunchManifest, ManifestDomainRole};
 use mboot_hv::memory::{NestedPageResources, NestedPageTable};
 use mboot_hv::scheduler::CooperativeScheduler;
 use mboot_hv::{
-    image, BackendKind, GuestConfig, Virtualization, VirtualizationResources, VmExitReason,
+    cpuid, image, BackendKind, CpuidResult, GuestConfig, Virtualization, VirtualizationResources,
+    VmExitReason,
 };
 use mnu_abi::hypervisor::{
     DomainBootInfo, HypercallNumber, DOMAIN_ROLE_APPLICATION, DOMAIN_ROLE_HARDWARE,
@@ -84,6 +85,7 @@ enum ResumeKind {
     WithoutAdvance,
     MsrRead(u64),
     MsrWrite,
+    Cpuid(CpuidResult),
     GeneralProtection,
 }
 
@@ -516,6 +518,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     // SAFETY: The preceding intercepted WRMSR was emulated.
                     unsafe { runtime.virtualization.resume_msr_write() }
                 }
+                ResumeKind::Cpuid(result) => {
+                    // SAFETY: These values complete the preceding intercepted CPUID.
+                    unsafe { runtime.virtualization.resume_cpuid(result) }
+                }
                 ResumeKind::GeneralProtection => {
                     // SAFETY: The vCPU is stopped at the rejected instruction.
                     if let Err(error) =
@@ -578,6 +584,15 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             } else {
                 ResumeKind::MsrWrite
             };
+            continue;
+        }
+        if vm_exit.reason == VmExitReason::Cpuid {
+            runtime.resume_kind = ResumeKind::Cpuid(cpuid::query(
+                vm_exit.cpuid_leaf,
+                vm_exit.cpuid_subleaf,
+                0,
+                1,
+            ));
             continue;
         }
         if vm_exit.reason != VmExitReason::Hypercall {

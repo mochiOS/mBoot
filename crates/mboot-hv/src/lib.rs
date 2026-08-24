@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod arch;
+pub mod cpuid;
 pub mod domain;
 pub mod event;
 pub mod grant;
@@ -59,6 +60,15 @@ pub enum VmExitReason {
     InterruptWindow,
     MsrRead,
     MsrWrite,
+    Cpuid,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CpuidResult {
+    pub eax: u32,
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +81,8 @@ pub struct VmExit {
     pub arg2: u64,
     pub msr: u32,
     pub msr_value: u64,
+    pub cpuid_leaf: u32,
+    pub cpuid_subleaf: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,6 +215,17 @@ impl Virtualization {
         match self {
             Virtualization::Intel(vmx) => unsafe { vmx.resume_msr_write() },
             Virtualization::Amd(svm) => unsafe { svm.resume_msr_write() },
+        }
+    }
+
+    /// Completes an intercepted CPUID and resumes after the instruction.
+    ///
+    /// # Safety
+    /// The previous exit must have been `VmExitReason::Cpuid` from this vCPU.
+    pub unsafe fn resume_cpuid(&mut self, result: CpuidResult) -> Result<VmExit, Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.resume_cpuid(result) },
+            Virtualization::Amd(svm) => unsafe { svm.resume_cpuid(result) },
         }
     }
 

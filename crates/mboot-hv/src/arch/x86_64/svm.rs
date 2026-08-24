@@ -2,7 +2,7 @@ use core::arch::global_asm;
 use core::ptr::write_bytes;
 
 use crate::arch::x86_64::{cpu, read_msr, write_msr};
-use crate::{BackendKind, Error, GuestConfig, VmExit, VmExitReason};
+use crate::{BackendKind, CpuidResult, Error, GuestConfig, VmExit, VmExitReason};
 
 const EFER: u32 = 0xc000_0080;
 const VM_CR: u32 = 0xc001_0114;
@@ -44,6 +44,7 @@ const VMCB_RSP: usize = 0x5d8;
 const VMCB_RAX: usize = 0x5f8;
 
 const INTERCEPT_HLT: u32 = 1 << 24;
+const INTERCEPT_CPUID: u32 = 1 << 18;
 const INTERCEPT_MSR_PROT: u32 = 1 << 28;
 const INTERCEPT_VMRUN: u32 = 1;
 const INTERCEPT_VMMCALL: u32 = 1 << 1;
@@ -52,6 +53,7 @@ const SVM_EXIT_HLT: u64 = 0x78;
 const SVM_EXIT_VMMCALL: u64 = 0x81;
 const SVM_EXIT_MSR: u64 = 0x7c;
 const SVM_EXIT_INTR: u64 = 0x60;
+const SVM_EXIT_CPUID: u64 = 0x72;
 const INTERCEPT_INTR: u32 = 1;
 const V_INTR_MASKING: u64 = 1 << 24;
 const V_IRQ: u64 = 1 << 8;
@@ -74,6 +76,10 @@ struct SvmRunContext {
     r14: u64,
     r15: u64,
     rcx: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
 }
 
 global_asm!(
@@ -98,6 +104,10 @@ global_asm!(
     "mov rsi, [rax + 16]",
     "mov rdx, [rax + 24]",
     "mov rcx, [rax + 80]",
+    "mov r8, [rax + 88]",
+    "mov r9, [rax + 96]",
+    "mov r10, [rax + 104]",
+    "mov r11, [rax + 112]",
     "mov rax, [rsp + 8]",
     "sti",
     "vmrun rax",
@@ -112,28 +122,40 @@ global_asm!(
     "push rsi",
     "push rdx",
     "push rcx",
-    "mov rax, [rsp + 80]",
-    "mov rcx, [rsp + 72]",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "mov rax, [rsp + 112]",
+    "mov rcx, [rsp + 104]",
     "mov [rax + 32], rcx",
-    "mov rcx, [rsp + 64]",
+    "mov rcx, [rsp + 96]",
     "mov [rax + 40], rcx",
-    "mov rcx, [rsp + 56]",
+    "mov rcx, [rsp + 88]",
     "mov [rax + 48], rcx",
-    "mov rcx, [rsp + 48]",
+    "mov rcx, [rsp + 80]",
     "mov [rax + 56], rcx",
-    "mov rcx, [rsp + 40]",
+    "mov rcx, [rsp + 72]",
     "mov [rax + 64], rcx",
-    "mov rcx, [rsp + 32]",
+    "mov rcx, [rsp + 64]",
     "mov [rax + 72], rcx",
-    "mov rcx, [rsp + 24]",
+    "mov rcx, [rsp + 56]",
     "mov [rax + 8], rcx",
-    "mov rcx, [rsp + 16]",
+    "mov rcx, [rsp + 48]",
     "mov [rax + 16], rcx",
-    "mov rcx, [rsp + 8]",
+    "mov rcx, [rsp + 40]",
     "mov [rax + 24], rcx",
-    "mov rcx, [rsp]",
+    "mov rcx, [rsp + 32]",
     "mov [rax + 80], rcx",
-    "add rsp, 80",
+    "mov rcx, [rsp + 24]",
+    "mov [rax + 88], rcx",
+    "mov rcx, [rsp + 16]",
+    "mov [rax + 96], rcx",
+    "mov rcx, [rsp + 8]",
+    "mov [rax + 104], rcx",
+    "mov rcx, [rsp]",
+    "mov [rax + 112], rcx",
+    "add rsp, 112",
     "add rsp, 16",
     "pop r15",
     "pop r14",
@@ -288,14 +310,22 @@ impl Svm {
     pub unsafe fn resume_msr_read(&mut self, value: u64) -> Result<VmExit, Error> {
         self.run_context.rax = u64::from(value as u32);
         self.run_context.rdx = u64::from((value >> 32) as u32);
-        unsafe { self.resume_msr() }
+        unsafe { self.resume_instruction() }
     }
 
     pub unsafe fn resume_msr_write(&mut self) -> Result<VmExit, Error> {
-        unsafe { self.resume_msr() }
+        unsafe { self.resume_instruction() }
     }
 
-    unsafe fn resume_msr(&mut self) -> Result<VmExit, Error> {
+    pub unsafe fn resume_cpuid(&mut self, result: CpuidResult) -> Result<VmExit, Error> {
+        self.run_context.rax = u64::from(result.eax);
+        self.run_context.rbx = u64::from(result.ebx);
+        self.run_context.rcx = u64::from(result.ecx);
+        self.run_context.rdx = u64::from(result.edx);
+        unsafe { self.resume_instruction() }
+    }
+
+    unsafe fn resume_instruction(&mut self) -> Result<VmExit, Error> {
         if !self.active || !self.started {
             return Err(Error::InvalidState);
         }
@@ -382,6 +412,8 @@ impl Svm {
                     arg2: 0,
                     msr: 0,
                     msr_value: 0,
+                    cpuid_leaf: 0,
+                    cpuid_subleaf: 0,
                 })
             }
             SVM_EXIT_HLT => Ok(VmExit {
@@ -393,6 +425,8 @@ impl Svm {
                 arg2: 0,
                 msr: 0,
                 msr_value: 0,
+                cpuid_leaf: 0,
+                cpuid_subleaf: 0,
             }),
             SVM_EXIT_VMMCALL => Ok(VmExit {
                 reason: VmExitReason::Hypercall,
@@ -403,6 +437,8 @@ impl Svm {
                 arg2: self.run_context.rdx,
                 msr: 0,
                 msr_value: 0,
+                cpuid_leaf: 0,
+                cpuid_subleaf: 0,
             }),
             SVM_EXIT_MSR => {
                 let write = unsafe { read_u64(self.vmcb_phys, VMCB_EXIT_INFO1) } & 1 != 0;
@@ -420,8 +456,22 @@ impl Svm {
                     msr: self.run_context.rcx as u32,
                     msr_value: u64::from(self.run_context.rax as u32)
                         | (u64::from(self.run_context.rdx as u32) << 32),
+                    cpuid_leaf: 0,
+                    cpuid_subleaf: 0,
                 })
             }
+            SVM_EXIT_CPUID => Ok(VmExit {
+                reason: VmExitReason::Cpuid,
+                raw_reason: exit_code,
+                hypercall_number: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+                msr: 0,
+                msr_value: 0,
+                cpuid_leaf: self.run_context.rax as u32,
+                cpuid_subleaf: self.run_context.rcx as u32,
+            }),
             _ => Err(Error::UnexpectedVmExit(exit_code)),
         }
     }
@@ -450,7 +500,7 @@ unsafe fn initialize_guest(vmcb: u64, guest_asid: u32, config: GuestConfig) {
         write_u32(
             vmcb,
             VMCB_INTERCEPT_MISC1,
-            INTERCEPT_INTR | INTERCEPT_HLT | INTERCEPT_MSR_PROT,
+            INTERCEPT_INTR | INTERCEPT_CPUID | INTERCEPT_HLT | INTERCEPT_MSR_PROT,
         );
         // VMRUN must never recurse into a guest-provided VMCB. AMD defines this
         // as a mandatory intercept for a valid first-level guest.
@@ -561,9 +611,11 @@ mod tests {
     }
 
     #[test]
-    fn assembly_context_offsets_include_guest_rcx() {
+    fn assembly_context_offsets_include_all_guest_scratch_registers() {
         assert_eq!(core::mem::offset_of!(SvmRunContext, rcx), 80);
-        assert_eq!(core::mem::size_of::<SvmRunContext>(), 88);
+        assert_eq!(core::mem::offset_of!(SvmRunContext, r8), 88);
+        assert_eq!(core::mem::offset_of!(SvmRunContext, r11), 112);
+        assert_eq!(core::mem::size_of::<SvmRunContext>(), 120);
     }
 
     #[test]
