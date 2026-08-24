@@ -390,15 +390,30 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         quarantine.bus_masters_disabled,
         quarantine.bus_masters_active
     );
-    if quarantine.bus_masters_active != 0 {
+    if let Some(requester) = quarantine.first_active_requester {
+        log!(
+            "PCI DMA quarantine could not disable {:02x}:{:02x}.{}",
+            requester >> 8,
+            requester >> 3 & 0x1f,
+            requester & 7
+        );
+    }
+    if quarantine.bus_masters_active != 0 && iommu_topology.is_none() {
         halt_with_error(
             "PCI DMA quarantine",
             mboot_hv::Error::DeviceQuarantineFailed,
         )
     }
+    if quarantine.bus_masters_active != 0 {
+        log!(
+            "{} active bus master(s) require deny-all IOMMU protection",
+            quarantine.bus_masters_active
+        );
+    }
     if let Some(topology) = iommu_topology {
-        // SAFETY: Tables were allocated and zeroed before ExitBootServices, PCI
-        // bus mastering is disabled, and mBoot now exclusively owns IOMMU MMIO.
+        // SAFETY: Tables were allocated and zeroed before ExitBootServices,
+        // firmware activity has ended, and mBoot now exclusively owns IOMMU
+        // MMIO. PCI bus mastering was disabled wherever hardware permitted it.
         if let Err(error) = unsafe { iommu::enable_deny_all(&topology, &iommu_tables) } {
             halt_with_error("IOMMU protection", iommu_error(error))
         }

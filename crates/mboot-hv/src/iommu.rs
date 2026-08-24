@@ -114,7 +114,9 @@ pub const fn deny_all_table_pages(kind: IommuKind) -> usize {
 /// # Safety
 /// Each table address must name the zeroed, contiguous number of pages returned
 /// by [`deny_all_table_pages`]. IOMMU MMIO ranges must remain identity-mapped,
-/// PCI bus mastering must be disabled, and no other agent may program the units.
+/// firmware device activity must have ended, and no other agent may program the
+/// units. The caller should disable PCI bus mastering wherever the hardware
+/// permits it; successful deny-all translation is the final DMA boundary.
 pub unsafe fn enable_deny_all(
     topology: &IommuTopology,
     table_addresses: &[u64],

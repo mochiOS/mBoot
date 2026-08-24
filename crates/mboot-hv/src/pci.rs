@@ -9,6 +9,7 @@ pub struct QuarantineReport {
     pub functions: u32,
     pub bus_masters_disabled: u32,
     pub bus_masters_active: u32,
+    pub first_active_requester: Option<u16>,
 }
 
 /// Stops PCI functions in segment zero from initiating new DMA transactions.
@@ -92,9 +93,16 @@ unsafe fn quarantine_function(
             report.bus_masters_disabled = report.bus_masters_disabled.saturating_add(1);
         } else {
             report.bus_masters_active = report.bus_masters_active.saturating_add(1);
+            if report.first_active_requester.is_none() {
+                report.first_active_requester = Some(requester_id(bus, device, function));
+            }
         }
     }
     next_bus.filter(|bus| *bus != 0)
+}
+
+const fn requester_id(bus: u8, device: u8, function: u8) -> u16 {
+    ((bus as u16) << 8) | ((device as u16) << 3) | function as u16
 }
 
 const fn without_bus_master(command: u16) -> u16 {
@@ -166,5 +174,10 @@ mod tests {
     fn quarantine_changes_only_bus_master_enable() {
         assert_eq!(without_bus_master(0xffff), 0xfffb);
         assert_eq!(without_bus_master(0x0403), 0x0403);
+    }
+
+    #[test]
+    fn requester_id_uses_the_pci_bdf_layout() {
+        assert_eq!(requester_id(0x12, 0x1f, 7), 0x12ff);
     }
 }
