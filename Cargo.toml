@@ -1,18 +1,40 @@
-[workspace]
-members = [
-    "crates/mboot-hv",
-    "crates/mboot-protocol",
-    "crates/mbootd",
-    "crates/mock-mochios-agent",
-]
-default-members = [
-    "crates/mboot-protocol",
-    "crates/mbootd",
-    "crates/mock-mochios-agent",
-]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "mboot"
+version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
-version = "0.1.0"
+description = "Type-1 hypervisor for mochiOS"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mboot"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["uefi-app"]
+
+[features]
+default = []
+uefi-app = ["dep:uefi"]
+
+[dependencies]
+mnu-abi = { git = "https://github.com/mochiOS/mnu" }
+sha2 = { version = "0.10", default-features = false }
+uefi = { version = "0.30", default-features = false, features = ["alloc", "global_allocator"], optional = true }
+
+[build-dependencies]
+sha2 = "0.10"
+
+[lints.rust]
+unused = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

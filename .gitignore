@@ -1,5 +1,3 @@
 output/
-output-dev/
 target/
 *.img
-buildroot/

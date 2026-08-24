@@ -1,242 +1,73 @@
 # mBoot
 
-> **注意:** このリポジトリには、現在使っているLinuxベースのmBootと、次の構成に
-> 向けて開発中のType-1ハイパーバイザーが同居しています。以下の「ハイパーバイザー
-> イメージ」は後者について説明しています。
+mBootは、mnuのABIを使ってmochiOSとDriver Linuxを動かすx86_64向けType-1ハイパーバイザーです。UEFIから直接起動します。LinuxをホストOSとして起動する旧方式は、このリポジトリから削除しました。
 
-mBoot は、物理 x86_64 PC 上で mochiOS を全画面 QEMU 仮想マシンとして
-起動する Buildroot ベースの専用 Linux アプライアンスです。mBoot 自体は
-BIOS/UEFI の両方から起動でき、物理 GPU、入力、ストレージ、音声、
-ネットワークを Linux が担当します。mochiOS 側には安定した virtio
-プラットフォームを提供します。
+Intel CPUではVMXとEPT、AMD CPUではSVMとNPTを使います。mBootが管理するのはCPU、RAM、IOMMU、PCIデバイス、割り込み、Domain間の共有ページです。ファイルシステム、ネットワーク、GUI、一般的なデバイスドライバは持ちません。
 
-## 必要な mochiOS 成果物
+## ディレクトリ
 
-mBoot に必要なのは `kernel.elf` や `initfs` の単体ファイルではありません。
-**mochiOS のブートローダー、カーネル、initfs、パーティションテーブルを
-すべて含んだ、起動可能な raw GPT ディスクイメージ**が必要です。
+| 場所 | 内容 |
+|---|---|
+| `mboot/` | ハイパーバイザー本体です |
+| `config/` | Domain、メモリ、Capability、PCI割り当てを記述します |
+| `scripts/` | Launch Manifestと起動イメージを作り、QEMUで検査します |
+| `firmware/` | QEMUテストで使うOVMFです。実機イメージには入りません |
 
-現在の mochiOS リポジトリでは、通常これは次の成果物です。
+`mboot-protocol`と`mbootd`はありません。どちらもLinuxホストからmochiOSのQEMUを操作するためのコードだったため、Type-1 mBootには不要です。
 
-```text
-mochiOS/out/artifacts/disk.img
-```
+## ビルド
 
-このファイルはビルド時に mBoot の root filesystem へ
-`/var/lib/mboot/mochiOS.img` として格納されます。実機では mBoot と mochiOS を
-別々のディスクへ書き込む必要はありません。
+mBoot単体リポジトリの隣にmnuを置いた場合は、次のコマンドで`output/mochiOS.iso`を作れます。
 
 ```sh
-# mBoot リポジトリ直下へ、既定名で配置する
-cp ../mochiOS/out/artifacts/disk.img ./mochiOS.img
-make defconfig
-make build
-
-# または元の場所を明示する
-make build MOCHIOS=../mochiOS/out/artifacts/disk.img
+make image
 ```
 
-必要条件は以下のとおりです。
-
-- QEMU の raw block device として渡せる通常ファイル
-- GPT パーティションテーブルを持つこと
-- 64 MiB 以上で、ビルド時に読み取れること
-- OVMF/UEFI で単独起動できる完全な mochiOS ディスクであること
-
-`make build` はファイルの存在、最小サイズ、GPT header を検査します。完成後の
-mBoot は内包したファイルを `MOCHIOS` という virtio disk serial 付きで mochiOS
-へ渡します。GPTパーティション名やfilesystem labelの変更は不要です。また、完成
-diskのGPT、root PARTUUID、ext4の可読性、hostname、host identity混入、boot file、
-kernel builtin driverを自動検査し、失敗したimageを成功成果物として扱いません。
-再現ビルド対応前のBuildroot outputは互換versionで一度だけ自動cleanされ、その後は
-通常のcached buildへ戻ります。
-
-## ビルドと起動
+mnuが別の場所にある場合は明示します。
 
 ```sh
-make defconfig                                  # 初回だけ設定を生成
-make build MOCHIOS=../mochiOS/out/artifacts/disk.img
-make check
-make check-image MOCHIOS=../mochiOS/out/artifacts/disk.img
-make run MOCHIOS=../mochiOS/out/artifacts/disk.img
+make image MNU_DIR=/path/to/mnu CONFIG=config/intel-hardware.toml
 ```
 
-`make build` は次の2つを生成します。内容は同一です。
+`mochiOS.iso`はISO9660ではありません。USBメモリへそのまま書き込めるraw GPTディスクイメージです。EFI System PartitionにはmBoot、Launch Manifest、設定で選んだDomainイメージが入ります。
 
-```text
-output/images/disk.img   通常のraw GPTディスクイメージ
-output/images/mboot.iso  USB書き込みツール向けの配布名
-```
+mochiOSワークスペースからは、ルートで`make mboot`を実行します。通常の出力先は`out/mochiOS.iso`です。
 
-`mboot.iso` は、CD/DVD用の読み取り専用ISO9660ではありません。mochiOSのディスク
-内容やOVMF状態を実機で永続化するため、BIOS/UEFI両対応の書き込み可能なraw GPT
-イメージを`.iso`という名前でも出力しています。
+## Driver Linux
 
-disk GUID、partition GUID、root filesystem UUID/type、hostname、root deviceの待機
-時間は [boot-layout.conf](board/mboot/boot-layout.conf) だけで定義します。Buildroot、
-kernel、GRUB、genimage用の設定は`output/generated/`へ自動生成されます。kernelは
-root deviceを無期限には待たず、見つからない場合は30秒後に期待値、検出partition、
-VFS errorをconsoleへ表示します。
+Driver LinuxはmBootの外でビルドします。mBootは署名やハッシュを確認できる完成済みのkernelとinitramfsだけを受け取ります。この分離により、mBootのクリーンビルドにBuildrootやLinuxのソースツリーは要りません。
 
-GUI を使わずシリアルログだけを確認する場合は、次のように実行します。
+Driver Linuxを含む設定でイメージを作る場合は、2つの成果物を渡します。
 
 ```sh
-make run QEMU_DISPLAY=none
+make image \
+  CONFIG=config/qemu-driver-linux.toml \
+  DRIVER_LINUX_KERNEL=/path/to/vmlinux \
+  DRIVER_LINUX_INITRAMFS=/path/to/initramfs.cpio
 ```
 
-`make run` は完成した1台のmBootディスクだけを外側のQEMUへ接続します。内側の
-mochiOSが自動起動するため、単一ディスク構成をそのまま仮想環境で確認できます。
-利用可能ならKVM、利用できなければTCGを選択します。
+指定したファイルがない場合、mBootは代わりのLinuxを自動生成せず、その場でエラーにします。古いBuildrootの出力を黙って使うこともありません。
 
-## ハイパーバイザーイメージ
+## 確認
 
-ワークスペースのルートで次を実行すると、Intel実機向けの
-`out/mochiOS.iso`を生成します。
+ホスト上の単体テストは次のコマンドで実行します。
 
 ```sh
-make hv-image
+make test
 ```
 
-このファイルはISO9660ではなく、USBメモリへそのまま書き込めるraw GPT
-ディスクイメージです。EFI System PartitionにはmBootのUEFIアプリ、Launch
-Manifest、mochiOS System Domainイメージが入ります。既定のIntel実機向け設定は
-`config/hypervisor/intel-hardware.toml`です。QEMUで複数Domainを確かめる場合は
-`config/hypervisor/qemu.toml`を使います。
+QEMUで起動まで確認する場合は、CPU仮想化を使える環境で実行します。
 
 ```sh
-make hv-image \
-  HV_CONFIG=mboot/config/hypervisor/qemu.toml \
-  HV_OUTPUT_IMAGE=out/mochiOS-qemu.iso
+make image-test MNU_DIR=/path/to/mnu
+make qemu-test MNU_DIR=/path/to/mnu
+make device-io-test MNU_DIR=/path/to/mnu
 ```
 
-設定ファイルではRust toolchain、ディスクとESPの容量、GPT GUID、起動するDomainを
-まとめて指定します。各DomainにはID、役割、メモリ、vCPU数、Capability、イメージ、
-EFI上の配置先を指定します。現在は1 Domainあたり1 vCPU、最大2 MiBのRAM、最大8
-Domainに対応しています。System Domainは必ず1つだけ必要です。
+`config/intel-hardware.toml`はIntel実機向け、`config/qemu.toml`は通常のDomain起動試験向けです。`config/qemu-device-io.toml`はPCI、DMA、IOMMU、MSI-Xの試験に使います。
 
-生成したイメージは次のコマンドでUEFI起動まで確認できます。この試験にはKVMと、
-CPU側のIntel VMXまたはAMD SVMが必要です。
+## 起動時の表示
 
-```sh
-make hv-image-test
-```
+mBootは画面とシリアルへ進行状況を出します。Intelでは`INTEL VMX`、AMDでは`AMD SVM`と表示します。mochiOS System Domainまで起動すると`MOCHIOS OK`、Hardware Domainの準備が終わると`Hardware OK`になります。
 
-実機では、mBootが画面を濃い青に切り替えて起動状況を表示します。Intel CPUなら
-`INTEL VMX`、AMD CPUなら`AMD SVM`と表示されます。mochiOS System Domainが
-常駐待機へ入ると画面が緑に変わり、`MOCHIOS OK`が残ります。赤い画面が出た場合は、
-`ERROR`の下にある番号を確認してください。
-
-| 番号 | 止まった場所 |
-|---:|---|
-| 01 | CPUでVMXとSVMのどちらも利用できません |
-| 02 | Launch Manifestを読み込めません |
-| 03 | Launch Manifestの検証に失敗しました |
-| 04 | AMD SVMのASIDが足りません |
-| 05 | Domain設定を読み取れません |
-| 06 | 現在のmBootで扱えないDomain設定です |
-| 07 | Domainイメージを読み込めません |
-| 08 | DomainイメージのSHA-256が一致しません |
-| 09 | System Domainが1つではありません |
-| 11〜13 | UEFIから必要なメモリを確保できません |
-| 20〜22 | ページテーブルまたはDomainイメージの準備に失敗しました |
-| 30 | CPU仮想化の初期化に失敗しました |
-| 31 | BIOSまたはUEFIでCPU仮想化が無効になっています |
-| 32 | EPTまたはNPTを利用できません |
-| 33 | VMXONまたはVMCSの物理アドレスが不正です |
-| 34 | VMXON、VMCLEAR、VMPTRLDのいずれかに失敗しました |
-| 35 | CPUが要求するVMX制御領域を扱えません |
-| 36 | 2個目以降のvCPU制御領域を準備できません |
-| 40〜42 | Domainの状態遷移または起動情報に問題があります |
-| 50〜52 | vCPUへ入る処理に失敗しました |
-| 53 | Domainが未対応の理由でVM exitしました |
-| 54 | Domainを停止できません |
-| 99 | mBoot内でpanicが発生しました |
-
-赤い画面に`VMCS`と4桁の16進数が表示された場合、その番号は書き込みに失敗した
-VMCSフィールドです。`VMX`と4桁の番号が表示された場合は、Intel CPUが返した
-VM-instruction errorです。
-
-## USBまたはSSDから実機起動
-
-`output/images/mboot.iso`または`disk.img`を、ファイルとしてコピーするのではなく、
-USBメモリやSSDの**デバイス全体**へディスクイメージとして書き込みます。4 GiB
-以上の専用媒体を推奨します。書き込み先の既存データは消去されます。
-
-書き込んだ1台だけを実機へ接続し、BIOSまたはUEFIから起動してください。別の
-mochiOS用ディスクや`MOCHIOS`ラベルは不要です。Secure Bootには対応していない
-ため、ファームウェア設定で無効にしてください。
-
-## 実行時設定とログ
-
-root 所有の `/etc/mboot.conf` で、vCPU、メモリ上限、Q35/PC、virtio GPU、
-SDL 全画面、user networking、ALSA 音声、disk cache を設定できます。
-mochiOSは現在マルチコア未対応のため、既定値は`MBOOT_VCPUS=1`です。メモリを
-空欄にするとLinux用の予約分を残して自動算出します。
-
-ログは次に保存され、再起動後も残ります。
-
-```text
-/var/log/mboot/launcher.log
-/var/log/mboot/xorg.log
-/var/log/mboot/qemu.log
-/var/log/mboot/mochios.log
-```
-
-mochiOS が正常終了すると mBoot も電源を切ります。初期化失敗や QEMU の
-異常終了時はログインシェルを開かず、tty1 に短いエラーコードとログ位置を
-表示します。
-
-## 開発用リモートデバッグ
-
-mochiOSリポジトリの`make mboot-dev`は、通常版とは別の`mboot/output-dev/`へ
-開発専用イメージを生成します。SSH公開鍵を明示し、初回だけUSB全体へ書き込みます。
-
-```sh
-make mboot-dev MBOOT_DEV_AUTHORIZED_KEY="$HOME/.ssh/id_ed25519.pub"
-```
-
-開発版だけが鍵認証専用Dropbear、`mboot-dev.local`のmDNS広告、QMP Unix socket、
-検証付きイメージ交換コマンドを含みます。root password認証、SSH forwarding、
-QMPのTCP listenは無効で、rootのpassword entryもロック状態を維持します。
-通常の`make mboot`と`make release`にはこれらを
-収録しません。開発版root filesystemは現在と直前のmochiOSイメージを保持できる
-よう4 GiBで生成されるため、8 GiB以上のUSB媒体が必要です。
-
-最初の書き込み後は、同じLAN上の開発PCからmochiOSだけを更新できます。
-
-```sh
-make device-status DEVICE=mboot-dev.local
-make deploy-device DEVICE=mboot-dev.local
-make device-logs DEVICE=mboot-dev.local
-make device-screenshot DEVICE=mboot-dev.local
-make device-restart DEVICE=mboot-dev.local
-make device-rollback DEVICE=mboot-dev.local
-```
-
-`deploy-device`は転送完了後にGPT headerとSHA-256を実機側で検証し、QEMUを停止して
-イメージを同一filesystem内で切り替えます。新しいQEMUが起動しない場合は直前の
-イメージへ自動rollbackします。Wi-Fi設定とmBootログはmBoot root filesystemに
-残るため、この更新では消えません。Wi-Fi自体を試験して一時的に接続が切れた場合、
-再接続後に同じコマンドを再実行できます。
-
-## mBoot Control Protocol
-
-通信デバイスに依存しないv1 codecは`crates/mboot-protocol`、Linux daemonは
-`crates/mbootd`にあります。virtio-serial統合前の開発用transportとしてUnix
-domain socketを使用でき、socket pathは第1引数で変更できます。
-
-```sh
-make protocol-test
-cargo run -p mbootd -- /tmp/mochios-control.sock
-# 別のterminalから
-cargo run -p mock-mochios-agent -- /tmp/mochios-control.sock
-```
-
-既定socketは`/run/mboot/mochios-control.sock`です。mock agentはHELLO、4段階の
-READY、uptime 10000msのHEARTBEATを送信し、mbootdのWELCOMEを検証します。
-`HOST.POWEROFF`と`HOST.REBOOT`はprotocol responseまでに限定され、host command
-やshutdown処理は実行しません。
-
-詳しい構成は [docs/architecture.md](docs/architecture.md)、検証項目は
-[docs/test-plan.md](docs/test-plan.md)、同梱 OVMF の由来は
-[docs/ovmf.md](docs/ovmf.md) を参照してください。
+赤い画面に`ERROR`が出た場合は、番号と直前のシリアルログを確認してください。`VMCS`の後ろに出る4桁の値は、Intel VMCSへ書き込めなかったフィールド番号です。
