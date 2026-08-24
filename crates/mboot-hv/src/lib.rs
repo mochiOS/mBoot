@@ -2,6 +2,7 @@
 
 pub mod arch;
 pub mod cpuid;
+pub mod device;
 pub mod domain;
 pub mod event;
 pub mod grant;

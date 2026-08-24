@@ -1,3 +1,4 @@
+use mnu_abi::hypervisor::DOMAIN_CAPABILITY_DEVICE_QUERY;
 use sha2::{Digest, Sha256};
 
 use crate::Error;
@@ -194,6 +195,11 @@ impl<'a> LaunchManifest<'a> {
             return Err(Error::InvalidManifest);
         }
         let capabilities = read_u64(entry, 32)?;
+        if capabilities & !DOMAIN_CAPABILITY_DEVICE_QUERY != 0
+            || role != ManifestDomainRole::Hardware && capabilities != 0
+        {
+            return Err(Error::InvalidManifest);
+        }
         let image_sha256 = entry[40..72]
             .try_into()
             .map_err(|_| Error::InvalidManifest)?;
@@ -360,6 +366,23 @@ mod tests {
             LaunchManifest::parse(&bytes, digest),
             Err(Error::InvalidManifest)
         );
+    }
+
+    #[test]
+    fn device_query_capability_belongs_only_to_hardware_domains() {
+        let mut bytes = manifest();
+        bytes[MANIFEST_HEADER_SIZE + 32..MANIFEST_HEADER_SIZE + 40]
+            .copy_from_slice(&DOMAIN_CAPABILITY_DEVICE_QUERY.to_le_bytes());
+        let digest = Sha256::digest(bytes).into();
+        assert_eq!(
+            LaunchManifest::parse(&bytes, digest),
+            Err(Error::InvalidManifest)
+        );
+
+        bytes[MANIFEST_HEADER_SIZE + 4..MANIFEST_HEADER_SIZE + 6]
+            .copy_from_slice(&(ManifestDomainRole::Hardware as u16).to_le_bytes());
+        let digest = Sha256::digest(bytes).into();
+        assert!(LaunchManifest::parse(&bytes, digest).is_ok());
     }
 
     #[test]

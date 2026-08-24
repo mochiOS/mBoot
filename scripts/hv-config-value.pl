@@ -18,6 +18,14 @@ if ($key eq 'system_image') {
     print "$system->{image}\n";
     exit 0;
 }
+if ($key eq 'hardware_bootstrap_id') {
+    my @domains = grep {
+        $_->{role} eq 'hardware' && $_->{image} eq 'hardware-bootstrap'
+    } @{$config->{domains}};
+    @domains <= 1 or die "multiple hardware-bootstrap Domains are unsupported\n";
+    print(@domains ? $domains[0]->{id} : 0, "\n");
+    exit 0;
+}
 exists $config->{$key} && ref($config->{$key}) eq ''
     or die "unknown scalar config key: $key\n";
 print "$config->{$key}\n";

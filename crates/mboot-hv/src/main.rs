@@ -12,6 +12,7 @@ use core::arch::asm;
 use core::mem::size_of;
 use core::ptr::{copy_nonoverlapping, write_bytes};
 use mboot_hv::arch::x86_64::{cpu, descriptor, timer};
+use mboot_hv::device::DeviceTable;
 use mboot_hv::domain::{Domain, DomainId, DomainRole, DomainState};
 use mboot_hv::event::EventChannelTable;
 use mboot_hv::grant::{GrantRef, GrantTable};
@@ -26,11 +27,11 @@ use mboot_hv::{
     VmExitReason,
 };
 use mnu_abi::hypervisor::{
-    DomainBootInfo, DomainCrashInfo, HypercallNumber, DOMAIN_CRASH_STATUS_CRASHED,
-    DOMAIN_CRASH_STATUS_RESTARTED, DOMAIN_MANAGEMENT_VECTOR, DOMAIN_ROLE_APPLICATION,
-    DOMAIN_ROLE_HARDWARE, DOMAIN_ROLE_SYSTEM, EVENT_CHANNEL_VECTOR, GRANT_FLAG_WRITABLE,
-    HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED,
-    HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
+    DomainBootInfo, DomainCrashInfo, HypercallNumber, PciDeviceInfo,
+    DOMAIN_CAPABILITY_DEVICE_QUERY, DOMAIN_CRASH_STATUS_CRASHED, DOMAIN_CRASH_STATUS_RESTARTED,
+    DOMAIN_MANAGEMENT_VECTOR, DOMAIN_ROLE_APPLICATION, DOMAIN_ROLE_HARDWARE, DOMAIN_ROLE_SYSTEM,
+    EVENT_CHANNEL_VECTOR, GRANT_FLAG_WRITABLE, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS,
+    HYPERCALL_UNSUPPORTED, HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
 };
 use uefi::fs::Error as FsError;
 use uefi::prelude::*;
@@ -449,6 +450,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             requester & 7
         );
     }
+    let devices = DeviceTable::from_pci(quarantine.inventory(), deferred_display);
+    log!("PCI ownership table: {} device(s)", devices.len());
     if let Some(topology) = iommu_topology {
         // SAFETY: Tables were allocated and zeroed before ExitBootServices, PCI
         // bus mastering is disabled, and mBoot now exclusively owns IOMMU MMIO.
@@ -550,6 +553,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             grant_window_start(domain.nested_pages()),
             GRANT_WINDOW_PAGES as u64 * 4096,
             0,
+            domain.capabilities(),
         );
         let Some(boot_info_host) = domain
             .nested_pages()
@@ -800,6 +804,37 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             continue;
         }
         runtime.resume_kind = ResumeKind::Hypercall;
+        if vm_exit.hypercall_number == HypercallNumber::DeviceQuery as u64 {
+            let authorized = runtime_domains[index].domain.role() == DomainRole::Hardware
+                && runtime_domains[index].domain.capabilities() & DOMAIN_CAPABILITY_DEVICE_QUERY
+                    != 0;
+            let info = usize::try_from(vm_exit.arg0)
+                .ok()
+                .and_then(|device_index| devices.query(device_index));
+            let destination = runtime_domains[index]
+                .domain
+                .nested_pages()
+                .guest_host_address(vm_exit.arg1, size_of::<PciDeviceInfo>() as u64);
+            runtime_domains[index].pending_result =
+                if authorized && vm_exit.arg2 >= size_of::<PciDeviceInfo>() as u64 {
+                    match (info, destination) {
+                        (Some(info), Some(destination)) => {
+                            unsafe {
+                                copy_nonoverlapping(
+                                    &info as *const PciDeviceInfo,
+                                    destination as *mut PciDeviceInfo,
+                                    1,
+                                )
+                            };
+                            HYPERCALL_SUCCESS
+                        }
+                        _ => HYPERCALL_INVALID_ARGUMENT,
+                    }
+                } else {
+                    HYPERCALL_INVALID_ARGUMENT
+                };
+            continue;
+        }
         if vm_exit.hypercall_number == HypercallNumber::DomainCrashQuery as u64 {
             let requester_is_system = runtime_domains[index].domain.role() == DomainRole::System;
             let crash_info = u32::try_from(vm_exit.arg0).ok().and_then(|domain_id| {
@@ -1157,12 +1192,23 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 HYPERCALL_SUCCESS
             }
             number if number == HypercallNumber::Ready as u64 => {
-                if runtime.domain.role() != DomainRole::System || runtime.ready {
+                if !matches!(
+                    runtime.domain.role(),
+                    DomainRole::System | DomainRole::Hardware
+                ) || runtime.ready
+                    || vm_exit.arg0 != 0
+                    || vm_exit.arg1 != 0
+                    || vm_exit.arg2 != 0
+                {
                     HYPERCALL_INVALID_ARGUMENT
                 } else {
                     runtime.ready = true;
-                    log!("mochiOS System Domain {} ready", runtime.domain.id().get());
-                    display::mochios_ready();
+                    if runtime.domain.role() == DomainRole::System {
+                        log!("mochiOS System Domain {} ready", runtime.domain.id().get());
+                        display::mochios_ready();
+                    } else {
+                        log!("Hardware Domain {} ready", runtime.domain.id().get());
+                    }
                     HYPERCALL_SUCCESS
                 }
             }
@@ -1359,6 +1405,7 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
         grant_window_start(runtime.domain.nested_pages()),
         GRANT_WINDOW_PAGES as u64 * 4096,
         runtime.restart_count,
+        runtime.domain.capabilities(),
     );
     let Some(boot_info_host) = runtime
         .domain

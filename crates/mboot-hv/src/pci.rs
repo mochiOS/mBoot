@@ -4,8 +4,16 @@ const CONFIG_ADDRESS: u16 = 0x0cf8;
 const CONFIG_DATA: u16 = 0x0cfc;
 const COMMAND_BUS_MASTER: u16 = 1 << 2;
 const MAX_ACTIVE_REQUESTERS: usize = 32;
+const MAX_INVENTORY_FUNCTIONS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PciFunction {
+    pub requester: u16,
+    pub class: u8,
+    pub subclass: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QuarantineReport {
     pub functions: u32,
     pub bus_masters_disabled: u32,
@@ -14,6 +22,24 @@ pub struct QuarantineReport {
     pub display_requester: Option<u16>,
     active_requesters: [u16; MAX_ACTIVE_REQUESTERS],
     active_requester_count: usize,
+    inventory: [PciFunction; MAX_INVENTORY_FUNCTIONS],
+    inventory_count: usize,
+}
+
+impl Default for QuarantineReport {
+    fn default() -> Self {
+        Self {
+            functions: 0,
+            bus_masters_disabled: 0,
+            bus_masters_active: 0,
+            first_active_requester: None,
+            display_requester: None,
+            active_requesters: [0; MAX_ACTIVE_REQUESTERS],
+            active_requester_count: 0,
+            inventory: [PciFunction::default(); MAX_INVENTORY_FUNCTIONS],
+            inventory_count: 0,
+        }
+    }
 }
 
 impl QuarantineReport {
@@ -23,6 +49,10 @@ impl QuarantineReport {
 
     pub const fn recorded_every_active_requester(&self) -> bool {
         self.active_requester_count as u32 == self.bus_masters_active
+    }
+
+    pub fn inventory(&self) -> &[PciFunction] {
+        &self.inventory[..self.inventory_count]
     }
 }
 
@@ -88,6 +118,14 @@ unsafe fn quarantine_function(
     let class = unsafe { read_u8(bus, device, function, 0x0b) };
     // SAFETY: The same serialized, existing function is being read.
     let subclass = unsafe { read_u8(bus, device, function, 0x0a) };
+    if report.inventory_count < report.inventory.len() {
+        report.inventory[report.inventory_count] = PciFunction {
+            requester: requester_id(bus, device, function),
+            class,
+            subclass,
+        };
+        report.inventory_count += 1;
+    }
     let next_bus = if class == 0x06 && subclass == 0x04 {
         // SAFETY: PCI-to-PCI bridge headers define byte 0x19 as Secondary Bus.
         Some(unsafe { read_u8(bus, device, function, 0x19) })

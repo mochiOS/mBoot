@@ -12,6 +12,7 @@ OVMF_CODE="$ROOT/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_CODE_4M.fd"
 OVMF_VARS="$ROOT/board/mboot/rootfs-overlay/usr/share/mboot/OVMF_VARS_4M.fd"
 DOMAIN_COUNT=$($ROOT/scripts/hv-config-value.pl "$CONFIG" domain_count)
 SYSTEM_IMAGE=$($ROOT/scripts/hv-config-value.pl "$CONFIG" system_image)
+HARDWARE_BOOTSTRAP_ID=$($ROOT/scripts/hv-config-value.pl "$CONFIG" hardware_bootstrap_id)
 
 test -s "$IMAGE" || { echo "missing image: $IMAGE" >&2; exit 1; }
 for file in "$OVMF_CODE" "$OVMF_VARS"; do
@@ -56,7 +57,11 @@ else
     expected="[mBoot-HV] bootstrap complete; $DOMAIN_COUNT Domains entered and stopped cleanly"
 fi
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
-    grep -Fq "$expected" "$WORK/serial.log" 2>/dev/null && break
+    if grep -Fq "$expected" "$WORK/serial.log" 2>/dev/null \
+        && { [[ $HARDWARE_BOOTSTRAP_ID == 0 ]] \
+            || grep -Fq "[mBoot-HV] Hardware Domain $HARDWARE_BOOTSTRAP_ID ready" "$WORK/serial.log" 2>/dev/null; }; then
+        break
+    fi
     kill -0 "$QEMU_PID" 2>/dev/null || break
     sleep 0.1
 done
@@ -65,5 +70,12 @@ grep -Fq "$expected" "$WORK/serial.log" || {
     echo "hypervisor image did not reach its expected Domain state" >&2
     exit 1
 }
+if [[ $HARDWARE_BOOTSTRAP_ID != 0 ]]; then
+    grep -Fq "[mBoot-HV] Hardware Domain $HARDWARE_BOOTSTRAP_ID ready" "$WORK/serial.log" || {
+        sed -n '1,200p' "$WORK/serial.log" >&2
+        echo 'Hardware Domain did not query devices and become ready' >&2
+        exit 1
+    }
+fi
 grep -E '\[mBoot-HV\]|\[Domain' "$WORK/serial.log"
 echo 'test-hv-disk-image: PASS'

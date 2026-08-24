@@ -17,3 +17,16 @@ autostart = true
 required = true
 restart = "never"
 max_restarts = 0
+
+[[domains]]
+id = 2
+role = "hardware"
+memory_mib = 2
+vcpus = 1
+capabilities = 0x1
+image = "hardware-bootstrap"
+path = '\EFI\MBOOT\HARDWARE.ELF'
+autostart = true
+required = true
+restart = "never"
+max_restarts = 0

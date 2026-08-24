@@ -70,6 +70,10 @@ my %domain_images = (
         bin => 'mochios-domain',
         path => "$mnu_dir/target/x86_64-unknown-none/release/mochios-domain",
     },
+    'hardware-bootstrap' => {
+        bin => 'hardware-bootstrap',
+        path => "$mnu_dir/target/x86_64-unknown-none/release/hardware-bootstrap",
+    },
 );
 my %required_images;
 for my $domain (@{$config->{domains}}) {
