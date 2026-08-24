@@ -57,12 +57,14 @@ for my $domain (@{$config->{domains}}) {
         close $image_fh or die "cannot close $images{$image_name}: $!\n";
     }
     my $flags = ($domain->{autostart} ? 1 : 0) | ($domain->{required} ? 2 : 0);
+    my %restart_policy = ('never' => 0, 'on-failure' => 1, 'always' => 2);
     my $path = $domain->{path};
     length($path) <= 80 or die "$config_file: Domain image path is too long\n";
     $entries .= pack(
-        'V v v Q< v a14 Q< a32 v a6 a80',
+        'V v v Q< v C C a12 Q< a32 v a6 a80',
         $domain->{id}, role_id($domain->{role}), $flags,
-        $domain->{memory_mib} * 1024 * 1024, $domain->{vcpus}, '',
+        $domain->{memory_mib} * 1024 * 1024, $domain->{vcpus},
+        $restart_policy{$domain->{restart}}, $domain->{max_restarts}, '',
         $domain->{capabilities}, sha256($image_bytes{$image_name}),
         length($path), '', $path,
     );

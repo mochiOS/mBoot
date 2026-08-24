@@ -422,6 +422,15 @@ impl Vmx {
         self.vmcs_phys
     }
 
+    pub unsafe fn reset(&mut self) -> Result<(), Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmclear(self.vmcs_phys).map_err(|()| Error::ControlInstructionFailed)? };
+        self.run_context = VmxRunContext::default();
+        Ok(())
+    }
+
     /// Runs a 64-bit guest until its first intercepted exit.
     ///
     /// # Safety

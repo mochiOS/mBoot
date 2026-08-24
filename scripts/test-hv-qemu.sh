@@ -77,7 +77,7 @@ QEMU_PID=$!
 
 BOOTSTRAPPED=0
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
-    if grep -Fq '[mBoot-HV] bootstrap complete; 2 Domain(s) stopped cleanly; 1 crash(es) isolated' "$SERIAL" 2>/dev/null; then
+    if grep -Fq '[mBoot-HV] bootstrap complete; 3 Domain(s) stopped cleanly; 1 crash(es) recovered' "$SERIAL" 2>/dev/null; then
         BOOTSTRAPPED=1
         break
     fi
@@ -95,6 +95,21 @@ fi
 grep -Fq 'Domain 3 crashed and was isolated: exit=0x400 gpa=0x40000000' "$SERIAL" || {
     sed -n '1,200p' "$SERIAL" >&2
     echo 'test-hv-qemu: nested-page fault did not remain isolated to Application Domain 3' >&2
+    exit 1
+}
+grep -Fq 'Domain 3 restarted: attempt=1' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: Application Domain 3 was not restarted once' >&2
+    exit 1
+}
+grep -Fq '[Domain 3] Application Domain restarted' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: restarted Application Domain did not reach its clean path' >&2
+    exit 1
+}
+grep -Fq '[Domain 1] Domain crash notification verified' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: System Domain did not read the crash notification' >&2
     exit 1
 }
 if [[ -n $EXPECT_BACKEND ]]; then

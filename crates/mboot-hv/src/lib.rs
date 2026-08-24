@@ -171,6 +171,17 @@ impl Virtualization {
         }
     }
 
+    /// Returns a stopped vCPU to its pre-launch architectural state.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped on the CPU that owns its control structure.
+    pub unsafe fn reset_vcpu(&mut self) -> Result<(), Error> {
+        match self {
+            Self::Intel(vmx) => unsafe { vmx.reset() },
+            Self::Amd(svm) => unsafe { svm.reset() },
+        }
+    }
+
     /// Completes the intercepted Hypercall and resumes the same vCPU.
     ///
     /// # Safety

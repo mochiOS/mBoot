@@ -16,7 +16,7 @@ use mboot_hv::domain::{Domain, DomainId, DomainRole, DomainState};
 use mboot_hv::event::EventChannelTable;
 use mboot_hv::grant::{GrantRef, GrantTable};
 use mboot_hv::interrupt::VirtualLocalApic;
-use mboot_hv::manifest::{LaunchManifest, ManifestDomainRole};
+use mboot_hv::manifest::{LaunchManifest, ManifestDomainRole, ManifestRestartPolicy};
 use mboot_hv::memory::{NestedPageResources, NestedPageTable};
 use mboot_hv::scheduler::CooperativeScheduler;
 use mboot_hv::{
@@ -24,10 +24,11 @@ use mboot_hv::{
     VmExitReason,
 };
 use mnu_abi::hypervisor::{
-    DomainBootInfo, HypercallNumber, DOMAIN_ROLE_APPLICATION, DOMAIN_ROLE_HARDWARE,
-    DOMAIN_ROLE_SYSTEM, EVENT_CHANNEL_VECTOR, GRANT_FLAG_WRITABLE, HYPERCALL_INVALID_ARGUMENT,
-    HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED, HYPERVISOR_BACKEND_AMD_SVM,
-    HYPERVISOR_BACKEND_INTEL_VMX,
+    DomainBootInfo, DomainCrashInfo, HypercallNumber, DOMAIN_CRASH_STATUS_CRASHED,
+    DOMAIN_CRASH_STATUS_RESTARTED, DOMAIN_MANAGEMENT_VECTOR, DOMAIN_ROLE_APPLICATION,
+    DOMAIN_ROLE_HARDWARE, DOMAIN_ROLE_SYSTEM, EVENT_CHANNEL_VECTOR, GRANT_FLAG_WRITABLE,
+    HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED,
+    HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
 };
 use uefi::fs::Error as FsError;
 use uefi::prelude::*;
@@ -73,6 +74,8 @@ struct PreparedDomain {
     id: u32,
     role: DomainRole,
     capabilities: u64,
+    restart_policy: ManifestRestartPolicy,
+    max_restarts: u8,
     image: Vec<u8>,
     nested_pages: NestedPageResources,
     vcpu_control_page: u64,
@@ -102,7 +105,11 @@ struct RuntimeDomain {
     resume_kind: ResumeKind,
     event_irq_enabled: bool,
     interrupts: VirtualLocalApic,
-    _image: Vec<u8>,
+    restart_policy: ManifestRestartPolicy,
+    max_restarts: u8,
+    restart_count: u32,
+    crash_info: Option<DomainCrashInfo>,
+    image: Vec<u8>,
 }
 
 impl BootMemoryMap {
@@ -276,6 +283,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             id: config.id,
             role,
             capabilities: config.capabilities,
+            restart_policy: config.restart_policy,
+            max_restarts: config.max_restarts,
             image,
             nested_pages,
             vcpu_control_page,
@@ -388,6 +397,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             domain.nested_pages().guest_memory_size(),
             grant_window_start(domain.nested_pages()),
             GRANT_WINDOW_PAGES as u64 * 4096,
+            0,
         );
         let Some(boot_info_host) = domain
             .nested_pages()
@@ -436,7 +446,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             resume_kind: ResumeKind::Hypercall,
             event_irq_enabled: false,
             interrupts: VirtualLocalApic::new(),
-            _image: prepared.image,
+            restart_policy: prepared.restart_policy,
+            max_restarts: prepared.max_restarts,
+            restart_count: 0,
+            crash_info: None,
+            image: prepared.image,
         });
     }
 
@@ -546,6 +560,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     &mut runnable,
                     &mut grants,
                     &mut event_channels,
+                    manifest,
                     raw_reason,
                     0,
                     0,
@@ -611,6 +626,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut runnable,
                 &mut grants,
                 &mut event_channels,
+                manifest,
                 vm_exit.raw_reason,
                 vm_exit.fault_address,
                 vm_exit.fault_info,
@@ -624,6 +640,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut runnable,
                 &mut grants,
                 &mut event_channels,
+                manifest,
                 vm_exit.raw_reason,
                 0,
                 0,
@@ -631,6 +648,38 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             continue;
         }
         runtime.resume_kind = ResumeKind::Hypercall;
+        if vm_exit.hypercall_number == HypercallNumber::DomainCrashQuery as u64 {
+            let requester_is_system = runtime_domains[index].domain.role() == DomainRole::System;
+            let crash_info = u32::try_from(vm_exit.arg0).ok().and_then(|domain_id| {
+                runtime_domains
+                    .iter()
+                    .find(|runtime| runtime.domain.id().get() == domain_id)
+                    .and_then(|runtime| runtime.crash_info)
+            });
+            let destination = runtime_domains[index]
+                .domain
+                .nested_pages()
+                .guest_host_address(vm_exit.arg1, size_of::<DomainCrashInfo>() as u64);
+            runtime_domains[index].pending_result =
+                if requester_is_system && vm_exit.arg2 >= size_of::<DomainCrashInfo>() as u64 {
+                    match (crash_info, destination) {
+                        (Some(info), Some(destination)) => {
+                            unsafe {
+                                copy_nonoverlapping(
+                                    &info as *const DomainCrashInfo,
+                                    destination as *mut DomainCrashInfo,
+                                    1,
+                                )
+                            };
+                            HYPERCALL_SUCCESS
+                        }
+                        _ => HYPERCALL_INVALID_ARGUMENT,
+                    }
+                } else {
+                    HYPERCALL_INVALID_ARGUMENT
+                };
+            continue;
+        }
         if vm_exit.hypercall_number == HypercallNumber::Shutdown as u64 {
             cleanup_domain_resources(
                 index,
@@ -651,6 +700,13 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 runtime.preemption_count,
                 vm_exit.raw_reason
             );
+            let should_restart = runtime.domain.role() == DomainRole::Application
+                && runtime.restart_policy == ManifestRestartPolicy::Always
+                && runtime.restart_count < u32::from(runtime.max_restarts);
+            if should_restart {
+                restart_domain(index, &mut runtime_domains, &mut runnable);
+                reconnect_domain_channels(index, &runtime_domains, &mut event_channels, manifest);
+            }
             continue;
         }
         if vm_exit.hypercall_number == HypercallNumber::GrantCreate as u64 {
@@ -978,16 +1034,32 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         .iter()
         .filter(|domain| domain.domain.state() == DomainState::Crashed)
         .count();
+    let recovered_crashes = runtime_domains
+        .iter()
+        .filter(|domain| {
+            domain.crash_info.is_some_and(|info| {
+                info.status == DOMAIN_CRASH_STATUS_RESTARTED
+                    && domain.domain.state() != DomainState::Crashed
+            })
+        })
+        .count();
     let stopped_domains = runtime_domains
         .iter()
         .filter(|domain| domain.domain.state() == DomainState::Stopped)
         .count();
-    if waiting_domains == 0 && crashed_domains == 0 {
+    if waiting_domains == 0 && crashed_domains == 0 && recovered_crashes == 0 {
         log!(
             "bootstrap complete; {} Domains entered and stopped cleanly",
             stopped_domains
         );
         display::bootstrap_success();
+    } else if waiting_domains == 0 && crashed_domains == 0 {
+        log!(
+            "bootstrap complete; {} Domain(s) stopped cleanly; {} crash(es) recovered",
+            stopped_domains,
+            recovered_crashes
+        );
+        display::isolation_success();
     } else if waiting_domains == 0 {
         log!(
             "bootstrap complete; {} Domain(s) stopped cleanly; {} crash(es) isolated",
@@ -1015,6 +1087,7 @@ fn isolate_crashed_domain(
     runnable: &mut [bool],
     grants: &mut GrantTable,
     event_channels: &mut EventChannelTable,
+    manifest: LaunchManifest<'_>,
     raw_reason: u64,
     fault_address: u64,
     fault_info: u64,
@@ -1025,6 +1098,15 @@ fn isolate_crashed_domain(
     }
     runtime_domains[index].waiting = false;
     runnable[index] = false;
+    let next_restart_count = runtime_domains[index].restart_count.saturating_add(1);
+    runtime_domains[index].crash_info = Some(DomainCrashInfo::new(
+        domain_id.get(),
+        raw_reason,
+        fault_address,
+        fault_info,
+        next_restart_count,
+        DOMAIN_CRASH_STATUS_CRASHED,
+    ));
     cleanup_domain_resources(index, runtime_domains, grants, event_channels);
     log!(
         "Domain {} crashed and was isolated: exit={:#x} gpa={:#x} info={:#x}",
@@ -1033,6 +1115,17 @@ fn isolate_crashed_domain(
         fault_address,
         fault_info
     );
+    let should_restart = runtime_domains[index].domain.role() == DomainRole::Application
+        && matches!(
+            runtime_domains[index].restart_policy,
+            ManifestRestartPolicy::OnFailure | ManifestRestartPolicy::Always
+        )
+        && runtime_domains[index].restart_count < u32::from(runtime_domains[index].max_restarts);
+    if should_restart {
+        restart_domain(index, runtime_domains, runnable);
+        reconnect_domain_channels(index, runtime_domains, event_channels, manifest);
+    }
+    notify_system_domain(runtime_domains);
 }
 
 fn cleanup_domain_resources(
@@ -1081,6 +1174,141 @@ fn cleanup_domain_resources(
             domain_id.get(),
             disconnected
         );
+    }
+}
+
+fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable: &mut [bool]) {
+    let runtime = &mut runtime_domains[index];
+    if let Err(error) = unsafe { runtime.virtualization.reset_vcpu() } {
+        halt_with_error("vCPU reset", error)
+    }
+    unsafe { runtime.domain.nested_pages().clear_guest_memory() };
+    let page_table_root =
+        match unsafe { runtime.domain.nested_pages().initialize_guest_page_tables() } {
+            Ok(root) => root,
+            Err(error) => halt_with_error("guest page table restart", error),
+        };
+    let guest_image =
+        match unsafe { image::load_elf(&runtime.image, runtime.domain.nested_pages()) } {
+            Ok(image) => image,
+            Err(error) => halt_with_error("Domain image restart", error),
+        };
+    runtime.restart_count = runtime.restart_count.saturating_add(1);
+    let backend = match runtime.domain.backend() {
+        BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
+        BackendKind::AmdSvm => HYPERVISOR_BACKEND_AMD_SVM,
+    };
+    let boot_info = DomainBootInfo::new(
+        runtime.domain.id().get(),
+        0,
+        backend,
+        abi_domain_role(runtime.domain.role()),
+        runtime.domain.nested_pages().guest_memory_size(),
+        grant_window_start(runtime.domain.nested_pages()),
+        GRANT_WINDOW_PAGES as u64 * 4096,
+        runtime.restart_count,
+    );
+    let Some(boot_info_host) = runtime
+        .domain
+        .nested_pages()
+        .guest_host_address(DOMAIN_BOOT_INFO_GPA, size_of::<DomainBootInfo>() as u64)
+    else {
+        halt_with_error("Domain restart boot info", mboot_hv::Error::InvalidPage)
+    };
+    unsafe {
+        copy_nonoverlapping(
+            &boot_info as *const DomainBootInfo,
+            boot_info_host as *mut DomainBootInfo,
+            1,
+        )
+    };
+    if let Err(error) = runtime.domain.prepare_restart() {
+        halt_with_error("Domain restart transition", error)
+    }
+    if let Err(error) = runtime.domain.start() {
+        halt_with_error("Domain restart", error)
+    }
+    runtime.guest.page_table_root = page_table_root;
+    runtime.guest.entry = guest_image.entry();
+    runtime.started = false;
+    runtime.pending_result = HYPERCALL_SUCCESS;
+    runtime.yield_count = 0;
+    runtime.preemption_count = 0;
+    runtime.ready = false;
+    runtime.waiting = false;
+    runtime.resume_kind = ResumeKind::Hypercall;
+    runtime.event_irq_enabled = false;
+    runtime.interrupts = VirtualLocalApic::new();
+    if let Some(info) = &mut runtime.crash_info {
+        info.restart_count = runtime.restart_count;
+        info.status = DOMAIN_CRASH_STATUS_RESTARTED;
+    }
+    runnable[index] = true;
+    log!(
+        "Domain {} restarted: attempt={}",
+        runtime.domain.id().get(),
+        runtime.restart_count
+    );
+}
+
+fn reconnect_domain_channels(
+    index: usize,
+    runtime_domains: &[RuntimeDomain],
+    event_channels: &mut EventChannelTable,
+    manifest: LaunchManifest<'_>,
+) {
+    let domain_id = runtime_domains[index].domain.id().get();
+    for channel_index in 0..manifest.event_channel_count() {
+        let channel = match manifest.event_channel(channel_index) {
+            Ok(channel) => channel,
+            Err(error) => halt_with_error("Event Channel restart manifest", error),
+        };
+        if channel.domain_a != domain_id && channel.domain_b != domain_id {
+            continue;
+        }
+        let peer = if channel.domain_a == domain_id {
+            channel.domain_b
+        } else {
+            channel.domain_a
+        };
+        if !runtime_domains.iter().any(|runtime| {
+            runtime.domain.id().get() == peer && runtime.domain.state() == DomainState::Running
+        }) {
+            continue;
+        }
+        if event_channels
+            .connect(
+                DomainId::new(channel.domain_a),
+                channel.port_a,
+                DomainId::new(channel.domain_b),
+                channel.port_b,
+            )
+            .is_err()
+        {
+            halt_with_error("Event Channel reconnect", mboot_hv::Error::InvalidState)
+        }
+        log!(
+            "Event Channel reconnected: {}:{} <-> {}:{}",
+            channel.domain_a,
+            channel.port_a,
+            channel.domain_b,
+            channel.port_b
+        );
+    }
+}
+
+fn notify_system_domain(runtime_domains: &mut [RuntimeDomain]) {
+    let Some(system) = runtime_domains.iter_mut().find(|runtime| {
+        runtime.domain.role() == DomainRole::System
+            && runtime.domain.state() == DomainState::Running
+    }) else {
+        return;
+    };
+    if system.interrupts.raise(DOMAIN_MANAGEMENT_VECTOR).is_err() {
+        halt_with_error(
+            "Domain management notification",
+            mboot_hv::Error::InvalidState,
+        )
     }
 }
 

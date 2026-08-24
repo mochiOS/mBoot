@@ -1,4 +1,4 @@
-version = 2
+version = 3
 toolchain = "nightly-2026-05-14"
 disk_size_mib = 96
 esp_size_mib = 64
@@ -15,3 +15,5 @@ image = "mochios"
 path = '\EFI\MBOOT\MOCHIOS.ELF'
 autostart = true
 required = true
+restart = "never"
+max_restarts = 0

@@ -102,6 +102,14 @@ impl Domain {
         Ok(())
     }
 
+    pub fn prepare_restart(&mut self) -> Result<(), Error> {
+        if !matches!(self.state, DomainState::Crashed | DomainState::Stopped) {
+            return Err(Error::InvalidState);
+        }
+        self.state = DomainState::Ready;
+        Ok(())
+    }
+
     fn transition(&mut self, from: DomainState, to: DomainState) -> Result<(), Error> {
         if self.state != from {
             return Err(Error::InvalidState);
@@ -129,5 +137,23 @@ mod tests {
         assert_eq!(domain.mark_ready(), Ok(()));
         assert_eq!(domain.start(), Ok(()));
         assert_eq!(domain.stop(), Ok(()));
+    }
+
+    #[test]
+    fn crashed_domain_must_be_prepared_before_restart() {
+        let pages = NestedPageTable::test_new(BackendKind::IntelVmx, 0x1000, 0x5000, 1);
+        let mut domain = Domain::new(
+            DomainId::new(3),
+            DomainRole::Application,
+            0,
+            BackendKind::IntelVmx,
+            pages,
+        );
+        domain.mark_ready().unwrap();
+        domain.start().unwrap();
+        domain.mark_crashed().unwrap();
+        assert_eq!(domain.start(), Err(Error::InvalidState));
+        assert_eq!(domain.prepare_restart(), Ok(()));
+        assert_eq!(domain.start(), Ok(()));
     }
 }

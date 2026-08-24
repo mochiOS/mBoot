@@ -261,6 +261,16 @@ impl Svm {
         self.vmcb_phys
     }
 
+    pub unsafe fn reset(&mut self) -> Result<(), Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        unsafe { write_bytes(self.vmcb_phys as *mut u8, 0, 4096) };
+        self.run_context = SvmRunContext::default();
+        self.started = false;
+        Ok(())
+    }
+
     /// Runs a 64-bit guest until its first intercepted exit.
     ///
     /// # Safety

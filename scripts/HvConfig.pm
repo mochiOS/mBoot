@@ -42,7 +42,7 @@ sub read_hv_config {
     for my $key (qw(version toolchain disk_size_mib esp_size_mib disk_guid esp_guid)) {
         exists $root{$key} or die "$path: missing $key\n";
     }
-    $root{version} == 2 or die "$path: unsupported version $root{version}\n";
+    $root{version} == 3 or die "$path: unsupported version $root{version}\n";
     $root{disk_size_mib} > $root{esp_size_mib} + 2
         or die "$path: disk_size_mib must exceed esp_size_mib by at least 2 MiB\n";
     @domains && @domains <= 8 or die "$path: domains must contain 1 to 8 entries\n";
@@ -50,7 +50,7 @@ sub read_hv_config {
     my %ids;
     my $system_domains = 0;
     for my $domain (@domains) {
-        for my $key (qw(id role memory_mib vcpus capabilities image path autostart required)) {
+        for my $key (qw(id role memory_mib vcpus capabilities image path autostart required restart max_restarts)) {
             exists $domain->{$key} or die "$path: Domain is missing $key\n";
         }
         $domain->{id} > 0 && !$ids{$domain->{id}}++
@@ -65,6 +65,16 @@ sub read_hv_config {
             or die "$path: Domain path must stay below \\EFI\\MBOOT\n";
         $domain->{autostart}
             or die "$path: current bootstrap requires autostart Domains\n";
+        $domain->{restart} =~ /^(?:never|on-failure|always)$/
+            or die "$path: invalid Domain restart policy\n";
+        if ($domain->{restart} eq 'never') {
+            $domain->{max_restarts} == 0
+                or die "$path: never-restarted Domain must use max_restarts = 0\n";
+        }
+        else {
+            $domain->{max_restarts} > 0 && $domain->{max_restarts} <= 255
+                or die "$path: restarted Domain max_restarts must be 1 to 255\n";
+        }
     }
     $system_domains == 1 or die "$path: exactly one System Domain is required\n";
 

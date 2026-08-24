@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use crate::Error;
 
 pub const MANIFEST_MAGIC: &[u8; 8] = b"MBLHV1\0\0";
-pub const MANIFEST_VERSION: u16 = 2;
+pub const MANIFEST_VERSION: u16 = 3;
 pub const MANIFEST_HEADER_SIZE: usize = 32;
 pub const DOMAIN_ENTRY_SIZE: usize = 160;
 pub const EVENT_CHANNEL_ENTRY_SIZE: usize = 32;
@@ -23,12 +23,22 @@ pub enum ManifestDomainRole {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ManifestRestartPolicy {
+    Never = 0,
+    OnFailure = 1,
+    Always = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManifestDomain<'a> {
     pub id: u32,
     pub role: ManifestDomainRole,
     pub flags: u16,
     pub memory_size: u64,
     pub vcpu_count: u16,
+    pub restart_policy: ManifestRestartPolicy,
+    pub max_restarts: u8,
     pub capabilities: u64,
     pub image_sha256: [u8; 32],
     pub image_path: &'a str,
@@ -164,12 +174,21 @@ impl<'a> LaunchManifest<'a> {
         let flags = read_u16(entry, 6)?;
         let memory_size = read_u64(entry, 8)?;
         let vcpu_count = read_u16(entry, 16)?;
+        let restart_policy = match entry[18] {
+            0 => ManifestRestartPolicy::Never,
+            1 => ManifestRestartPolicy::OnFailure,
+            2 => ManifestRestartPolicy::Always,
+            _ => return Err(Error::InvalidManifest),
+        };
+        let max_restarts = entry[19];
         if id == 0
             || flags & !DOMAIN_FLAGS_KNOWN != 0
             || memory_size == 0
             || memory_size & 0xfff != 0
             || vcpu_count == 0
-            || entry[18..32].iter().any(|byte| *byte != 0)
+            || restart_policy == ManifestRestartPolicy::Never && max_restarts != 0
+            || restart_policy != ManifestRestartPolicy::Never && max_restarts == 0
+            || entry[20..32].iter().any(|byte| *byte != 0)
             || entry[74..80].iter().any(|byte| *byte != 0)
         {
             return Err(Error::InvalidManifest);
@@ -193,6 +212,8 @@ impl<'a> LaunchManifest<'a> {
             flags,
             memory_size,
             vcpu_count,
+            restart_policy,
+            max_restarts,
             capabilities,
             image_sha256,
             image_path,
@@ -291,6 +312,7 @@ mod tests {
         entry[6..8].copy_from_slice(&(DOMAIN_FLAG_AUTO_START | DOMAIN_FLAG_REQUIRED).to_le_bytes());
         entry[8..16].copy_from_slice(&(2_u64 * 1024 * 1024).to_le_bytes());
         entry[16..18].copy_from_slice(&1_u16.to_le_bytes());
+        entry[18] = ManifestRestartPolicy::Never as u8;
         let path = b"\\EFI\\MBOOT\\MNU.ELF";
         entry[72..74].copy_from_slice(&(path.len() as u16).to_le_bytes());
         entry[80..80 + path.len()].copy_from_slice(path);
@@ -307,6 +329,7 @@ mod tests {
         assert_eq!(domain.id, 1);
         assert_eq!(domain.role, ManifestDomainRole::System);
         assert_eq!(domain.memory_size, 2 * 1024 * 1024);
+        assert_eq!(domain.restart_policy, ManifestRestartPolicy::Never);
         assert_eq!(domain.image_path, "\\EFI\\MBOOT\\MNU.ELF");
         assert!(domain.auto_starts());
         assert!(domain.is_required());

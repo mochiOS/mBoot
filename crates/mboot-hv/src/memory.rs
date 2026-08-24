@@ -208,6 +208,20 @@ impl NestedPageTable {
         Ok(0)
     }
 
+    /// Clears all Domain RAM before a fresh image is loaded.
+    ///
+    /// # Safety
+    /// The Domain vCPU must be stopped and no backend may access guest RAM.
+    pub unsafe fn clear_guest_memory(&self) {
+        unsafe {
+            write_bytes(
+                self.guest_base as *mut u8,
+                0,
+                self.guest_memory_size() as usize,
+            )
+        };
+    }
+
     pub const fn hardware_root(&self) -> u64 {
         match self.backend {
             BackendKind::IntelVmx => self.root | EPT_WRITE_BACK | EPT_WALK_LENGTH_4,
