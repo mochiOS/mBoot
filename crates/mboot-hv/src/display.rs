@@ -67,6 +67,11 @@ pub fn failure(code: u8) {
     draw_centered(&digits, line_y(2));
 }
 
+pub fn pci_dma_failure(requester: u16) {
+    show(0x006B_2028, b"MBOOT", b"PCI DMA");
+    draw_hex(u64::from(requester), line_y(2));
+}
+
 pub fn vmcs_failure(field: u64) {
     show(0x006B_2028, b"MBOOT", b"VMCS");
     draw_hex(field, line_y(2));
