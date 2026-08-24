@@ -1,6 +1,7 @@
 use mnu_abi::hypervisor::{
-    PciDeviceInfo, PCI_DEVICE_FLAG_CLAIMABLE, PCI_DEVICE_STATE_CLAIMED_DISABLED,
-    PCI_DEVICE_STATE_FIRMWARE_DEFERRED, PCI_DEVICE_STATE_QUARANTINED,
+    PciDeviceInfo, PCI_DEVICE_FLAG_CLAIMABLE, PCI_DEVICE_STATE_ACTIVE,
+    PCI_DEVICE_STATE_CLAIMED_DISABLED, PCI_DEVICE_STATE_FIRMWARE_DEFERRED,
+    PCI_DEVICE_STATE_QUARANTINED,
 };
 
 use crate::manifest::{ManifestDevice, ManifestDeviceKind};
@@ -130,6 +131,24 @@ impl DeviceTable {
         Ok(())
     }
 
+    pub fn activate(&mut self, domain_id: u32, requester: u16) -> Result<(), DeviceError> {
+        self.can_activate(domain_id, requester)?;
+        let record = self.record_mut(requester)?;
+        record.info.state = PCI_DEVICE_STATE_ACTIVE;
+        Ok(())
+    }
+
+    pub fn can_activate(&self, domain_id: u32, requester: u16) -> Result<(), DeviceError> {
+        let record = self.record(requester)?;
+        if record.info.owner_domain != domain_id {
+            return Err(DeviceError::PermissionDenied);
+        }
+        if record.info.state != PCI_DEVICE_STATE_CLAIMED_DISABLED {
+            return Err(DeviceError::InvalidState);
+        }
+        Ok(())
+    }
+
     pub fn can_claim(&self, domain_id: u32, requester: u16) -> Result<(), DeviceError> {
         let record = self.record(requester)?;
         if record.allowed_domain != domain_id {
@@ -146,7 +165,10 @@ impl DeviceTable {
         if record.info.owner_domain != domain_id {
             return Err(DeviceError::PermissionDenied);
         }
-        if record.info.state != PCI_DEVICE_STATE_CLAIMED_DISABLED {
+        if !matches!(
+            record.info.state,
+            PCI_DEVICE_STATE_CLAIMED_DISABLED | PCI_DEVICE_STATE_ACTIVE
+        ) {
             return Err(DeviceError::InvalidState);
         }
         Ok(())
@@ -162,6 +184,13 @@ impl DeviceTable {
     fn record(&self, requester: u16) -> Result<&DeviceRecord, DeviceError> {
         self.devices[..self.count]
             .iter()
+            .find(|record| record.info.requester == requester)
+            .ok_or(DeviceError::DeviceUnavailable)
+    }
+
+    fn record_mut(&mut self, requester: u16) -> Result<&mut DeviceRecord, DeviceError> {
+        self.devices[..self.count]
+            .iter_mut()
             .find(|record| record.info.requester == requester)
             .ok_or(DeviceError::DeviceUnavailable)
     }
@@ -233,6 +262,8 @@ mod tests {
             table.query(2, 0).unwrap().state,
             PCI_DEVICE_STATE_CLAIMED_DISABLED
         );
+        table.activate(2, 0x00a0).unwrap();
+        assert_eq!(table.query(2, 0).unwrap().state, PCI_DEVICE_STATE_ACTIVE);
         assert_eq!(table.release_domain(2), 1);
         assert_eq!(
             table.query(2, 0).unwrap().state,

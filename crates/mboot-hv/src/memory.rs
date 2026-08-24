@@ -6,10 +6,12 @@ const PAGE_SIZE: u64 = 4096;
 const ENTRY_COUNT: usize = 512;
 const EPT_READ_WRITE_EXECUTE: u64 = 0b111;
 const EPT_LEAF_WRITE_BACK: u64 = EPT_READ_WRITE_EXECUTE | (6 << 3);
+const EPT_DEVICE_READ_WRITE: u64 = 0b011;
 const EPT_WRITE_BACK: u64 = 6;
 const EPT_WALK_LENGTH_4: u64 = 3 << 3;
 const NPT_PRESENT_WRITE_USER: u64 = 0b111;
 const NPT_PRESENT_USER_NO_EXECUTE: u64 = 0b101 | (1 << 63);
+const NPT_DEVICE_READ_WRITE: u64 = NPT_PRESENT_WRITE_USER | (1 << 3) | (1 << 4) | (1 << 63);
 const GUEST_PAGE_TABLE_FLAGS: u64 = 0b111;
 const GUEST_LARGE_PAGE_FLAGS: u64 = GUEST_PAGE_TABLE_FLAGS | (1 << 7);
 
@@ -180,6 +182,25 @@ impl NestedPageTable {
         Ok(())
     }
 
+    /// Maps one physical device page into a stopped Domain with non-executable,
+    /// uncacheable semantics.
+    ///
+    /// # Safety
+    /// `host_page` must be a validated device MMIO page. The vCPU must remain
+    /// stopped until the nested translation cache has been invalidated.
+    pub unsafe fn map_device_page(&self, guest_page: u64, host_page: u64) -> Result<(), Error> {
+        let index = self.page_index(guest_page)?;
+        if host_page == 0 || host_page & (PAGE_SIZE - 1) != 0 || host_page >> 52 != 0 {
+            return Err(Error::InvalidPage);
+        }
+        let flags = match self.backend {
+            BackendKind::IntelVmx => EPT_DEVICE_READ_WRITE,
+            BackendKind::AmdSvm => NPT_DEVICE_READ_WRITE,
+        };
+        unsafe { write_entry(self.level1, index, host_page | flags) };
+        Ok(())
+    }
+
     fn page_index(&self, guest_page: u64) -> Result<usize, Error> {
         self.owned_page_host_address(guest_page)
             .ok_or(Error::InvalidPage)?;
@@ -284,6 +305,15 @@ mod tests {
         assert_eq!(level1.0[0], shared.0.as_mut_ptr() as u64 | (6 << 3) | 1);
         unsafe { table.restore_owned_page(0).unwrap() };
         assert_eq!(level1.0[0], resources.guest_base | EPT_LEAF_WRITE_BACK);
+        unsafe {
+            table
+                .map_device_page(0, shared.0.as_mut_ptr() as u64)
+                .unwrap()
+        };
+        assert_eq!(
+            level1.0[0],
+            shared.0.as_mut_ptr() as u64 | EPT_DEVICE_READ_WRITE
+        );
         assert_eq!(
             table.hardware_root() & 0xfff,
             EPT_WRITE_BACK | EPT_WALK_LENGTH_4
@@ -312,6 +342,15 @@ mod tests {
         assert_eq!(
             level1.0[0],
             shared.0.as_mut_ptr() as u64 | NPT_PRESENT_USER_NO_EXECUTE | (1 << 1)
+        );
+        unsafe {
+            table
+                .map_device_page(0, shared.0.as_mut_ptr() as u64)
+                .unwrap()
+        };
+        assert_eq!(
+            level1.0[0],
+            shared.0.as_mut_ptr() as u64 | NPT_DEVICE_READ_WRITE
         );
     }
 

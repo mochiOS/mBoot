@@ -27,7 +27,7 @@ use mboot_hv::{
     VmExitReason,
 };
 use mnu_abi::hypervisor::{
-    DomainBootInfo, DomainCrashInfo, HypercallNumber, PciDeviceInfo,
+    DomainBootInfo, DomainCrashInfo, HypercallNumber, PciDeviceInfo, PciDeviceResource,
     DOMAIN_CAPABILITY_DEVICE_CLAIM, DOMAIN_CAPABILITY_DEVICE_QUERY, DOMAIN_CRASH_STATUS_CRASHED,
     DOMAIN_CRASH_STATUS_RESTARTED, DOMAIN_MANAGEMENT_VECTOR, DOMAIN_ROLE_APPLICATION,
     DOMAIN_ROLE_HARDWARE, DOMAIN_ROLE_SYSTEM, EVENT_CHANNEL_VECTOR, GRANT_FLAG_WRITABLE,
@@ -43,6 +43,7 @@ use uefi::CString16;
 const MAX_MEMORY_REGIONS: usize = 256;
 const MAX_GUEST_MEMORY_PAGES: usize = 512;
 const GRANT_WINDOW_PAGES: usize = 16;
+const DEVICE_WINDOW_PAGES: usize = 64;
 const DOMAIN_BOOT_INFO_GPA: u64 = 0x3000;
 const MAX_CONSOLE_WRITE: u64 = 4096;
 const LAUNCH_MANIFEST_PATH: &str = "\\EFI\\MBOOT\\LAUNCH.MF";
@@ -60,6 +61,7 @@ struct MemoryRegion {
     start: u64,
     len: u64,
     usable: bool,
+    mmio: bool,
 }
 
 impl MemoryRegion {
@@ -67,12 +69,14 @@ impl MemoryRegion {
         start: 0,
         len: 0,
         usable: false,
+        mmio: false,
     };
 }
 
 struct BootMemoryMap {
     regions: [MemoryRegion; MAX_MEMORY_REGIONS],
     len: usize,
+    overflowed: bool,
 }
 
 struct PreparedDomain {
@@ -122,6 +126,7 @@ impl BootMemoryMap {
         Self {
             regions: [MemoryRegion::EMPTY; MAX_MEMORY_REGIONS],
             len: 0,
+            overflowed: false,
         }
     }
 
@@ -129,6 +134,8 @@ impl BootMemoryMap {
         if self.len < self.regions.len() {
             self.regions[self.len] = region;
             self.len += 1;
+        } else {
+            self.overflowed = true;
         }
     }
 
@@ -146,6 +153,21 @@ impl BootMemoryMap {
             .map(|region| region.start)
             .min()
             .unwrap_or(0)
+    }
+
+    fn allows_device_mmio(&self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        !self.overflowed
+            && start != 0
+            && len != 0
+            && start & 0xfff == 0
+            && len & 0xfff == 0
+            && self.regions[..self.len].iter().all(|region| {
+                let region_end = region.start.saturating_add(region.len);
+                end <= region.start || start >= region_end || region.mmio
+            })
     }
 }
 
@@ -297,7 +319,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         let guest_pages = (config.memory_size / 4096) as usize;
         if !config.auto_starts()
             || config.vcpu_count != 1
-            || !(GRANT_WINDOW_PAGES + 16..=MAX_GUEST_MEMORY_PAGES).contains(&guest_pages)
+            || !(GRANT_WINDOW_PAGES + DEVICE_WINDOW_PAGES + 16..=MAX_GUEST_MEMORY_PAGES)
+                .contains(&guest_pages)
         {
             log!("unsupported configuration for Domain {}", config.id);
             display::failure(6);
@@ -386,6 +409,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             start: descriptor.phys_start,
             len: descriptor.page_count * 4096,
             usable: descriptor.ty == MemoryType::CONVENTIONAL,
+            mmio: descriptor.ty == MemoryType::MMIO,
         });
     }
 
@@ -470,6 +494,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 halt_with_error("PCI ownership policy", mboot_hv::Error::InvalidManifest)
             }
         };
+    let mut pci_assignments = pci::AssignmentTable::new();
     log!("PCI ownership table: {} device(s)", devices.len());
     let mut dma_remapper = if let Some(topology) = iommu_topology {
         // SAFETY: Tables were allocated and zeroed before ExitBootServices, PCI
@@ -575,6 +600,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             domain.nested_pages().guest_memory_size(),
             grant_window_start(domain.nested_pages()),
             GRANT_WINDOW_PAGES as u64 * 4096,
+            device_window_start(domain.nested_pages()),
+            DEVICE_WINDOW_PAGES as u64 * 4096,
             0,
             domain.capabilities(),
         );
@@ -610,7 +637,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 nested_root: domain.nested_pages().hardware_root(),
                 page_table_root: guest_cr3,
                 entry: guest_image.entry(),
-                stack: grant_window_start(domain.nested_pages()) - 16,
+                stack: device_window_start(domain.nested_pages()) - 16,
                 boot_info: DOMAIN_BOOT_INFO_GPA,
                 msr_permission_map: prepared.msr_permission_map,
             },
@@ -661,7 +688,32 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
 
     let mut scheduler = CooperativeScheduler::new();
-    while let Some(index) = scheduler.next(&runnable) {
+    loop {
+        let pending_devices = pci::take_pending_device_interrupts();
+        let routed_interrupts: Vec<(u32, u8)> =
+            pci_assignments.route_pending(pending_devices).collect();
+        for (domain_id, vector) in routed_interrupts {
+            let Some(target) = runtime_domains
+                .iter()
+                .position(|runtime| runtime.domain.id().get() == domain_id)
+            else {
+                halt_with_error("PCI IRQ routing", mboot_hv::Error::InvalidState)
+            };
+            if runtime_domains[target].interrupts.raise(vector).is_err() {
+                halt_with_error("PCI IRQ routing", mboot_hv::Error::InvalidState)
+            }
+            runtime_domains[target].waiting = false;
+            runnable[target] = true;
+        }
+        let Some(index) = scheduler.next(&runnable) else {
+            if pci_assignments.has_active() {
+                // SAFETY: The mBoot IDT owns every enabled device vector. STI is
+                // immediately followed by HLT, and the handler returns with IF clear.
+                unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+                continue;
+            }
+            break;
+        };
         let runtime = &mut runtime_domains[index];
         if runtime.interrupts.update_timer(timer::now()).is_err() {
             halt_with_error("Virtual APIC timer", mboot_hv::Error::InvalidState)
@@ -740,6 +792,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     &mut grants,
                     &mut event_channels,
                     &mut devices,
+                    &mut pci_assignments,
                     &mut dma_remapper,
                     manifest,
                     raw_reason,
@@ -808,6 +861,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut grants,
                 &mut event_channels,
                 &mut devices,
+                &mut pci_assignments,
                 &mut dma_remapper,
                 manifest,
                 vm_exit.raw_reason,
@@ -824,6 +878,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut grants,
                 &mut event_channels,
                 &mut devices,
+                &mut pci_assignments,
                 &mut dma_remapper,
                 manifest,
                 vm_exit.raw_reason,
@@ -867,37 +922,24 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         }
         if vm_exit.hypercall_number == HypercallNumber::DeviceClaim as u64 {
             let domain_id = runtime_domains[index].domain.id().get();
-            let guest_base = runtime_domains[index].domain.nested_pages().guest_base();
-            let guest_size = runtime_domains[index]
-                .domain
-                .nested_pages()
-                .guest_memory_size();
             let authorized = runtime_domains[index].domain.role() == DomainRole::Hardware
                 && runtime_domains[index].domain.capabilities() & DOMAIN_CAPABILITY_DEVICE_CLAIM
                     != 0;
             let requester = u16::try_from(vm_exit.arg0).ok().filter(|value| *value != 0);
-            let claimed = requester.is_some_and(|requester| {
-                if !authorized
-                    || vm_exit.arg1 != 0
-                    || vm_exit.arg2 != 0
-                    || devices.can_claim(domain_id, requester).is_err()
-                {
-                    return false;
-                }
-                let Some(remapper) = dma_remapper.as_mut() else {
-                    return false;
-                };
-                if unsafe { remapper.assign(0, requester, domain_id, guest_base, guest_size) }
-                    .is_err()
-                {
-                    return false;
-                }
-                if devices.claim(domain_id, requester).is_err() {
-                    let _ = unsafe { remapper.detach(0, requester, domain_id) };
-                    return false;
-                }
-                true
-            });
+            let claimed = authorized
+                && vm_exit.arg1 == 0
+                && vm_exit.arg2 == 0
+                && requester.is_some_and(|requester| {
+                    claim_pci_device(
+                        index,
+                        &mut runtime_domains,
+                        &mut devices,
+                        &mut pci_assignments,
+                        &mut dma_remapper,
+                        &memory_map,
+                        requester,
+                    )
+                });
             runtime_domains[index].pending_result = if claimed {
                 log!(
                     "PCI requester {:04x} mapped for DMA and claimed-disabled by Hardware Domain {}",
@@ -910,28 +952,111 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             };
             continue;
         }
+        if vm_exit.hypercall_number == HypercallNumber::DeviceConfigRead as u64 {
+            let domain_id = runtime_domains[index].domain.id().get();
+            let requester = u16::try_from(vm_exit.arg0).ok();
+            let offset = u16::try_from(vm_exit.arg1).ok();
+            runtime_domains[index].pending_result = match (requester, offset) {
+                (Some(requester), Some(offset))
+                    if runtime_domains[index].domain.role() == DomainRole::Hardware =>
+                {
+                    unsafe { pci_assignments.config_read(domain_id, requester, offset) }
+                        .map_or(HYPERCALL_INVALID_ARGUMENT, u64::from)
+                }
+                _ => HYPERCALL_INVALID_ARGUMENT,
+            };
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::DeviceResourceQuery as u64 {
+            let domain_id = runtime_domains[index].domain.id().get();
+            let requester = u16::try_from(vm_exit.arg0).ok();
+            let resource_index = usize::try_from(vm_exit.arg1).ok();
+            let destination = runtime_domains[index]
+                .domain
+                .nested_pages()
+                .guest_host_address(vm_exit.arg2, size_of::<PciDeviceResource>() as u64);
+            let resource = requester
+                .zip(resource_index)
+                .and_then(|(requester, resource_index)| {
+                    pci_assignments.resource(domain_id, requester, resource_index)
+                });
+            runtime_domains[index].pending_result = match (resource, destination) {
+                (Some(resource), Some(destination))
+                    if runtime_domains[index].domain.role() == DomainRole::Hardware =>
+                {
+                    unsafe {
+                        copy_nonoverlapping(
+                            &resource as *const PciDeviceResource,
+                            destination as *mut PciDeviceResource,
+                            1,
+                        )
+                    };
+                    HYPERCALL_SUCCESS
+                }
+                _ => HYPERCALL_INVALID_ARGUMENT,
+            };
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::DeviceActivate as u64 {
+            let domain_id = runtime_domains[index].domain.id().get();
+            let requester = u16::try_from(vm_exit.arg0).ok();
+            let guest_vector = u8::try_from(vm_exit.arg1).ok();
+            let activated = requester
+                .zip(guest_vector)
+                .is_some_and(|(requester, guest_vector)| {
+                    if vm_exit.arg2 != 0
+                        || runtime_domains[index].domain.role() != DomainRole::Hardware
+                        || devices.can_activate(domain_id, requester).is_err()
+                    {
+                        return false;
+                    }
+                    match unsafe { pci_assignments.activate(domain_id, requester, guest_vector) } {
+                        Ok(physical_vector) => {
+                            if devices.activate(domain_id, requester).is_err() {
+                                halt_with_error(
+                                    "PCI activation state",
+                                    mboot_hv::Error::InvalidState,
+                                )
+                            }
+                            log!(
+                                "PCI requester {:04x} active: host IRQ {:#x} -> Domain {} vector {:#x}",
+                                requester,
+                                physical_vector,
+                                domain_id,
+                                guest_vector
+                            );
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                });
+            runtime_domains[index].pending_result = if activated {
+                HYPERCALL_SUCCESS
+            } else {
+                HYPERCALL_INVALID_ARGUMENT
+            };
+            continue;
+        }
         if vm_exit.hypercall_number == HypercallNumber::DeviceRelease as u64 {
             let domain_id = runtime_domains[index].domain.id().get();
             let authorized = runtime_domains[index].domain.role() == DomainRole::Hardware
                 && runtime_domains[index].domain.capabilities() & DOMAIN_CAPABILITY_DEVICE_CLAIM
                     != 0;
             let requester = u16::try_from(vm_exit.arg0).ok().filter(|value| *value != 0);
-            let released = requester.is_some_and(|requester| {
-                if !authorized
-                    || vm_exit.arg1 != 0
-                    || vm_exit.arg2 != 0
-                    || devices.can_release(domain_id, requester).is_err()
-                {
-                    return false;
-                }
-                let Some(remapper) = dma_remapper.as_mut() else {
-                    return false;
-                };
-                if unsafe { remapper.detach(0, requester, domain_id) }.is_err() {
-                    return false;
-                }
-                devices.release(domain_id, requester).is_ok()
-            });
+            let released = authorized
+                && vm_exit.arg1 == 0
+                && vm_exit.arg2 == 0
+                && requester.is_some_and(|requester| {
+                    release_pci_device(
+                        index,
+                        &mut runtime_domains,
+                        &mut devices,
+                        &mut pci_assignments,
+                        &mut dma_remapper,
+                        requester,
+                        true,
+                    )
+                });
             runtime_domains[index].pending_result = if released {
                 log!(
                     "PCI requester {:04x} returned to IOMMU deny-all by Hardware Domain {}",
@@ -983,6 +1108,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut grants,
                 &mut event_channels,
                 &mut devices,
+                &mut pci_assignments,
                 &mut dma_remapper,
             );
             let runtime = &mut runtime_domains[index];
@@ -1398,6 +1524,7 @@ fn isolate_crashed_domain(
     grants: &mut GrantTable,
     event_channels: &mut EventChannelTable,
     devices: &mut DeviceTable,
+    pci_assignments: &mut pci::AssignmentTable,
     dma_remapper: &mut Option<iommu::DmaRemapper>,
     manifest: LaunchManifest<'_>,
     raw_reason: u64,
@@ -1425,6 +1552,7 @@ fn isolate_crashed_domain(
         grants,
         event_channels,
         devices,
+        pci_assignments,
         dma_remapper,
     );
     log!(
@@ -1453,23 +1581,29 @@ fn cleanup_domain_resources(
     grants: &mut GrantTable,
     event_channels: &mut EventChannelTable,
     devices: &mut DeviceTable,
+    pci_assignments: &mut pci::AssignmentTable,
     dma_remapper: &mut Option<iommu::DmaRemapper>,
 ) {
     let domain_id = runtime_domains[index].domain.id();
     let crashed = runtime_domains[index].domain.state() == DomainState::Crashed;
     let claimed_requesters: Vec<u16> = devices.claimed_requesters(domain_id.get()).collect();
     for requester in &claimed_requesters {
-        let Some(remapper) = dma_remapper.as_mut() else {
-            halt_with_error("IOMMU device cleanup", mboot_hv::Error::InvalidState)
-        };
-        if let Err(error) = unsafe { remapper.detach(0, *requester, domain_id.get()) } {
-            halt_with_error("IOMMU device cleanup", iommu_error(error))
+        if !release_pci_device(
+            index,
+            runtime_domains,
+            devices,
+            pci_assignments,
+            dma_remapper,
+            *requester,
+            true,
+        ) {
+            halt_with_error("PCI device cleanup", mboot_hv::Error::InvalidState)
         }
     }
-    let released_devices = devices.release_domain(domain_id.get());
+    let released_devices = claimed_requesters.len();
     if released_devices != 0 {
         log!(
-            "Domain {} returned {} claimed-disabled PCI device(s)",
+            "Domain {} returned {} PCI device(s)",
             domain_id.get(),
             released_devices
         );
@@ -1544,6 +1678,8 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
         runtime.domain.nested_pages().guest_memory_size(),
         grant_window_start(runtime.domain.nested_pages()),
         GRANT_WINDOW_PAGES as u64 * 4096,
+        device_window_start(runtime.domain.nested_pages()),
+        DEVICE_WINDOW_PAGES as u64 * 4096,
         runtime.restart_count,
         runtime.domain.capabilities(),
     );
@@ -1673,6 +1809,204 @@ fn handle_console_write(
     HYPERCALL_SUCCESS
 }
 
+fn claim_pci_device(
+    index: usize,
+    runtime_domains: &mut [RuntimeDomain],
+    devices: &mut DeviceTable,
+    assignments: &mut pci::AssignmentTable,
+    dma_remapper: &mut Option<iommu::DmaRemapper>,
+    memory_map: &BootMemoryMap,
+    requester: u16,
+) -> bool {
+    let domain_id = runtime_domains[index].domain.id().get();
+    if devices.can_claim(domain_id, requester).is_err() {
+        return false;
+    }
+    let descriptor = match unsafe { pci::probe_descriptor(requester) } {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            log!(
+                "PCI requester {:04x} resource probe failed: {:?}",
+                requester,
+                error
+            );
+            return false;
+        }
+    };
+    if descriptor.bars[..descriptor.bar_count]
+        .iter()
+        .any(|bar| !memory_map.allows_device_mmio(bar.physical_address, bar.length))
+    {
+        log!("PCI requester {:04x} exposed an unsafe MMIO BAR", requester);
+        return false;
+    }
+    let window_start = device_window_start(runtime_domains[index].domain.nested_pages());
+    let bars = match assignments.insert(
+        domain_id,
+        descriptor,
+        window_start,
+        DEVICE_WINDOW_PAGES as u64 * 4096,
+    ) {
+        Ok(bars) => {
+            let mut copied = [pci::PciBar::default(); pci::MAX_DEVICE_BARS];
+            copied[..bars.len()].copy_from_slice(bars);
+            copied
+        }
+        Err(error) => {
+            log!(
+                "PCI requester {:04x} device window allocation failed: {:?}",
+                requester,
+                error
+            );
+            return false;
+        }
+    };
+    let nested_root = runtime_domains[index].domain.nested_pages().hardware_root();
+    for bar in bars.iter().filter(|bar| bar.length != 0) {
+        let mut offset = 0;
+        while offset < bar.length {
+            if unsafe {
+                runtime_domains[index]
+                    .domain
+                    .nested_pages()
+                    .map_device_page(bar.guest_address + offset, bar.physical_address + offset)
+            }
+            .is_err()
+            {
+                if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
+                    halt_with_error("PCI mapping rollback", mboot_hv::Error::InvalidState)
+                }
+                return false;
+            }
+            offset += 4096;
+        }
+    }
+    if unsafe {
+        runtime_domains[index]
+            .virtualization
+            .flush_nested(nested_root)
+    }
+    .is_err()
+    {
+        if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
+            halt_with_error("PCI mapping rollback", mboot_hv::Error::InvalidState)
+        }
+        return false;
+    }
+    let Some(remapper) = dma_remapper.as_mut() else {
+        if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
+            halt_with_error("PCI mapping rollback", mboot_hv::Error::InvalidState)
+        }
+        return false;
+    };
+    let guest_base = runtime_domains[index].domain.nested_pages().guest_base();
+    let guest_size = runtime_domains[index]
+        .domain
+        .nested_pages()
+        .guest_memory_size();
+    if unsafe { remapper.assign(0, requester, domain_id, guest_base, guest_size) }.is_err() {
+        if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
+            halt_with_error("PCI mapping rollback", mboot_hv::Error::InvalidState)
+        }
+        return false;
+    }
+    if devices.claim(domain_id, requester).is_err() {
+        if unsafe { remapper.detach(0, requester, domain_id) }.is_err() {
+            halt_with_error("PCI DMA rollback", mboot_hv::Error::InvalidState)
+        }
+        if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
+            halt_with_error("PCI mapping rollback", mboot_hv::Error::InvalidState)
+        }
+        return false;
+    }
+    true
+}
+
+fn release_pci_device(
+    index: usize,
+    runtime_domains: &mut [RuntimeDomain],
+    devices: &mut DeviceTable,
+    assignments: &mut pci::AssignmentTable,
+    dma_remapper: &mut Option<iommu::DmaRemapper>,
+    requester: u16,
+    reset: bool,
+) -> bool {
+    let domain_id = runtime_domains[index].domain.id().get();
+    if devices.can_release(domain_id, requester).is_err() {
+        return false;
+    }
+    let bars = match unsafe { assignments.deactivate(domain_id, requester, reset) } {
+        Ok(bars) => bars,
+        Err(error) => {
+            log!(
+                "PCI requester {:04x} shutdown failed: {:?}",
+                requester,
+                error
+            );
+            return false;
+        }
+    };
+    let Some(remapper) = dma_remapper.as_mut() else {
+        return false;
+    };
+    if unsafe { remapper.detach(0, requester, domain_id) }.is_err() {
+        return false;
+    }
+    if !restore_pci_mapping(index, runtime_domains, bars) {
+        halt_with_error("PCI mapping restore", mboot_hv::Error::InvalidState)
+    }
+    if assignments.remove(domain_id, requester).is_err()
+        || devices.release(domain_id, requester).is_err()
+    {
+        halt_with_error("PCI release state", mboot_hv::Error::InvalidState)
+    }
+    true
+}
+
+fn rollback_pci_mapping(
+    index: usize,
+    runtime_domains: &mut [RuntimeDomain],
+    assignments: &mut pci::AssignmentTable,
+    requester: u16,
+    bars: [pci::PciBar; pci::MAX_DEVICE_BARS],
+) -> bool {
+    let domain_id = runtime_domains[index].domain.id().get();
+    let deactivated = unsafe { assignments.deactivate(domain_id, requester, false) }.is_ok();
+    let restored = restore_pci_mapping(index, runtime_domains, bars);
+    let removed = assignments.remove(domain_id, requester).is_ok();
+    deactivated && restored && removed
+}
+
+fn restore_pci_mapping(
+    index: usize,
+    runtime_domains: &mut [RuntimeDomain],
+    bars: [pci::PciBar; pci::MAX_DEVICE_BARS],
+) -> bool {
+    let nested_root = runtime_domains[index].domain.nested_pages().hardware_root();
+    for bar in bars.iter().filter(|bar| bar.length != 0) {
+        let mut offset = 0;
+        while offset < bar.length {
+            if unsafe {
+                runtime_domains[index]
+                    .domain
+                    .nested_pages()
+                    .restore_owned_page(bar.guest_address + offset)
+            }
+            .is_err()
+            {
+                return false;
+            }
+            offset += 4096;
+        }
+    }
+    unsafe {
+        runtime_domains[index]
+            .virtualization
+            .flush_nested(nested_root)
+    }
+    .is_ok()
+}
+
 fn abi_domain_role(role: DomainRole) -> u32 {
     match role {
         DomainRole::System => DOMAIN_ROLE_SYSTEM,
@@ -1683,6 +2017,10 @@ fn abi_domain_role(role: DomainRole) -> u32 {
 
 fn grant_window_start(memory: &NestedPageTable) -> u64 {
     memory.guest_memory_size() - GRANT_WINDOW_PAGES as u64 * 4096
+}
+
+fn device_window_start(memory: &NestedPageTable) -> u64 {
+    grant_window_start(memory) - DEVICE_WINDOW_PAGES as u64 * 4096
 }
 
 fn grant_window_contains(memory: &NestedPageTable, guest_page: u64) -> bool {
