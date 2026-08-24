@@ -99,6 +99,7 @@ impl DeviceTable {
     }
 
     pub fn claim(&mut self, domain_id: u32, requester: u16) -> Result<(), DeviceError> {
+        self.can_claim(domain_id, requester)?;
         let record = self
             .devices
             .get_mut(..self.count)
@@ -108,18 +109,13 @@ impl DeviceTable {
                     .find(|record| record.info.requester == requester)
             })
             .ok_or(DeviceError::DeviceUnavailable)?;
-        if record.allowed_domain != domain_id {
-            return Err(DeviceError::PermissionDenied);
-        }
-        if record.info.state != PCI_DEVICE_STATE_QUARANTINED || record.info.owner_domain != 0 {
-            return Err(DeviceError::InvalidState);
-        }
         record.info.state = PCI_DEVICE_STATE_CLAIMED_DISABLED;
         record.info.owner_domain = domain_id;
         Ok(())
     }
 
     pub fn release(&mut self, domain_id: u32, requester: u16) -> Result<(), DeviceError> {
+        self.can_release(domain_id, requester)?;
         let record = self
             .devices
             .get_mut(..self.count)
@@ -129,15 +125,45 @@ impl DeviceTable {
                     .find(|record| record.info.requester == requester)
             })
             .ok_or(DeviceError::DeviceUnavailable)?;
+        record.info.state = PCI_DEVICE_STATE_QUARANTINED;
+        record.info.owner_domain = 0;
+        Ok(())
+    }
+
+    pub fn can_claim(&self, domain_id: u32, requester: u16) -> Result<(), DeviceError> {
+        let record = self.record(requester)?;
+        if record.allowed_domain != domain_id {
+            return Err(DeviceError::PermissionDenied);
+        }
+        if record.info.state != PCI_DEVICE_STATE_QUARANTINED || record.info.owner_domain != 0 {
+            return Err(DeviceError::InvalidState);
+        }
+        Ok(())
+    }
+
+    pub fn can_release(&self, domain_id: u32, requester: u16) -> Result<(), DeviceError> {
+        let record = self.record(requester)?;
         if record.info.owner_domain != domain_id {
             return Err(DeviceError::PermissionDenied);
         }
         if record.info.state != PCI_DEVICE_STATE_CLAIMED_DISABLED {
             return Err(DeviceError::InvalidState);
         }
-        record.info.state = PCI_DEVICE_STATE_QUARANTINED;
-        record.info.owner_domain = 0;
         Ok(())
+    }
+
+    pub fn claimed_requesters(&self, domain_id: u32) -> impl Iterator<Item = u16> + '_ {
+        self.devices[..self.count]
+            .iter()
+            .filter(move |record| record.info.owner_domain == domain_id)
+            .map(|record| record.info.requester)
+    }
+
+    fn record(&self, requester: u16) -> Result<&DeviceRecord, DeviceError> {
+        self.devices[..self.count]
+            .iter()
+            .find(|record| record.info.requester == requester)
+            .ok_or(DeviceError::DeviceUnavailable)
     }
 
     pub fn release_domain(&mut self, domain_id: u32) -> usize {

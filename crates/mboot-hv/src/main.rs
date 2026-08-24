@@ -228,8 +228,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
 
     let boot_services = system_table.boot_services();
-    let iommu_tables = match iommu_topology {
-        Some(topology) => match allocate_iommu_tables(boot_services, topology) {
+    let iommu_resources = match iommu_topology {
+        Some(topology) => match allocate_iommu_resources(boot_services, topology) {
             Ok(tables) => tables,
             Err(status) => {
                 log!("failed to allocate deny-all IOMMU tables: {:?}", status);
@@ -471,14 +471,15 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             }
         };
     log!("PCI ownership table: {} device(s)", devices.len());
-    if let Some(topology) = iommu_topology {
+    let mut dma_remapper = if let Some(topology) = iommu_topology {
         // SAFETY: Tables were allocated and zeroed before ExitBootServices, PCI
         // bus mastering is disabled, and mBoot now exclusively owns IOMMU MMIO.
-        if let Err(error) =
-            unsafe { iommu::enable_deny_all(&topology, &iommu_tables, deferred_display) }
-        {
-            halt_with_error("IOMMU protection", iommu_error(error))
-        }
+        let remapper = match unsafe {
+            iommu::DmaRemapper::initialize(topology, &iommu_resources, deferred_display)
+        } {
+            Ok(remapper) => remapper,
+            Err(error) => halt_with_error("IOMMU protection", iommu_error(error)),
+        };
         log!(
             "IOMMU DMA protection enabled: {:?} {}",
             topology.kind(),
@@ -490,7 +491,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 "firmware-reserved-only"
             }
         );
-    }
+        Some(remapper)
+    } else {
+        None
+    };
     let preemption_timer = unsafe { timer::initialize() };
     log!(
         "vCPU preemption timer {}",
@@ -736,6 +740,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     &mut grants,
                     &mut event_channels,
                     &mut devices,
+                    &mut dma_remapper,
                     manifest,
                     raw_reason,
                     0,
@@ -803,6 +808,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut grants,
                 &mut event_channels,
                 &mut devices,
+                &mut dma_remapper,
                 manifest,
                 vm_exit.raw_reason,
                 vm_exit.fault_address,
@@ -818,6 +824,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut grants,
                 &mut event_channels,
                 &mut devices,
+                &mut dma_remapper,
                 manifest,
                 vm_exit.raw_reason,
                 0,
@@ -860,17 +867,40 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         }
         if vm_exit.hypercall_number == HypercallNumber::DeviceClaim as u64 {
             let domain_id = runtime_domains[index].domain.id().get();
+            let guest_base = runtime_domains[index].domain.nested_pages().guest_base();
+            let guest_size = runtime_domains[index]
+                .domain
+                .nested_pages()
+                .guest_memory_size();
             let authorized = runtime_domains[index].domain.role() == DomainRole::Hardware
                 && runtime_domains[index].domain.capabilities() & DOMAIN_CAPABILITY_DEVICE_CLAIM
                     != 0;
             let requester = u16::try_from(vm_exit.arg0).ok().filter(|value| *value != 0);
-            runtime_domains[index].pending_result = if authorized
-                && vm_exit.arg1 == 0
-                && vm_exit.arg2 == 0
-                && requester.is_some_and(|requester| devices.claim(domain_id, requester).is_ok())
-            {
+            let claimed = requester.is_some_and(|requester| {
+                if !authorized
+                    || vm_exit.arg1 != 0
+                    || vm_exit.arg2 != 0
+                    || devices.can_claim(domain_id, requester).is_err()
+                {
+                    return false;
+                }
+                let Some(remapper) = dma_remapper.as_mut() else {
+                    return false;
+                };
+                if unsafe { remapper.assign(0, requester, domain_id, guest_base, guest_size) }
+                    .is_err()
+                {
+                    return false;
+                }
+                if devices.claim(domain_id, requester).is_err() {
+                    let _ = unsafe { remapper.detach(0, requester, domain_id) };
+                    return false;
+                }
+                true
+            });
+            runtime_domains[index].pending_result = if claimed {
                 log!(
-                    "PCI requester {:04x} claimed-disabled by Hardware Domain {}",
+                    "PCI requester {:04x} mapped for DMA and claimed-disabled by Hardware Domain {}",
                     requester.unwrap_or(0),
                     domain_id
                 );
@@ -886,13 +916,25 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 && runtime_domains[index].domain.capabilities() & DOMAIN_CAPABILITY_DEVICE_CLAIM
                     != 0;
             let requester = u16::try_from(vm_exit.arg0).ok().filter(|value| *value != 0);
-            runtime_domains[index].pending_result = if authorized
-                && vm_exit.arg1 == 0
-                && vm_exit.arg2 == 0
-                && requester.is_some_and(|requester| devices.release(domain_id, requester).is_ok())
-            {
+            let released = requester.is_some_and(|requester| {
+                if !authorized
+                    || vm_exit.arg1 != 0
+                    || vm_exit.arg2 != 0
+                    || devices.can_release(domain_id, requester).is_err()
+                {
+                    return false;
+                }
+                let Some(remapper) = dma_remapper.as_mut() else {
+                    return false;
+                };
+                if unsafe { remapper.detach(0, requester, domain_id) }.is_err() {
+                    return false;
+                }
+                devices.release(domain_id, requester).is_ok()
+            });
+            runtime_domains[index].pending_result = if released {
                 log!(
-                    "PCI requester {:04x} released by Hardware Domain {}",
+                    "PCI requester {:04x} returned to IOMMU deny-all by Hardware Domain {}",
                     requester.unwrap_or(0),
                     domain_id
                 );
@@ -941,6 +983,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut grants,
                 &mut event_channels,
                 &mut devices,
+                &mut dma_remapper,
             );
             let runtime = &mut runtime_domains[index];
             if let Err(error) = runtime.domain.stop() {
@@ -1355,6 +1398,7 @@ fn isolate_crashed_domain(
     grants: &mut GrantTable,
     event_channels: &mut EventChannelTable,
     devices: &mut DeviceTable,
+    dma_remapper: &mut Option<iommu::DmaRemapper>,
     manifest: LaunchManifest<'_>,
     raw_reason: u64,
     fault_address: u64,
@@ -1375,7 +1419,14 @@ fn isolate_crashed_domain(
         next_restart_count,
         DOMAIN_CRASH_STATUS_CRASHED,
     ));
-    cleanup_domain_resources(index, runtime_domains, grants, event_channels, devices);
+    cleanup_domain_resources(
+        index,
+        runtime_domains,
+        grants,
+        event_channels,
+        devices,
+        dma_remapper,
+    );
     log!(
         "Domain {} crashed and was isolated: exit={:#x} gpa={:#x} info={:#x}",
         domain_id.get(),
@@ -1402,9 +1453,19 @@ fn cleanup_domain_resources(
     grants: &mut GrantTable,
     event_channels: &mut EventChannelTable,
     devices: &mut DeviceTable,
+    dma_remapper: &mut Option<iommu::DmaRemapper>,
 ) {
     let domain_id = runtime_domains[index].domain.id();
     let crashed = runtime_domains[index].domain.state() == DomainState::Crashed;
+    let claimed_requesters: Vec<u16> = devices.claimed_requesters(domain_id.get()).collect();
+    for requester in &claimed_requesters {
+        let Some(remapper) = dma_remapper.as_mut() else {
+            halt_with_error("IOMMU device cleanup", mboot_hv::Error::InvalidState)
+        };
+        if let Err(error) = unsafe { remapper.detach(0, *requester, domain_id.get()) } {
+            halt_with_error("IOMMU device cleanup", iommu_error(error))
+        }
+    }
     let released_devices = devices.release_domain(domain_id.get());
     if released_devices != 0 {
         log!(
@@ -1632,21 +1693,45 @@ fn grant_window_contains(memory: &NestedPageTable, guest_page: u64) -> bool {
             .is_some_and(|end| end <= memory.guest_memory_size())
 }
 
-fn allocate_iommu_tables(
+fn allocate_iommu_resources(
     boot_services: &BootServices,
     topology: iommu::IommuTopology,
-) -> Result<Vec<u64>, Status> {
-    let pages = iommu::deny_all_table_pages(topology.kind());
-    let mut tables = Vec::with_capacity(topology.unit_count());
+) -> Result<Vec<iommu::IommuResources>, Status> {
+    let (remapping_pages, domain_pages, command_pages, completion_pages) =
+        iommu::IommuResources::required_pages(topology.kind());
+    let mut resources = Vec::with_capacity(topology.unit_count());
     for _ in topology.units() {
-        let address = boot_services
-            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
-            .map_err(|error| error.status())?;
-        // SAFETY: UEFI returned `pages` contiguous writable pages exclusively to mBoot.
-        unsafe { write_bytes(address as *mut u8, 0, pages * 4096) };
-        tables.push(address);
+        let remapping_table = allocate_zeroed_pages(boot_services, remapping_pages)?;
+        let domain_tables = allocate_optional_zeroed_pages(boot_services, domain_pages)?;
+        let command_buffer = allocate_optional_zeroed_pages(boot_services, command_pages)?;
+        let completion = allocate_optional_zeroed_pages(boot_services, completion_pages)?;
+        resources.push(iommu::IommuResources {
+            remapping_table,
+            domain_tables,
+            command_buffer,
+            completion,
+        });
     }
-    Ok(tables)
+    Ok(resources)
+}
+
+fn allocate_optional_zeroed_pages(
+    boot_services: &BootServices,
+    pages: usize,
+) -> Result<u64, Status> {
+    if pages == 0 {
+        Ok(0)
+    } else {
+        allocate_zeroed_pages(boot_services, pages)
+    }
+}
+
+fn allocate_zeroed_pages(boot_services: &BootServices, pages: usize) -> Result<u64, Status> {
+    let address = boot_services
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
+        .map_err(|error| error.status())?;
+    unsafe { write_bytes(address as *mut u8, 0, pages * 4096) };
+    Ok(address)
 }
 
 fn iommu_error(error: iommu::Error) -> mboot_hv::Error {
