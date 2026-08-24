@@ -7,8 +7,10 @@ pub mod event;
 pub mod grant;
 pub mod image;
 pub mod interrupt;
+pub mod iommu;
 pub mod manifest;
 pub mod memory;
+pub mod pci;
 pub mod scheduler;
 
 use arch::x86_64::{cpu, svm, vmx};
@@ -33,6 +35,7 @@ pub enum Error {
     UnsupportedDomainConfig,
     AddressSpaceIdUnavailable,
     InterruptVirtualizationUnavailable,
+    DeviceQuarantineFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

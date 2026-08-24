@@ -7,6 +7,9 @@ TIMEOUT_SECONDS=${HV_TIMEOUT_SECONDS:-45}
 ACCEL=${HV_ACCEL:-kvm}
 CPU=${HV_CPU:-host}
 EXPECT_BACKEND=${HV_EXPECT_BACKEND:-}
+EXPECT_IOMMU=${HV_EXPECT_IOMMU:-}
+IOMMU_DEVICE=${HV_IOMMU_DEVICE:-}
+IOMMU_PROBE_ONLY=${HV_IOMMU_PROBE_ONLY:-0}
 EFI="$ROOT/output/hv-target/x86_64-unknown-uefi/release/mboot-hv.efi"
 RING_BOOTSTRAP_DOMAIN_ELF=${RING_BOOTSTRAP_DOMAIN_ELF:-"$ROOT/../core/target/x86_64-unknown-none/release/ring-bootstrap"}
 HV_LAUNCH_MANIFEST=${HV_LAUNCH_MANIFEST:-"$ROOT/output/hv/launch.manifest"}
@@ -56,6 +59,11 @@ mcopy -i "$ESP" "$RING_BOOTSTRAP_DOMAIN_ELF" ::/EFI/MBOOT/RINGBOOT.ELF
 mcopy -i "$ESP" "$HV_LAUNCH_MANIFEST" ::/EFI/MBOOT/LAUNCH.MF
 cp "$OVMF_VARS" "$VARS"
 
+IOMMU_ARGS=()
+if [[ -n $IOMMU_DEVICE ]]; then
+    IOMMU_ARGS=(-device "$IOMMU_DEVICE")
+fi
+
 "$QEMU" \
     -accel "$ACCEL" \
     -cpu "$CPU" \
@@ -67,6 +75,7 @@ cp "$OVMF_VARS" "$VARS"
     -drive "if=pflash,format=raw,file=$VARS" \
     -drive "if=none,id=esp,format=raw,file=$ESP" \
     -device virtio-blk-pci,drive=esp,bootindex=1 \
+    "${IOMMU_ARGS[@]}" \
     -display none \
     -monitor none \
     -serial "file:$SERIAL" \
@@ -74,6 +83,31 @@ cp "$OVMF_VARS" "$VARS"
     -no-reboot \
     -no-shutdown &
 QEMU_PID=$!
+
+if [[ $IOMMU_PROBE_ONLY == 1 ]]; then
+    [[ -n $EXPECT_IOMMU ]] || {
+        echo 'test-hv-qemu: HV_EXPECT_IOMMU is required for an IOMMU probe' >&2
+        exit 1
+    }
+    PROBED=0
+    for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
+        if grep -Fq "IOMMU description $EXPECT_IOMMU:" "$SERIAL" 2>/dev/null \
+            && grep -Fq 'PCI DMA quarantine:' "$SERIAL" 2>/dev/null; then
+            PROBED=1
+            break
+        fi
+        kill -0 "$QEMU_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [[ $PROBED -ne 1 ]]; then
+        sed -n '1,200p' "$SERIAL" >&2
+        echo "test-hv-qemu: IOMMU probe failed: $EXPECT_IOMMU" >&2
+        exit 1
+    fi
+    grep -E 'IOMMU description|IOMMU unit|PCI DMA quarantine' "$SERIAL"
+    echo 'test-hv-qemu: IOMMU probe PASS'
+    exit 0
+fi
 
 BOOTSTRAPPED=0
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
@@ -112,6 +146,18 @@ grep -Fq '[Domain 1] Domain crash notification verified' "$SERIAL" || {
     echo 'test-hv-qemu: System Domain did not read the crash notification' >&2
     exit 1
 }
+grep -Fq 'PCI DMA quarantine:' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: PCI DMA quarantine did not run' >&2
+    exit 1
+}
+if [[ -n $EXPECT_IOMMU ]]; then
+    grep -Fq "IOMMU description $EXPECT_IOMMU:" "$SERIAL" || {
+        sed -n '1,200p' "$SERIAL" >&2
+        echo "test-hv-qemu: expected IOMMU description was not discovered: $EXPECT_IOMMU" >&2
+        exit 1
+    }
+fi
 if [[ -n $EXPECT_BACKEND ]]; then
     grep -Fq "backend=$EXPECT_BACKEND" "$SERIAL" || {
         sed -n '1,200p' "$SERIAL" >&2

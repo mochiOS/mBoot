@@ -16,8 +16,10 @@ use mboot_hv::domain::{Domain, DomainId, DomainRole, DomainState};
 use mboot_hv::event::EventChannelTable;
 use mboot_hv::grant::{GrantRef, GrantTable};
 use mboot_hv::interrupt::VirtualLocalApic;
+use mboot_hv::iommu::{self, IommuKind};
 use mboot_hv::manifest::{LaunchManifest, ManifestDomainRole, ManifestRestartPolicy};
 use mboot_hv::memory::{NestedPageResources, NestedPageTable};
+use mboot_hv::pci;
 use mboot_hv::scheduler::CooperativeScheduler;
 use mboot_hv::{
     cpuid, image, BackendKind, CpuidResult, GuestConfig, Virtualization, VirtualizationResources,
@@ -33,6 +35,7 @@ use mnu_abi::hypervisor::{
 use uefi::fs::Error as FsError;
 use uefi::prelude::*;
 use uefi::table::boot::{AllocateType, MemoryType};
+use uefi::table::cfg::ACPI2_GUID;
 use uefi::CString16;
 
 const MAX_MEMORY_REGIONS: usize = 256;
@@ -155,6 +158,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     let has_display = display::initialize(system_table.boot_services());
     log!("boot display available={}", has_display);
 
+    let rsdp_address = system_table
+        .config_table()
+        .iter()
+        .find(|entry| entry.guid == ACPI2_GUID)
+        .map(|entry| entry.address as usize as u64);
+
     let features = cpu::detect();
     let vendor = core::str::from_utf8(&features.vendor).unwrap_or("unknown");
     let Some(backend) = features.backend else {
@@ -170,6 +179,50 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         features.nested_paging,
         features.address_space_ids
     );
+
+    let iommu_topology = match rsdp_address {
+        // SAFETY: UEFI supplied this ACPI 2.0 RSDP pointer and Boot Services are
+        // still active, so the firmware tables remain identity-mapped here.
+        Some(address) => match unsafe { iommu::discover(address) } {
+            Ok(topology) => topology,
+            Err(error) => {
+                log!("invalid ACPI IOMMU description: {:?}", error);
+                display::failure(15);
+                return Status::SECURITY_VIOLATION;
+            }
+        },
+        None => None,
+    };
+    if let Some(topology) = iommu_topology {
+        let expected = match backend {
+            BackendKind::IntelVmx => IommuKind::IntelVtd,
+            BackendKind::AmdSvm => IommuKind::AmdVi,
+        };
+        if topology.kind() != expected {
+            log!(
+                "IOMMU description {:?} does not match CPU backend {:?}",
+                topology.kind(),
+                backend
+            );
+            display::failure(16);
+            return Status::SECURITY_VIOLATION;
+        }
+        log!(
+            "IOMMU description {:?}: {} remapping unit(s)",
+            topology.kind(),
+            topology.unit_count()
+        );
+        for unit in topology.units() {
+            log!(
+                "IOMMU unit: segment={} registers={:#x} include-all={}",
+                unit.segment,
+                unit.register_base,
+                unit.include_all
+            );
+        }
+    } else {
+        log!("IOMMU description unavailable; device assignment remains disabled");
+    }
 
     let boot_services = system_table.boot_services();
     let manifest_bytes = match load_file(boot_services, image_handle, LAUNCH_MANIFEST_PATH) {
@@ -316,6 +369,21 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     unsafe {
         asm!("cli", options(nomem, nostack));
         descriptor::install();
+    }
+    // SAFETY: Firmware I/O has ended, interrupts are disabled, and mBoot is the
+    // sole PCI configuration-space owner from this point onward.
+    let quarantine = unsafe { pci::quarantine_segment_zero() };
+    log!(
+        "PCI DMA quarantine: {} function(s), {} bus master(s) disabled, {} still active",
+        quarantine.functions,
+        quarantine.bus_masters_disabled,
+        quarantine.bus_masters_active
+    );
+    if quarantine.bus_masters_active != 0 {
+        halt_with_error(
+            "PCI DMA quarantine",
+            mboot_hv::Error::DeviceQuarantineFailed,
+        )
     }
     let preemption_timer = unsafe { timer::initialize() };
     log!(
@@ -1438,6 +1506,7 @@ fn halt_error_code(stage: &str, error: mboot_hv::Error) -> u8 {
         "Grant translation flush" => 56,
         "Grant unmap" => 57,
         "Grant cleanup" => 58,
+        "PCI DMA quarantine" => 17,
         _ => 10,
     }
 }
