@@ -222,7 +222,6 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         };
         let guest_pages = (config.memory_size / 4096) as usize;
         if !config.auto_starts()
-            || !config.is_required()
             || config.vcpu_count != 1
             || !(GRANT_WINDOW_PAGES + 16..=MAX_GUEST_MEMORY_PAGES).contains(&guest_pages)
         {
@@ -540,10 +539,20 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         };
         let vm_exit = match vm_exit {
             Ok(exit) => exit,
-            Err(error) => {
-                let _ = runtime.domain.mark_crashed();
-                halt_with_error("vCPU entry", error)
+            Err(mboot_hv::Error::UnexpectedVmExit(raw_reason)) => {
+                isolate_crashed_domain(
+                    index,
+                    &mut runtime_domains,
+                    &mut runnable,
+                    &mut grants,
+                    &mut event_channels,
+                    raw_reason,
+                    0,
+                    0,
+                );
+                continue;
             }
+            Err(error) => halt_with_error("vCPU entry", error),
         };
         if vm_exit.reason == VmExitReason::Preempted {
             runtime.preemption_count += 1;
@@ -595,42 +604,40 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             ));
             continue;
         }
-        if vm_exit.reason != VmExitReason::Hypercall {
-            let _ = runtime.domain.mark_crashed();
-            halt_with_error(
-                "Domain Hypercall",
-                mboot_hv::Error::UnexpectedVmExit(vm_exit.raw_reason),
+        if vm_exit.reason == VmExitReason::NestedPageFault {
+            isolate_crashed_domain(
+                index,
+                &mut runtime_domains,
+                &mut runnable,
+                &mut grants,
+                &mut event_channels,
+                vm_exit.raw_reason,
+                vm_exit.fault_address,
+                vm_exit.fault_info,
             );
+            continue;
+        }
+        if vm_exit.reason != VmExitReason::Hypercall {
+            isolate_crashed_domain(
+                index,
+                &mut runtime_domains,
+                &mut runnable,
+                &mut grants,
+                &mut event_channels,
+                vm_exit.raw_reason,
+                0,
+                0,
+            );
+            continue;
         }
         runtime.resume_kind = ResumeKind::Hypercall;
         if vm_exit.hypercall_number == HypercallNumber::Shutdown as u64 {
-            let stopping_domain = runtime_domains[index].domain.id();
-            for mapping in grants.cleanup_domain(stopping_domain).into_iter().flatten() {
-                let Some(target_index) = runtime_domains
-                    .iter()
-                    .position(|runtime| runtime.domain.id() == mapping.target)
-                else {
-                    halt_with_error("Grant cleanup", mboot_hv::Error::InvalidState)
-                };
-                let target = &mut runtime_domains[target_index];
-                let nested_root = target.domain.nested_pages().hardware_root();
-                if let Err(error) = unsafe {
-                    target
-                        .domain
-                        .nested_pages()
-                        .restore_owned_page(mapping.target_page)
-                } {
-                    halt_with_error("Grant cleanup", error)
-                }
-                if let Err(error) = unsafe { target.virtualization.flush_nested(nested_root) } {
-                    halt_with_error("Grant translation flush", error)
-                }
-                log!(
-                    "Grant mapping at Domain {} GPA {:#x} cleaned up",
-                    mapping.target.get(),
-                    mapping.target_page
-                );
-            }
+            cleanup_domain_resources(
+                index,
+                &mut runtime_domains,
+                &mut grants,
+                &mut event_channels,
+            );
             let runtime = &mut runtime_domains[index];
             if let Err(error) = runtime.domain.stop() {
                 halt_with_error("Domain stop", error);
@@ -967,20 +974,113 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         .iter()
         .filter(|domain| domain.waiting)
         .count();
-    if waiting_domains == 0 {
+    let crashed_domains = runtime_domains
+        .iter()
+        .filter(|domain| domain.domain.state() == DomainState::Crashed)
+        .count();
+    let stopped_domains = runtime_domains
+        .iter()
+        .filter(|domain| domain.domain.state() == DomainState::Stopped)
+        .count();
+    if waiting_domains == 0 && crashed_domains == 0 {
         log!(
             "bootstrap complete; {} Domains entered and stopped cleanly",
-            runtime_domains.len()
+            stopped_domains
         );
         display::bootstrap_success();
+    } else if waiting_domains == 0 {
+        log!(
+            "bootstrap complete; {} Domain(s) stopped cleanly; {} crash(es) isolated",
+            stopped_domains,
+            crashed_domains
+        );
     } else {
-        log!("{} resident Domain(s) waiting", waiting_domains);
+        log!(
+            "{} resident Domain(s) waiting; {} crash(es) isolated",
+            waiting_domains,
+            crashed_domains
+        );
     }
 
     let _keep_domains_alive = runtime_domains;
     let _keep_prepared_storage = prepared_domains;
     let _keep_manifest_alive = manifest_bytes;
     halt()
+}
+
+fn isolate_crashed_domain(
+    index: usize,
+    runtime_domains: &mut [RuntimeDomain],
+    runnable: &mut [bool],
+    grants: &mut GrantTable,
+    event_channels: &mut EventChannelTable,
+    raw_reason: u64,
+    fault_address: u64,
+    fault_info: u64,
+) {
+    let domain_id = runtime_domains[index].domain.id();
+    if let Err(error) = runtime_domains[index].domain.mark_crashed() {
+        halt_with_error("Domain crash transition", error)
+    }
+    runtime_domains[index].waiting = false;
+    runnable[index] = false;
+    cleanup_domain_resources(index, runtime_domains, grants, event_channels);
+    log!(
+        "Domain {} crashed and was isolated: exit={:#x} gpa={:#x} info={:#x}",
+        domain_id.get(),
+        raw_reason,
+        fault_address,
+        fault_info
+    );
+}
+
+fn cleanup_domain_resources(
+    index: usize,
+    runtime_domains: &mut [RuntimeDomain],
+    grants: &mut GrantTable,
+    event_channels: &mut EventChannelTable,
+) {
+    let domain_id = runtime_domains[index].domain.id();
+    let crashed = runtime_domains[index].domain.state() == DomainState::Crashed;
+    let mappings = if crashed {
+        grants.cleanup_crashed_domain(domain_id)
+    } else {
+        grants.cleanup_domain(domain_id)
+    };
+    for mapping in mappings.into_iter().flatten() {
+        let Some(target_index) = runtime_domains
+            .iter()
+            .position(|runtime| runtime.domain.id() == mapping.target)
+        else {
+            halt_with_error("Grant cleanup", mboot_hv::Error::InvalidState)
+        };
+        let target = &mut runtime_domains[target_index];
+        let nested_root = target.domain.nested_pages().hardware_root();
+        if let Err(error) = unsafe {
+            target
+                .domain
+                .nested_pages()
+                .restore_owned_page(mapping.target_page)
+        } {
+            halt_with_error("Grant cleanup", error)
+        }
+        if let Err(error) = unsafe { target.virtualization.flush_nested(nested_root) } {
+            halt_with_error("Grant translation flush", error)
+        }
+        log!(
+            "Grant mapping at Domain {} GPA {:#x} cleaned up",
+            mapping.target.get(),
+            mapping.target_page
+        );
+    }
+    let disconnected = event_channels.disconnect_domain(domain_id);
+    if disconnected != 0 {
+        log!(
+            "Domain {} released {} Event Channel(s)",
+            domain_id.get(),
+            disconnected
+        );
+    }
 }
 
 fn handle_console_write(

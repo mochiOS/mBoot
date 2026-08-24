@@ -50,6 +50,7 @@ const ENTRY_EXCEPTION_ERROR_CODE: u64 = 0x4018;
 const SECONDARY_CONTROLS: u64 = 0x401e;
 const MSR_BITMAP: u64 = 0x2004;
 const EPT_POINTER: u64 = 0x201a;
+const GUEST_PHYSICAL_ADDRESS: u64 = 0x2400;
 const VMCS_LINK_POINTER: u64 = 0x2800;
 const GUEST_DEBUGCTL: u64 = 0x2802;
 const GUEST_EFER: u64 = 0x2806;
@@ -121,6 +122,7 @@ const HOST_IDTR_BASE: u64 = 0x6c0e;
 const HOST_SYSENTER_ESP: u64 = 0x6c10;
 const HOST_SYSENTER_EIP: u64 = 0x6c12;
 const EXIT_REASON: u64 = 0x4402;
+const EXIT_QUALIFICATION: u64 = 0x6400;
 const VM_INSTRUCTION_ERROR: u64 = 0x4400;
 const EXIT_INSTRUCTION_LENGTH: u64 = 0x440c;
 const EXIT_INTERRUPTION_INFO: u64 = 0x4404;
@@ -131,6 +133,7 @@ const HLT_EXIT_REASON: u64 = 12;
 const VMCALL_EXIT_REASON: u64 = 18;
 const RDMSR_EXIT_REASON: u64 = 31;
 const WRMSR_EXIT_REASON: u64 = 32;
+const EPT_VIOLATION_EXIT_REASON: u64 = 48;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -628,6 +631,8 @@ impl Vmx {
                 msr_value: 0,
                 cpuid_leaf: 0,
                 cpuid_subleaf: 0,
+                fault_address: 0,
+                fault_info: 0,
             }),
             EXTERNAL_INTERRUPT_EXIT_REASON => {
                 let info = unsafe { vmread(EXIT_INTERRUPTION_INFO) };
@@ -644,6 +649,8 @@ impl Vmx {
                         msr_value: 0,
                         cpuid_leaf: 0,
                         cpuid_subleaf: 0,
+                        fault_address: 0,
+                        fault_info: 0,
                     })
                 } else {
                     Err(Error::UnexpectedVmExit(reason))
@@ -660,6 +667,8 @@ impl Vmx {
                 msr_value: 0,
                 cpuid_leaf: 0,
                 cpuid_subleaf: 0,
+                fault_address: 0,
+                fault_info: 0,
             }),
             VMCALL_EXIT_REASON => Ok(VmExit {
                 reason: VmExitReason::Hypercall,
@@ -672,6 +681,8 @@ impl Vmx {
                 msr_value: 0,
                 cpuid_leaf: 0,
                 cpuid_subleaf: 0,
+                fault_address: 0,
+                fault_info: 0,
             }),
             RDMSR_EXIT_REASON => Ok(VmExit {
                 reason: VmExitReason::MsrRead,
@@ -684,6 +695,8 @@ impl Vmx {
                 msr_value: 0,
                 cpuid_leaf: 0,
                 cpuid_subleaf: 0,
+                fault_address: 0,
+                fault_info: 0,
             }),
             WRMSR_EXIT_REASON => Ok(VmExit {
                 reason: VmExitReason::MsrWrite,
@@ -697,6 +710,8 @@ impl Vmx {
                     | (u64::from(self.run_context.rdx as u32) << 32),
                 cpuid_leaf: 0,
                 cpuid_subleaf: 0,
+                fault_address: 0,
+                fault_info: 0,
             }),
             CPUID_EXIT_REASON => Ok(VmExit {
                 reason: VmExitReason::Cpuid,
@@ -709,6 +724,22 @@ impl Vmx {
                 msr_value: 0,
                 cpuid_leaf: self.run_context.rax as u32,
                 cpuid_subleaf: self.run_context.rcx as u32,
+                fault_address: 0,
+                fault_info: 0,
+            }),
+            EPT_VIOLATION_EXIT_REASON => Ok(VmExit {
+                reason: VmExitReason::NestedPageFault,
+                raw_reason: reason,
+                hypercall_number: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+                msr: 0,
+                msr_value: 0,
+                cpuid_leaf: 0,
+                cpuid_subleaf: 0,
+                fault_address: unsafe { vmread(GUEST_PHYSICAL_ADDRESS) },
+                fault_info: unsafe { vmread(EXIT_QUALIFICATION) },
             }),
             _ => Err(Error::UnexpectedVmExit(reason)),
         }

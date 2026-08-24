@@ -77,7 +77,7 @@ QEMU_PID=$!
 
 BOOTSTRAPPED=0
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
-    if grep -Fq '[mBoot-HV] bootstrap complete; 2 Domains entered and stopped cleanly' "$SERIAL" 2>/dev/null; then
+    if grep -Fq '[mBoot-HV] bootstrap complete; 2 Domain(s) stopped cleanly; 1 crash(es) isolated' "$SERIAL" 2>/dev/null; then
         BOOTSTRAPPED=1
         break
     fi
@@ -92,6 +92,11 @@ if [[ $BOOTSTRAPPED -ne 1 ]]; then
     echo 'test-hv-qemu: hypervisor did not complete bootstrap' >&2
     exit 1
 fi
+grep -Fq 'Domain 3 crashed and was isolated: exit=0x400 gpa=0x40000000' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: nested-page fault did not remain isolated to Application Domain 3' >&2
+    exit 1
+}
 if [[ -n $EXPECT_BACKEND ]]; then
     grep -Fq "backend=$EXPECT_BACKEND" "$SERIAL" || {
         sed -n '1,200p' "$SERIAL" >&2

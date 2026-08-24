@@ -63,8 +63,8 @@ sub read_hv_config {
             or die "$path: current hypervisor supports one vCPU per Domain\n";
         $domain->{path} =~ m{^\\EFI\\MBOOT\\[A-Za-z0-9._-]+$}
             or die "$path: Domain path must stay below \\EFI\\MBOOT\n";
-        $domain->{autostart} && $domain->{required}
-            or die "$path: current bootstrap requires autostart and required Domains\n";
+        $domain->{autostart}
+            or die "$path: current bootstrap requires autostart Domains\n";
     }
     $system_domains == 1 or die "$path: exactly one System Domain is required\n";
 

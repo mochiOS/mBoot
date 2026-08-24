@@ -110,6 +110,17 @@ impl EventChannelTable {
         })
     }
 
+    pub fn disconnect_domain(&mut self, domain: DomainId) -> usize {
+        let mut disconnected = 0;
+        for slot in &mut self.channels {
+            if slot.is_some_and(|channel| channel.a.domain == domain || channel.b.domain == domain) {
+                *slot = None;
+                disconnected += 1;
+            }
+        }
+        disconnected
+    }
+
     fn endpoint_exists(&self, domain: DomainId, port: u32) -> bool {
         self.channels.iter().flatten().any(|channel| {
             (channel.a.domain == domain && channel.a.port == port)
@@ -180,6 +191,26 @@ mod tests {
         assert_eq!(
             table.connect(DomainId::new(1), 1, DomainId::new(3), 1),
             Err(EventError::DuplicatePort)
+        );
+    }
+
+    #[test]
+    fn disconnecting_a_domain_removes_both_endpoints() {
+        let mut table = EventChannelTable::new();
+        table
+            .connect(DomainId::new(1), 1, DomainId::new(2), 1)
+            .unwrap();
+        table
+            .connect(DomainId::new(2), 2, DomainId::new(3), 1)
+            .unwrap();
+        assert_eq!(table.disconnect_domain(DomainId::new(2)), 2);
+        assert_eq!(
+            table.send(DomainId::new(1), 1),
+            Err(EventError::UnboundPort)
+        );
+        assert_eq!(
+            table.send(DomainId::new(3), 1),
+            Err(EventError::UnboundPort)
         );
     }
 }

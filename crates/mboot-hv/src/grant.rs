@@ -180,6 +180,21 @@ impl GrantTable {
     }
 
     pub fn cleanup_domain(&mut self, domain: DomainId) -> [Option<GrantMapping>; MAX_GRANTS] {
+        self.cleanup_domain_inner(domain, false)
+    }
+
+    pub fn cleanup_crashed_domain(
+        &mut self,
+        domain: DomainId,
+    ) -> [Option<GrantMapping>; MAX_GRANTS] {
+        self.cleanup_domain_inner(domain, true)
+    }
+
+    fn cleanup_domain_inner(
+        &mut self,
+        domain: DomainId,
+        revoke_unmapped_target: bool,
+    ) -> [Option<GrantMapping>; MAX_GRANTS] {
         let mut mappings = [None; MAX_GRANTS];
         let mut mapping_count = 0;
         for slot in &mut self.grants {
@@ -187,9 +202,9 @@ impl GrantTable {
                 continue;
             };
             let owner_is_stopping = grant.owner == domain;
-            let mapped_target_is_stopping =
-                grant.target == domain && grant.target_page.is_some();
-            if !owner_is_stopping && !mapped_target_is_stopping {
+            let target_is_stopping = grant.target == domain
+                && (revoke_unmapped_target || grant.target_page.is_some());
+            if !owner_is_stopping && !target_is_stopping {
                 continue;
             }
             if let Some(target_page) = grant.target_page {
@@ -299,5 +314,19 @@ mod tests {
         let reference = table.create(owner, target, 0x8000, true).unwrap();
         assert_eq!(table.cleanup_domain(target), [None; MAX_GRANTS]);
         assert_eq!(table.revoke(owner, reference), Ok(()));
+    }
+
+    #[test]
+    fn crashed_unmapped_target_revokes_the_stale_grant() {
+        let mut table = GrantTable::new();
+        let owner = DomainId::new(1);
+        let target = DomainId::new(2);
+        let reference = table.create(owner, target, 0x8000, true).unwrap();
+        assert_eq!(table.cleanup_crashed_domain(target), [None; MAX_GRANTS]);
+        assert!(!table.references_domain(target));
+        assert_eq!(
+            table.revoke(owner, reference),
+            Err(GrantError::UnknownGrant)
+        );
     }
 }

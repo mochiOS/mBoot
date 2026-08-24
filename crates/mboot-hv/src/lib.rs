@@ -61,6 +61,7 @@ pub enum VmExitReason {
     MsrRead,
     MsrWrite,
     Cpuid,
+    NestedPageFault,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -83,6 +84,8 @@ pub struct VmExit {
     pub msr_value: u64,
     pub cpuid_leaf: u32,
     pub cpuid_subleaf: u32,
+    pub fault_address: u64,
+    pub fault_info: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

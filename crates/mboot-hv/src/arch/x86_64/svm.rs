@@ -19,6 +19,7 @@ const VMCB_INTERRUPT_CONTROL: usize = 0x060;
 const VMCB_INTERRUPT_VECTOR: usize = 0x064;
 const VMCB_EXIT_CODE: usize = 0x070;
 const VMCB_EXIT_INFO1: usize = 0x078;
+const VMCB_EXIT_INFO2: usize = 0x080;
 const VMCB_NP_ENABLE: usize = 0x090;
 const VMCB_EVENT_INJECTION: usize = 0x0a8;
 const VMCB_NCR3: usize = 0x0b0;
@@ -54,6 +55,7 @@ const SVM_EXIT_VMMCALL: u64 = 0x81;
 const SVM_EXIT_MSR: u64 = 0x7c;
 const SVM_EXIT_INTR: u64 = 0x60;
 const SVM_EXIT_CPUID: u64 = 0x72;
+const SVM_EXIT_NPF: u64 = 0x400;
 const INTERCEPT_INTR: u32 = 1;
 const V_INTR_MASKING: u64 = 1 << 24;
 const V_IRQ: u64 = 1 << 8;
@@ -414,6 +416,8 @@ impl Svm {
                     msr_value: 0,
                     cpuid_leaf: 0,
                     cpuid_subleaf: 0,
+                    fault_address: 0,
+                    fault_info: 0,
                 })
             }
             SVM_EXIT_HLT => Ok(VmExit {
@@ -427,6 +431,8 @@ impl Svm {
                 msr_value: 0,
                 cpuid_leaf: 0,
                 cpuid_subleaf: 0,
+                fault_address: 0,
+                fault_info: 0,
             }),
             SVM_EXIT_VMMCALL => Ok(VmExit {
                 reason: VmExitReason::Hypercall,
@@ -439,6 +445,8 @@ impl Svm {
                 msr_value: 0,
                 cpuid_leaf: 0,
                 cpuid_subleaf: 0,
+                fault_address: 0,
+                fault_info: 0,
             }),
             SVM_EXIT_MSR => {
                 let write = unsafe { read_u64(self.vmcb_phys, VMCB_EXIT_INFO1) } & 1 != 0;
@@ -458,6 +466,8 @@ impl Svm {
                         | (u64::from(self.run_context.rdx as u32) << 32),
                     cpuid_leaf: 0,
                     cpuid_subleaf: 0,
+                    fault_address: 0,
+                    fault_info: 0,
                 })
             }
             SVM_EXIT_CPUID => Ok(VmExit {
@@ -471,6 +481,22 @@ impl Svm {
                 msr_value: 0,
                 cpuid_leaf: self.run_context.rax as u32,
                 cpuid_subleaf: self.run_context.rcx as u32,
+                fault_address: 0,
+                fault_info: 0,
+            }),
+            SVM_EXIT_NPF => Ok(VmExit {
+                reason: VmExitReason::NestedPageFault,
+                raw_reason: exit_code,
+                hypercall_number: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+                msr: 0,
+                msr_value: 0,
+                cpuid_leaf: 0,
+                cpuid_subleaf: 0,
+                fault_address: unsafe { read_u64(self.vmcb_phys, VMCB_EXIT_INFO2) },
+                fault_info: unsafe { read_u64(self.vmcb_phys, VMCB_EXIT_INFO1) },
             }),
             _ => Err(Error::UnexpectedVmExit(exit_code)),
         }

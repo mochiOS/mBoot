@@ -27,6 +27,17 @@ path = '\EFI\MBOOT\RINGBOOT.ELF'
 autostart = true
 required = true
 
+[[domains]]
+id = 3
+role = "application"
+memory_mib = 2
+vcpus = 1
+capabilities = 0
+image = "ring-bootstrap"
+path = '\EFI\MBOOT\RINGBOOT.ELF'
+autostart = true
+required = false
+
 [[channels]]
 domain_a = 1
 port_a = 1
