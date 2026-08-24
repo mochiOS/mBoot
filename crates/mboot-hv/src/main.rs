@@ -28,10 +28,11 @@ use mboot_hv::{
 };
 use mnu_abi::hypervisor::{
     DomainBootInfo, DomainCrashInfo, HypercallNumber, PciDeviceInfo,
-    DOMAIN_CAPABILITY_DEVICE_QUERY, DOMAIN_CRASH_STATUS_CRASHED, DOMAIN_CRASH_STATUS_RESTARTED,
-    DOMAIN_MANAGEMENT_VECTOR, DOMAIN_ROLE_APPLICATION, DOMAIN_ROLE_HARDWARE, DOMAIN_ROLE_SYSTEM,
-    EVENT_CHANNEL_VECTOR, GRANT_FLAG_WRITABLE, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS,
-    HYPERCALL_UNSUPPORTED, HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
+    DOMAIN_CAPABILITY_DEVICE_CLAIM, DOMAIN_CAPABILITY_DEVICE_QUERY, DOMAIN_CRASH_STATUS_CRASHED,
+    DOMAIN_CRASH_STATUS_RESTARTED, DOMAIN_MANAGEMENT_VECTOR, DOMAIN_ROLE_APPLICATION,
+    DOMAIN_ROLE_HARDWARE, DOMAIN_ROLE_SYSTEM, EVENT_CHANNEL_VECTOR, GRANT_FLAG_WRITABLE,
+    HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED,
+    HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
 };
 use uefi::fs::Error as FsError;
 use uefi::prelude::*;
@@ -363,6 +364,17 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         display::failure(9);
         return Status::UNSUPPORTED;
     }
+    let mut device_policies = Vec::with_capacity(manifest.device_count());
+    for index in 0..manifest.device_count() {
+        match manifest.device(index) {
+            Ok(device) => device_policies.push(device),
+            Err(error) => {
+                log!("invalid device policy {}: {:?}", index, error);
+                display::failure(5);
+                return Status::LOAD_ERROR;
+            }
+        }
+    }
 
     // SAFETY: All required firmware allocations are complete and no boot service
     // is used after this call.
@@ -450,7 +462,14 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             requester & 7
         );
     }
-    let devices = DeviceTable::from_pci(quarantine.inventory(), deferred_display);
+    let mut devices =
+        match DeviceTable::from_pci(quarantine.inventory(), deferred_display, &device_policies) {
+            Ok(devices) => devices,
+            Err(error) => {
+                log!("PCI ownership policy failed: {:?}", error);
+                halt_with_error("PCI ownership policy", mboot_hv::Error::InvalidManifest)
+            }
+        };
     log!("PCI ownership table: {} device(s)", devices.len());
     if let Some(topology) = iommu_topology {
         // SAFETY: Tables were allocated and zeroed before ExitBootServices, PCI
@@ -716,6 +735,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     &mut runnable,
                     &mut grants,
                     &mut event_channels,
+                    &mut devices,
                     manifest,
                     raw_reason,
                     0,
@@ -782,6 +802,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut runnable,
                 &mut grants,
                 &mut event_channels,
+                &mut devices,
                 manifest,
                 vm_exit.raw_reason,
                 vm_exit.fault_address,
@@ -796,6 +817,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut runnable,
                 &mut grants,
                 &mut event_channels,
+                &mut devices,
                 manifest,
                 vm_exit.raw_reason,
                 0,
@@ -805,12 +827,13 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         }
         runtime.resume_kind = ResumeKind::Hypercall;
         if vm_exit.hypercall_number == HypercallNumber::DeviceQuery as u64 {
+            let domain_id = runtime_domains[index].domain.id().get();
             let authorized = runtime_domains[index].domain.role() == DomainRole::Hardware
                 && runtime_domains[index].domain.capabilities() & DOMAIN_CAPABILITY_DEVICE_QUERY
                     != 0;
             let info = usize::try_from(vm_exit.arg0)
                 .ok()
-                .and_then(|device_index| devices.query(device_index));
+                .and_then(|device_index| devices.query(domain_id, device_index));
             let destination = runtime_domains[index]
                 .domain
                 .nested_pages()
@@ -833,6 +856,50 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 } else {
                     HYPERCALL_INVALID_ARGUMENT
                 };
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::DeviceClaim as u64 {
+            let domain_id = runtime_domains[index].domain.id().get();
+            let authorized = runtime_domains[index].domain.role() == DomainRole::Hardware
+                && runtime_domains[index].domain.capabilities() & DOMAIN_CAPABILITY_DEVICE_CLAIM
+                    != 0;
+            let requester = u16::try_from(vm_exit.arg0).ok().filter(|value| *value != 0);
+            runtime_domains[index].pending_result = if authorized
+                && vm_exit.arg1 == 0
+                && vm_exit.arg2 == 0
+                && requester.is_some_and(|requester| devices.claim(domain_id, requester).is_ok())
+            {
+                log!(
+                    "PCI requester {:04x} claimed-disabled by Hardware Domain {}",
+                    requester.unwrap_or(0),
+                    domain_id
+                );
+                HYPERCALL_SUCCESS
+            } else {
+                HYPERCALL_INVALID_ARGUMENT
+            };
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::DeviceRelease as u64 {
+            let domain_id = runtime_domains[index].domain.id().get();
+            let authorized = runtime_domains[index].domain.role() == DomainRole::Hardware
+                && runtime_domains[index].domain.capabilities() & DOMAIN_CAPABILITY_DEVICE_CLAIM
+                    != 0;
+            let requester = u16::try_from(vm_exit.arg0).ok().filter(|value| *value != 0);
+            runtime_domains[index].pending_result = if authorized
+                && vm_exit.arg1 == 0
+                && vm_exit.arg2 == 0
+                && requester.is_some_and(|requester| devices.release(domain_id, requester).is_ok())
+            {
+                log!(
+                    "PCI requester {:04x} released by Hardware Domain {}",
+                    requester.unwrap_or(0),
+                    domain_id
+                );
+                HYPERCALL_SUCCESS
+            } else {
+                HYPERCALL_INVALID_ARGUMENT
+            };
             continue;
         }
         if vm_exit.hypercall_number == HypercallNumber::DomainCrashQuery as u64 {
@@ -873,6 +940,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut runtime_domains,
                 &mut grants,
                 &mut event_channels,
+                &mut devices,
             );
             let runtime = &mut runtime_domains[index];
             if let Err(error) = runtime.domain.stop() {
@@ -1286,6 +1354,7 @@ fn isolate_crashed_domain(
     runnable: &mut [bool],
     grants: &mut GrantTable,
     event_channels: &mut EventChannelTable,
+    devices: &mut DeviceTable,
     manifest: LaunchManifest<'_>,
     raw_reason: u64,
     fault_address: u64,
@@ -1306,7 +1375,7 @@ fn isolate_crashed_domain(
         next_restart_count,
         DOMAIN_CRASH_STATUS_CRASHED,
     ));
-    cleanup_domain_resources(index, runtime_domains, grants, event_channels);
+    cleanup_domain_resources(index, runtime_domains, grants, event_channels, devices);
     log!(
         "Domain {} crashed and was isolated: exit={:#x} gpa={:#x} info={:#x}",
         domain_id.get(),
@@ -1332,9 +1401,18 @@ fn cleanup_domain_resources(
     runtime_domains: &mut [RuntimeDomain],
     grants: &mut GrantTable,
     event_channels: &mut EventChannelTable,
+    devices: &mut DeviceTable,
 ) {
     let domain_id = runtime_domains[index].domain.id();
     let crashed = runtime_domains[index].domain.state() == DomainState::Crashed;
+    let released_devices = devices.release_domain(domain_id.get());
+    if released_devices != 0 {
+        log!(
+            "Domain {} returned {} claimed-disabled PCI device(s)",
+            domain_id.get(),
+            released_devices
+        );
+    }
     let mappings = if crashed {
         grants.cleanup_crashed_domain(domain_id)
     } else {
@@ -1640,6 +1718,7 @@ fn halt_error_code(stage: &str, error: mboot_hv::Error) -> u8 {
         "nested page table" => 20,
         "guest page tables" => 21,
         "Domain image" => 22,
+        "PCI ownership policy" => 23,
         "virtualization" => match error {
             mboot_hv::Error::VirtualizationDisabled => 31,
             mboot_hv::Error::NestedPagingUnavailable => 32,

@@ -1,19 +1,23 @@
-use mnu_abi::hypervisor::DOMAIN_CAPABILITY_DEVICE_QUERY;
+use mnu_abi::hypervisor::{DOMAIN_CAPABILITY_DEVICE_CLAIM, DOMAIN_CAPABILITY_DEVICE_QUERY};
 use sha2::{Digest, Sha256};
 
 use crate::Error;
 
 pub const MANIFEST_MAGIC: &[u8; 8] = b"MBLHV1\0\0";
-pub const MANIFEST_VERSION: u16 = 3;
+pub const MANIFEST_VERSION: u16 = 4;
 pub const MANIFEST_HEADER_SIZE: usize = 32;
 pub const DOMAIN_ENTRY_SIZE: usize = 160;
 pub const EVENT_CHANNEL_ENTRY_SIZE: usize = 32;
+pub const DEVICE_ENTRY_SIZE: usize = 32;
 pub const MAX_DOMAIN_COUNT: usize = 8;
 pub const MAX_EVENT_CHANNEL_COUNT: usize = 64;
+pub const MAX_DEVICE_COUNT: usize = 64;
 
 pub const DOMAIN_FLAG_AUTO_START: u16 = 1 << 0;
 pub const DOMAIN_FLAG_REQUIRED: u16 = 1 << 1;
 const DOMAIN_FLAGS_KNOWN: u16 = DOMAIN_FLAG_AUTO_START | DOMAIN_FLAG_REQUIRED;
+pub const DEVICE_FLAG_REQUIRED: u16 = 1 << 0;
+const DEVICE_FLAGS_KNOWN: u16 = DEVICE_FLAG_REQUIRED;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -29,6 +33,17 @@ pub enum ManifestRestartPolicy {
     Never = 0,
     OnFailure = 1,
     Always = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum ManifestDeviceKind {
+    Other = 0,
+    Display = 1,
+    Block = 2,
+    Network = 3,
+    Usb = 4,
+    Audio = 5,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +66,21 @@ pub struct ManifestEventChannel {
     pub port_a: u32,
     pub domain_b: u32,
     pub port_b: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManifestDevice {
+    pub segment: u16,
+    pub requester: u16,
+    pub kind: ManifestDeviceKind,
+    pub flags: u16,
+    pub domain_id: u32,
+}
+
+impl ManifestDevice {
+    pub const fn is_required(self) -> bool {
+        self.flags & DEVICE_FLAG_REQUIRED != 0
+    }
 }
 
 impl ManifestDomain<'_> {
@@ -77,6 +107,7 @@ pub struct LaunchManifest<'a> {
     bytes: &'a [u8],
     domain_count: usize,
     event_channel_count: usize,
+    device_count: usize,
 }
 
 impl<'a> LaunchManifest<'a> {
@@ -94,10 +125,13 @@ impl<'a> LaunchManifest<'a> {
         }
         let domain_count = usize::from(read_u16(bytes, 14)?);
         let event_channel_count = usize::from(read_u16(bytes, 20)?);
+        let device_count = usize::from(read_u16(bytes, 24)?);
         if domain_count == 0
             || domain_count > MAX_DOMAIN_COUNT
             || event_channel_count > MAX_EVENT_CHANNEL_COUNT
             || usize::from(read_u16(bytes, 22)?) != EVENT_CHANNEL_ENTRY_SIZE
+            || device_count > MAX_DEVICE_COUNT
+            || usize::from(read_u16(bytes, 26)?) != DEVICE_ENTRY_SIZE
         {
             return Err(Error::InvalidManifest);
         }
@@ -112,10 +146,15 @@ impl<'a> LaunchManifest<'a> {
                     .checked_mul(EVENT_CHANNEL_ENTRY_SIZE)
                     .and_then(|channel_bytes| size.checked_add(channel_bytes))
             })
+            .and_then(|size| {
+                device_count
+                    .checked_mul(DEVICE_ENTRY_SIZE)
+                    .and_then(|device_bytes| size.checked_add(device_bytes))
+            })
             .ok_or(Error::InvalidManifest)?;
         if read_u32(bytes, 16)? as usize != expected_size
             || bytes.len() != expected_size
-            || bytes[24..MANIFEST_HEADER_SIZE]
+            || bytes[28..MANIFEST_HEADER_SIZE]
                 .iter()
                 .any(|byte| *byte != 0)
         {
@@ -125,6 +164,7 @@ impl<'a> LaunchManifest<'a> {
             bytes,
             domain_count,
             event_channel_count,
+            device_count,
         };
         for index in 0..domain_count {
             let domain = manifest.domain(index)?;
@@ -148,6 +188,23 @@ impl<'a> LaunchManifest<'a> {
                 }
             }
         }
+        for index in 0..device_count {
+            let device = manifest.device(index)?;
+            let owner = manifest
+                .domain_by_id(device.domain_id)
+                .ok_or(Error::InvalidManifest)?;
+            if owner.role != ManifestDomainRole::Hardware
+                || owner.capabilities & DOMAIN_CAPABILITY_DEVICE_CLAIM == 0
+            {
+                return Err(Error::InvalidManifest);
+            }
+            for previous in 0..index {
+                let other = manifest.device(previous)?;
+                if other.segment == device.segment && other.requester == device.requester {
+                    return Err(Error::InvalidManifest);
+                }
+            }
+        }
         Ok(manifest)
     }
 
@@ -157,6 +214,10 @@ impl<'a> LaunchManifest<'a> {
 
     pub const fn event_channel_count(self) -> usize {
         self.event_channel_count
+    }
+
+    pub const fn device_count(self) -> usize {
+        self.device_count
     }
 
     pub fn domain(self, index: usize) -> Result<ManifestDomain<'a>, Error> {
@@ -195,7 +256,8 @@ impl<'a> LaunchManifest<'a> {
             return Err(Error::InvalidManifest);
         }
         let capabilities = read_u64(entry, 32)?;
-        if capabilities & !DOMAIN_CAPABILITY_DEVICE_QUERY != 0
+        let known_capabilities = DOMAIN_CAPABILITY_DEVICE_QUERY | DOMAIN_CAPABILITY_DEVICE_CLAIM;
+        if capabilities & !known_capabilities != 0
             || role != ManifestDomainRole::Hardware && capabilities != 0
         {
             return Err(Error::InvalidManifest);
@@ -252,8 +314,48 @@ impl<'a> LaunchManifest<'a> {
         Ok(channel)
     }
 
+    pub fn device(self, index: usize) -> Result<ManifestDevice, Error> {
+        if index >= self.device_count {
+            return Err(Error::InvalidManifest);
+        }
+        let offset = MANIFEST_HEADER_SIZE
+            + self.domain_count * DOMAIN_ENTRY_SIZE
+            + self.event_channel_count * EVENT_CHANNEL_ENTRY_SIZE
+            + index * DEVICE_ENTRY_SIZE;
+        let entry = &self.bytes[offset..offset + DEVICE_ENTRY_SIZE];
+        let kind = match read_u16(entry, 4)? {
+            0 => ManifestDeviceKind::Other,
+            1 => ManifestDeviceKind::Display,
+            2 => ManifestDeviceKind::Block,
+            3 => ManifestDeviceKind::Network,
+            4 => ManifestDeviceKind::Usb,
+            5 => ManifestDeviceKind::Audio,
+            _ => return Err(Error::InvalidManifest),
+        };
+        let device = ManifestDevice {
+            segment: read_u16(entry, 0)?,
+            requester: read_u16(entry, 2)?,
+            kind,
+            flags: read_u16(entry, 6)?,
+            domain_id: read_u32(entry, 8)?,
+        };
+        if device.requester == 0
+            || device.flags & !DEVICE_FLAGS_KNOWN != 0
+            || device.domain_id == 0
+            || entry[12..].iter().any(|byte| *byte != 0)
+        {
+            return Err(Error::InvalidManifest);
+        }
+        Ok(device)
+    }
+
     fn has_domain(self, id: u32) -> bool {
         (0..self.domain_count).any(|index| self.domain(index).is_ok_and(|domain| domain.id == id))
+    }
+
+    fn domain_by_id(self, id: u32) -> Option<ManifestDomain<'a>> {
+        (0..self.domain_count)
+            .find_map(|index| self.domain(index).ok().filter(|domain| domain.id == id))
     }
 }
 
@@ -300,7 +402,10 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+    use std::{vec, vec::Vec};
 
     fn manifest() -> [u8; MANIFEST_HEADER_SIZE + DOMAIN_ENTRY_SIZE] {
         let mut bytes = [0; MANIFEST_HEADER_SIZE + DOMAIN_ENTRY_SIZE];
@@ -312,6 +417,7 @@ mod tests {
         bytes[14..16].copy_from_slice(&1_u16.to_le_bytes());
         bytes[16..20].copy_from_slice(&total_size.to_le_bytes());
         bytes[22..24].copy_from_slice(&(EVENT_CHANNEL_ENTRY_SIZE as u16).to_le_bytes());
+        bytes[26..28].copy_from_slice(&(DEVICE_ENTRY_SIZE as u16).to_le_bytes());
         let entry = &mut bytes[MANIFEST_HEADER_SIZE..];
         entry[..4].copy_from_slice(&1_u32.to_le_bytes());
         entry[4..6].copy_from_slice(&(ManifestDomainRole::System as u16).to_le_bytes());
@@ -322,6 +428,34 @@ mod tests {
         let path = b"\\EFI\\MBOOT\\MNU.ELF";
         entry[72..74].copy_from_slice(&(path.len() as u16).to_le_bytes());
         entry[80..80 + path.len()].copy_from_slice(path);
+        bytes
+    }
+
+    fn manifest_with_device() -> Vec<u8> {
+        let base = manifest();
+        let mut bytes = vec![0; MANIFEST_HEADER_SIZE + 2 * DOMAIN_ENTRY_SIZE + DEVICE_ENTRY_SIZE];
+        bytes[..MANIFEST_HEADER_SIZE].copy_from_slice(&base[..MANIFEST_HEADER_SIZE]);
+        bytes[MANIFEST_HEADER_SIZE..MANIFEST_HEADER_SIZE + DOMAIN_ENTRY_SIZE]
+            .copy_from_slice(&base[MANIFEST_HEADER_SIZE..]);
+        let hardware = MANIFEST_HEADER_SIZE + DOMAIN_ENTRY_SIZE;
+        bytes[hardware..hardware + DOMAIN_ENTRY_SIZE]
+            .copy_from_slice(&base[MANIFEST_HEADER_SIZE..]);
+        bytes[hardware..hardware + 4].copy_from_slice(&2_u32.to_le_bytes());
+        bytes[hardware + 4..hardware + 6]
+            .copy_from_slice(&(ManifestDomainRole::Hardware as u16).to_le_bytes());
+        bytes[hardware + 32..hardware + 40].copy_from_slice(
+            &(DOMAIN_CAPABILITY_DEVICE_QUERY | DOMAIN_CAPABILITY_DEVICE_CLAIM).to_le_bytes(),
+        );
+        let device = MANIFEST_HEADER_SIZE + 2 * DOMAIN_ENTRY_SIZE;
+        bytes[device + 2..device + 4].copy_from_slice(&0x0010_u16.to_le_bytes());
+        bytes[device + 4..device + 6]
+            .copy_from_slice(&(ManifestDeviceKind::Block as u16).to_le_bytes());
+        bytes[device + 6..device + 8].copy_from_slice(&DEVICE_FLAG_REQUIRED.to_le_bytes());
+        bytes[device + 8..device + 12].copy_from_slice(&2_u32.to_le_bytes());
+        bytes[14..16].copy_from_slice(&2_u16.to_le_bytes());
+        let total_size = bytes.len() as u32;
+        bytes[16..20].copy_from_slice(&total_size.to_le_bytes());
+        bytes[24..26].copy_from_slice(&1_u16.to_le_bytes());
         bytes
     }
 
@@ -383,6 +517,24 @@ mod tests {
             .copy_from_slice(&(ManifestDomainRole::Hardware as u16).to_le_bytes());
         let digest = Sha256::digest(bytes).into();
         assert!(LaunchManifest::parse(&bytes, digest).is_ok());
+    }
+
+    #[test]
+    fn parses_a_device_policy_for_a_capable_hardware_domain() {
+        let bytes = manifest_with_device();
+        let digest = Sha256::digest(&bytes).into();
+        let manifest = LaunchManifest::parse(&bytes, digest).unwrap();
+        assert_eq!(manifest.device_count(), 1);
+        assert_eq!(
+            manifest.device(0).unwrap(),
+            ManifestDevice {
+                segment: 0,
+                requester: 0x0010,
+                kind: ManifestDeviceKind::Block,
+                flags: DEVICE_FLAG_REQUIRED,
+                domain_id: 2,
+            }
+        );
     }
 
     #[test]

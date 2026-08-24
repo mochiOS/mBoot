@@ -13,6 +13,7 @@ sub read_hv_config {
     my %root;
     my @domains;
     my @channels;
+    my @devices;
     my $current = \%root;
     my $line_number = 0;
     while (my $line = <$fh>) {
@@ -30,6 +31,11 @@ sub read_hv_config {
             $current = $channels[-1];
             next;
         }
+        if ($line eq '[[devices]]') {
+            push @devices, {};
+            $current = $devices[-1];
+            next;
+        }
         $line =~ /^([a-z][a-z0-9_]*)\s*=\s*(.+)$/
             or die "$path:$line_number: invalid config line\n";
         my ($key, $raw) = ($1, $2);
@@ -42,7 +48,7 @@ sub read_hv_config {
     for my $key (qw(version toolchain disk_size_mib esp_size_mib disk_guid esp_guid)) {
         exists $root{$key} or die "$path: missing $key\n";
     }
-    $root{version} == 3 or die "$path: unsupported version $root{version}\n";
+    $root{version} == 4 or die "$path: unsupported version $root{version}\n";
     $root{disk_size_mib} > $root{esp_size_mib} + 2
         or die "$path: disk_size_mib must exceed esp_size_mib by at least 2 MiB\n";
     @domains && @domains <= 8 or die "$path: domains must contain 1 to 8 entries\n";
@@ -99,8 +105,33 @@ sub read_hv_config {
         }
     }
 
+    @devices <= 64 or die "$path: devices may contain at most 64 entries\n";
+    my %requesters;
+    for my $device (@devices) {
+        for my $key (qw(segment requester kind domain required)) {
+            exists $device->{$key} or die "$path: device is missing $key\n";
+        }
+        $device->{segment} >= 0 && $device->{segment} <= 0xffff
+            or die "$path: device segment is outside u16\n";
+        $device->{requester} > 0 && $device->{requester} <= 0xffff
+            or die "$path: device requester is outside a valid PCI BDF\n";
+        $device->{kind} =~ /^(?:other|display|block|network|usb|audio)$/
+            or die "$path: invalid device kind\n";
+        $ids{$device->{domain}}
+            or die "$path: device refers to an unknown Domain\n";
+        my ($owner) = grep { $_->{id} == $device->{domain} } @domains;
+        $owner->{role} eq 'hardware'
+            or die "$path: physical devices belong only to Hardware Domains\n";
+        $owner->{capabilities} & 0x2
+            or die "$path: device owner lacks DeviceClaim capability\n";
+        my $key = "$device->{segment}:$device->{requester}";
+        !$requesters{$key}++
+            or die "$path: duplicate device requester $key\n";
+    }
+
     $root{domains} = \@domains;
     $root{channels} = \@channels;
+    $root{devices} = \@devices;
     return \%root;
 }
 

@@ -36,11 +36,14 @@ my $entry_size = 160;
 my $channel_entry_size = 32;
 my $domain_count = scalar @{$config->{domains}};
 my $channel_count = scalar @{$config->{channels}};
+my $device_count = scalar @{$config->{devices}};
+my $device_entry_size = 32;
 my $header = pack(
-    'a8 v v v v V v v Q<',
+    'a8 v v v v V v v v v V',
     "MBLHV1\0\0", $config->{version}, $header_size, $entry_size, $domain_count,
-    $header_size + $entry_size * $domain_count + $channel_entry_size * $channel_count,
-    $channel_count, $channel_entry_size, 0,
+    $header_size + $entry_size * $domain_count + $channel_entry_size * $channel_count
+        + $device_entry_size * $device_count,
+    $channel_count, $channel_entry_size, $device_count, $device_entry_size, 0,
 );
 
 my %image_bytes;
@@ -79,7 +82,21 @@ for my $channel (@{$config->{channels}}) {
     );
 }
 
+my %device_kinds = (
+    other => 0, display => 1, block => 2,
+    network => 3, usb => 4, audio => 5,
+);
+my $device_entries = '';
+for my $device (@{$config->{devices}}) {
+    my $flags = $device->{required} ? 1 : 0;
+    $device_entries .= pack(
+        'v v v v V a20',
+        $device->{segment}, $device->{requester}, $device_kinds{$device->{kind}},
+        $flags, $device->{domain}, '',
+    );
+}
+
 open my $output_fh, '>:raw', $output_file or die "cannot write $output_file: $!\n";
-print {$output_fh} $header, $entries, $channel_entries
+print {$output_fh} $header, $entries, $channel_entries, $device_entries
     or die "cannot write $output_file: $!\n";
 close $output_fh or die "cannot close $output_file: $!\n";
