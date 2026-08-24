@@ -1,0 +1,74 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/mboot: report Hardware Domain readiness
+
+Expose the active backend through the mBoot CPUID leaf.
+Linux uses the matching hypercall instruction after initialization.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+ arch/x86/kernel/cpu/mboot.c | 47 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -10,6 +10,9 @@
+ #include <asm/mpspec.h>
+ 
+ #define MBOOT_SIGNATURE "MochiOSmBoot"
++#define MBOOT_BACKEND_INTEL_VMX 1
++#define MBOOT_BACKEND_AMD_SVM 2
++#define MBOOT_HYPERCALL_READY 3
+ 
+ static u32 __init mboot_detect(void)
+ {
+@@ -29,6 +32,50 @@
+ 	return ebx;
+ }
+ 
++static u32 mboot_backend(void)
++{
++	u32 eax, ebx, ecx, edx;
++
++	cpuid(0x40000001, &eax, &ebx, &ecx, &edx);
++	return ecx;
++}
++
++static unsigned long mboot_hypercall(unsigned long number)
++{
++	unsigned long result = number;
++
++	switch (mboot_backend()) {
++	case MBOOT_BACKEND_INTEL_VMX:
++		asm volatile("vmcall"
++			     : "+a" (result)
++			     : "D" (0UL), "S" (0UL), "d" (0UL)
++			     : "memory");
++		break;
++	case MBOOT_BACKEND_AMD_SVM:
++		asm volatile("vmmcall"
++			     : "+a" (result)
++			     : "D" (0UL), "S" (0UL), "d" (0UL)
++			     : "memory");
++		break;
++	default:
++		return ~0UL;
++	}
++
++	return result;
++}
++
++static int __init mboot_report_ready(void)
++{
++	unsigned long result = mboot_hypercall(MBOOT_HYPERCALL_READY);
++
++	if (result)
++		pr_err("mDriver: mBoot Ready hypercall failed: %lu\n", result);
++	else
++		pr_info("mDriver: mBoot control path ready\n");
++	return 0;
++}
++late_initcall(mboot_report_ready);
++
+ static void __init mboot_init_platform(void)
+ {
+ 	unsigned long tsc_khz = mboot_tsc_khz();

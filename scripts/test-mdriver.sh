@@ -55,7 +55,8 @@ cp --sparse=always "$IMAGE" "$WORK/mdriver.iso"
 QEMU_PID=$!
 
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
-    if grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null; then
+    if grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null \
+        && grep -Fq '[mBoot] Hardware Domain 2 ready' "$WORK/serial.log" 2>/dev/null; then
         grep -E '\[mBoot\]|mDriver OK|Linux version' "$WORK/serial.log"
         echo 'test-mdriver: PASS'
         exit 0
@@ -65,5 +66,5 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
 done
 
 sed -n '1,240p' "$WORK/serial.log" >&2
-echo 'test-mdriver: mDriver did not reach init' >&2
+echo 'test-mdriver: mDriver did not complete init and its Ready hypercall' >&2
 exit 1

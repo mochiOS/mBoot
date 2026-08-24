@@ -34,6 +34,7 @@ pub fn query(
     apic_id: u32,
     vcpu_count: u32,
     tsc_frequency_khz: u32,
+    hypervisor_backend: u32,
 ) -> CpuidResult {
     match leaf {
         0 => vendor_leaf(MAX_BASIC_LEAF, CPU_VENDOR, false),
@@ -45,9 +46,11 @@ pub fn query(
         },
         0x0b => topology_leaf(subleaf, apic_id, vcpu_count),
         0x4000_0000 => vendor_leaf(MAX_HYPERVISOR_LEAF, HYPERVISOR_VENDOR, true),
+        // mBoot interface leaf: ABI version, virtual TSC kHz, backend ID.
         0x4000_0001 => CpuidResult {
             eax: 1,
             ebx: tsc_frequency_khz,
+            ecx: hypervisor_backend,
             ..CpuidResult::default()
         },
         0x8000_0000 => CpuidResult {
@@ -135,13 +138,13 @@ mod tests {
 
     #[test]
     fn hides_nested_virtualization_and_identifies_mboot() {
-        let features = query(1, 0, 0, 1, 2_400_000);
+        let features = query(1, 0, 0, 1, 2_400_000, 1);
         assert_eq!(features.ecx & (1 << 5), 0);
         assert_ne!(features.ecx & LEAF1_ECX_HYPERVISOR, 0);
         assert_ne!(features.ecx & LEAF1_ECX_X2APIC, 0);
-        assert_eq!(query(0x8000_0001, 0, 0, 1, 2_400_000).ecx & (1 << 2), 0);
+        assert_eq!(query(0x8000_0001, 0, 0, 1, 2_400_000, 1).ecx & (1 << 2), 0);
 
-        let vendor = query(0x4000_0000, 0, 0, 1, 2_400_000);
+        let vendor = query(0x4000_0000, 0, 0, 1, 2_400_000, 1);
         let bytes = [vendor.ebx, vendor.ecx, vendor.edx]
             .map(u32::to_le_bytes)
             .concat();
@@ -150,7 +153,7 @@ mod tests {
 
     #[test]
     fn reports_domain_topology_instead_of_host_topology() {
-        let leaf = query(0x0b, 1, 3, 4, 2_400_000);
+        let leaf = query(0x0b, 1, 3, 4, 2_400_000, 1);
         assert_eq!(leaf.eax, 2);
         assert_eq!(leaf.ebx, 4);
         assert_eq!(leaf.edx, 3);
@@ -159,14 +162,16 @@ mod tests {
     #[test]
     fn unsupported_leaves_are_empty() {
         assert_eq!(
-            query(0x1234_5678, 0, 0, 1, 2_400_000),
+            query(0x1234_5678, 0, 0, 1, 2_400_000, 1),
             CpuidResult::default()
         );
-        assert_eq!(query(7, 0, 0, 1, 2_400_000), CpuidResult::default());
+        assert_eq!(query(7, 0, 0, 1, 2_400_000, 1), CpuidResult::default());
     }
 
     #[test]
     fn reports_the_virtual_tsc_frequency_to_guests() {
-        assert_eq!(query(0x4000_0001, 0, 0, 1, 2_400_000).ebx, 2_400_000);
+        let leaf = query(0x4000_0001, 0, 0, 1, 2_400_000, 2);
+        assert_eq!(leaf.ebx, 2_400_000);
+        assert_eq!(leaf.ecx, 2);
     }
 }

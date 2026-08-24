@@ -38,7 +38,9 @@ make image \
   MDRIVER_INITRAMFS=mdriver/output/artifacts/initramfs.cpio
 ```
 
-今のmDriverは、mBoot上でPVH起動してPID 1へ到達するところまでを担当します。物理PCIデバイスをLinuxの通常のPCI層へ接続するguest driverと、mochiOS向けvirtio backendは次に実装します。
+今のmDriverはmBoot上でPVH起動し、Linuxの初期化が終わるとReady Hypercallを送ります。Intel VMXでは`vmcall`、AMD SVMでは`vmmcall`を使います。mBootはこの通知を受け取ってHardware Domainを起動済みとして扱います。
+
+物理PCIデバイスはまだLinuxのPCI層へ接続していません。次にDevice QueryとDevice Claimを扱うguest driverを追加し、その後でmochiOS向けの仮想デバイスbackendを実装します。
 
 ## ライセンス
 

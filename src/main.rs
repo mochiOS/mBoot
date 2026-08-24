@@ -506,10 +506,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 );
                 halt()
             }
-            halt_with_error(
-                "PCI DMA quarantine",
-                mboot::Error::DeviceQuarantineFailed,
-            )
+            halt_with_error("PCI DMA quarantine", mboot::Error::DeviceQuarantineFailed)
         }
         for requester in quarantine.active_requesters() {
             log!(
@@ -947,6 +944,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 timer::tsc_frequency_hz()
                     .and_then(|frequency| u32::try_from(frequency / 1_000).ok())
                     .unwrap_or(1_000_000),
+                match runtime.domain.backend() {
+                    BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
+                    BackendKind::AmdSvm => HYPERVISOR_BACKEND_AMD_SVM,
+                },
             );
             runtime.resume_kind = ResumeKind::Cpuid(result);
             continue;
@@ -1910,10 +1911,7 @@ fn notify_system_domain(runtime_domains: &mut [RuntimeDomain]) {
         return;
     };
     if system.interrupts.raise(DOMAIN_MANAGEMENT_VECTOR).is_err() {
-        halt_with_error(
-            "Domain management notification",
-            mboot::Error::InvalidState,
-        )
+        halt_with_error("Domain management notification", mboot::Error::InvalidState)
     }
 }
 

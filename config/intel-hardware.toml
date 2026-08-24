@@ -1,7 +1,7 @@
 version = 5
 toolchain = "nightly-2026-05-14"
-disk_size_mib = 96
-esp_size_mib = 64
+disk_size_mib = 128
+esp_size_mib = 96
 disk_guid = "6d426f6f-7400-4b00-8a00-000000000200"
 esp_guid = "6d426f6f-7400-4b00-8a00-000000000201"
 
@@ -22,12 +22,15 @@ max_restarts = 0
 [[domains]]
 id = 2
 role = "hardware"
-memory_mib = 2
+memory_mib = 64
 vcpus = 1
 capabilities = 0x3
-format = "native-elf"
-image = "hardware-bootstrap"
-path = '\EFI\MBOOT\HARDWARE.ELF'
+format = "linux-pvh"
+image = "mdriver"
+path = '\EFI\MBOOT\MDRIVER.ELF'
+initramfs = "mdriver"
+initramfs_path = '\EFI\MBOOT\MDRIVER.CPIO'
+command_line = "earlycon=uart,io,0x3f8 console=ttyS0 rdinit=/init pci=off acpi=off maxcpus=0 panic=-1"
 autostart = true
 required = true
 restart = "never"
