@@ -124,6 +124,11 @@ pub(crate) fn prepare_entry() {
     }
 }
 
+/// Returns the monotonic counter used by virtual Local APIC timers.
+pub fn now() -> u64 {
+    unsafe { _rdtsc() }
+}
+
 fn tsc_frequency_hz() -> Option<u64> {
     let maximum_leaf = __cpuid(0).eax;
     if maximum_leaf >= 0x15 {

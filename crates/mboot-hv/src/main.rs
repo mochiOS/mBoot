@@ -469,6 +469,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     let mut scheduler = CooperativeScheduler::new();
     while let Some(index) = scheduler.next(&runnable) {
         let runtime = &mut runtime_domains[index];
+        if runtime.interrupts.update_timer(timer::now()).is_err() {
+            halt_with_error("Virtual APIC timer", mboot_hv::Error::InvalidState)
+        }
         if !matches!(runtime.resume_kind, ResumeKind::GeneralProtection) {
             if let Some(vector) = runtime.interrupts.next_pending() {
                 let can_inject = match unsafe { runtime.virtualization.can_inject_interrupt() } {
@@ -553,6 +556,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             continue;
         }
         if vm_exit.reason == VmExitReason::MsrRead {
+            if runtime.interrupts.update_timer(timer::now()).is_err() {
+                halt_with_error("Virtual APIC timer", mboot_hv::Error::InvalidState)
+            }
             runtime.resume_kind = match runtime.interrupts.read_msr(vm_exit.msr) {
                 Ok(value) => ResumeKind::MsrRead(value),
                 Err(_) => ResumeKind::GeneralProtection,
@@ -560,6 +566,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             continue;
         }
         if vm_exit.reason == VmExitReason::MsrWrite {
+            if runtime.interrupts.update_timer(timer::now()).is_err() {
+                halt_with_error("Virtual APIC timer", mboot_hv::Error::InvalidState)
+            }
             runtime.resume_kind = if runtime
                 .interrupts
                 .write_msr(vm_exit.msr, vm_exit.msr_value)

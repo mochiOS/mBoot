@@ -124,6 +124,16 @@ grep -Fq '[Domain 2] Rejected MSR delivered #GP' "$SERIAL" || {
     echo 'test-hv-qemu: rejected MSR did not fault only the Hardware Domain' >&2
     exit 1
 }
+grep -Fq '[Domain 2] x2APIC self IPI received' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: x2APIC Self IPI and ICR self delivery were not verified' >&2
+    exit 1
+}
+grep -Fq '[Domain 2] Local APIC timer IRQ received' "$SERIAL" || {
+    sed -n '1,200p' "$SERIAL" >&2
+    echo 'test-hv-qemu: virtual Local APIC timer did not fire' >&2
+    exit 1
+}
 grep -Fq '[Domain 1] Shared Ring bootstrap entered' "$SERIAL" || {
     sed -n '1,200p' "$SERIAL" >&2
     echo 'test-hv-qemu: System Domain ConsoleWrite was not handled' >&2

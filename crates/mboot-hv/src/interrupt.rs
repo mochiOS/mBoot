@@ -32,11 +32,21 @@ const X2APIC_ISR_BASE: u32 = 0x810;
 const X2APIC_TMR_BASE: u32 = 0x818;
 const X2APIC_IRR_BASE: u32 = 0x820;
 const X2APIC_ESR: u32 = 0x828;
+const X2APIC_ICR: u32 = 0x830;
+const X2APIC_LVT_TIMER: u32 = 0x832;
+const X2APIC_INITIAL_COUNT: u32 = 0x838;
+const X2APIC_CURRENT_COUNT: u32 = 0x839;
+const X2APIC_DIVIDE_CONFIGURATION: u32 = 0x83e;
 const X2APIC_SELF_IPI: u32 = 0x83f;
 const APIC_BASE_ADDRESS: u64 = 0xfee0_0000;
 const APIC_BASE_BSP: u64 = 1 << 8;
 const APIC_BASE_X2APIC: u64 = 1 << 10;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
+const LVT_MASKED: u32 = 1 << 16;
+const LVT_PERIODIC: u32 = 1 << 17;
+const LVT_TIMER_MODE: u32 = 3 << 17;
+const ICR_DESTINATION_SHORTHAND: u64 = 3 << 18;
+const ICR_SELF: u64 = 1 << 18;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VirtualLocalApic {
@@ -46,6 +56,13 @@ pub struct VirtualLocalApic {
     task_priority: u8,
     apic_base: u64,
     spurious_vector: u16,
+    icr: u64,
+    lvt_timer: u32,
+    timer_initial_count: u32,
+    timer_current_count: u32,
+    timer_divide_configuration: u8,
+    timer_last_tsc: u64,
+    timer_remainder: u64,
 }
 
 impl VirtualLocalApic {
@@ -57,6 +74,13 @@ impl VirtualLocalApic {
             task_priority: 0,
             apic_base: APIC_BASE_ADDRESS | APIC_BASE_BSP | APIC_BASE_ENABLE,
             spurious_vector: 0xff,
+            icr: 0,
+            lvt_timer: LVT_MASKED,
+            timer_initial_count: 0,
+            timer_current_count: 0,
+            timer_divide_configuration: 0,
+            timer_last_tsc: 0,
+            timer_remainder: 0,
         }
     }
 
@@ -134,6 +158,11 @@ impl VirtualLocalApic {
             X2APIC_TMR_BASE..=0x81f => Ok(0),
             X2APIC_IRR_BASE..=0x827 => Ok(self.register_word(&self.pending, msr - X2APIC_IRR_BASE)),
             X2APIC_ESR => Ok(0),
+            X2APIC_ICR => Ok(self.icr),
+            X2APIC_LVT_TIMER => Ok(u64::from(self.lvt_timer)),
+            X2APIC_INITIAL_COUNT => Ok(u64::from(self.timer_initial_count)),
+            X2APIC_CURRENT_COUNT => Ok(u64::from(self.timer_current_count)),
+            X2APIC_DIVIDE_CONFIGURATION => Ok(u64::from(self.timer_divide_configuration)),
             _ => Err(ApicMsrError::Unsupported),
         }
     }
@@ -167,6 +196,29 @@ impl VirtualLocalApic {
                 Ok(ApicMsrEffect::None)
             }
             X2APIC_ESR if value == 0 => Ok(ApicMsrEffect::None),
+            X2APIC_ICR => self.write_icr(value),
+            X2APIC_LVT_TIMER if value <= u32::MAX.into() => {
+                let value = value as u32;
+                if value & !(u32::from(u8::MAX) | LVT_MASKED | LVT_TIMER_MODE) != 0
+                    || !matches!(value & LVT_TIMER_MODE, 0 | LVT_PERIODIC)
+                    || value & LVT_MASKED == 0 && (value as u8) < MIN_DEVICE_VECTOR
+                {
+                    return Err(ApicMsrError::InvalidValue);
+                }
+                self.lvt_timer = value;
+                Ok(ApicMsrEffect::None)
+            }
+            X2APIC_INITIAL_COUNT if value <= u32::MAX.into() => {
+                self.timer_initial_count = value as u32;
+                self.timer_current_count = value as u32;
+                self.timer_remainder = 0;
+                Ok(ApicMsrEffect::None)
+            }
+            X2APIC_DIVIDE_CONFIGURATION if valid_divide_configuration(value) => {
+                self.timer_divide_configuration = value as u8;
+                self.timer_remainder = 0;
+                Ok(ApicMsrEffect::None)
+            }
             X2APIC_SELF_IPI if value <= u8::MAX.into() => {
                 let vector = value as u8;
                 self.raise(vector).map_err(ApicMsrError::Interrupt)?;
@@ -178,6 +230,48 @@ impl VirtualLocalApic {
 
     pub fn is_in_service(&self, vector: u8) -> bool {
         contains(&self.in_service, vector)
+    }
+
+    /// Advances the virtual APIC timer using a monotonically increasing TSC.
+    /// At most one pending interrupt is recorded; repeated expirations coalesce.
+    pub fn update_timer(&mut self, now: u64) -> Result<Option<u8>, InterruptError> {
+        if self.timer_last_tsc == 0 {
+            self.timer_last_tsc = now;
+            return Ok(None);
+        }
+        let elapsed = now.wrapping_sub(self.timer_last_tsc);
+        self.timer_last_tsc = now;
+        if self.timer_current_count == 0 {
+            self.timer_remainder = 0;
+            return Ok(None);
+        }
+        let divisor = u64::from(timer_divisor(self.timer_divide_configuration));
+        let total = self.timer_remainder.saturating_add(elapsed);
+        let decrement = total / divisor;
+        self.timer_remainder = total % divisor;
+        if decrement < u64::from(self.timer_current_count) {
+            self.timer_current_count -= decrement as u32;
+            return Ok(None);
+        }
+
+        if self.lvt_timer & LVT_TIMER_MODE == LVT_PERIODIC && self.timer_initial_count != 0 {
+            let overshoot = decrement - u64::from(self.timer_current_count);
+            let phase = overshoot % u64::from(self.timer_initial_count);
+            self.timer_current_count = if phase == 0 {
+                self.timer_initial_count
+            } else {
+                self.timer_initial_count - phase as u32
+            };
+        } else {
+            self.timer_current_count = 0;
+        }
+
+        if self.lvt_timer & LVT_MASKED != 0 {
+            return Ok(None);
+        }
+        let vector = self.lvt_timer as u8;
+        self.raise(vector)?;
+        Ok(Some(vector))
     }
 
     fn highest_in_service(&self) -> Option<u8> {
@@ -206,6 +300,21 @@ impl VirtualLocalApic {
         let bit = index * 32;
         (bitmap[(bit / 64) as usize] >> (bit % 64)) & u64::from(u32::MAX)
     }
+
+    fn write_icr(&mut self, value: u64) -> Result<ApicMsrEffect, ApicMsrError> {
+        let shorthand = value & ICR_DESTINATION_SHORTHAND;
+        let destination = value >> 32;
+        let reserved = value & 0x0000_0000_fff3_3000;
+        let fixed_physical_edge = value & ((7 << 8) | (1 << 11) | (1 << 15)) == 0;
+        let targets_self = shorthand == ICR_SELF || shorthand == 0 && destination == 0;
+        if reserved != 0 || !fixed_physical_edge || !targets_self {
+            return Err(ApicMsrError::Unsupported);
+        }
+        let vector = value as u8;
+        self.raise(vector).map_err(ApicMsrError::Interrupt)?;
+        self.icr = value;
+        Ok(ApicMsrEffect::SelfIpi(vector))
+    }
 }
 
 impl Default for VirtualLocalApic {
@@ -232,6 +341,24 @@ fn set(bitmap: &mut [u64; 4], vector: u8) {
 
 fn clear(bitmap: &mut [u64; 4], vector: u8) {
     bitmap[usize::from(vector / 64)] &= !(1_u64 << (vector % 64));
+}
+
+fn valid_divide_configuration(value: u64) -> bool {
+    value <= 0xb && value & 0x4 == 0
+}
+
+fn timer_divisor(configuration: u8) -> u8 {
+    match configuration & 0xb {
+        0x0 => 2,
+        0x1 => 4,
+        0x2 => 8,
+        0x3 => 16,
+        0x8 => 32,
+        0x9 => 64,
+        0xa => 128,
+        0xb => 1,
+        _ => 2,
+    }
 }
 
 #[cfg(test)]
@@ -308,5 +435,77 @@ mod tests {
     fn x2apic_registers_require_x2apic_mode() {
         let apic = VirtualLocalApic::new();
         assert_eq!(apic.read_msr(X2APIC_TPR), Err(ApicMsrError::Disabled));
+    }
+
+    #[test]
+    fn self_ipi_and_icr_self_shorthand_raise_interrupts() {
+        let mut apic = x2apic();
+        assert_eq!(
+            apic.write_msr(X2APIC_SELF_IPI, 0x51),
+            Ok(ApicMsrEffect::SelfIpi(0x51))
+        );
+        assert_eq!(apic.next_pending(), Some(0x51));
+        apic.accept(0x51).unwrap();
+        apic.eoi().unwrap();
+        assert_eq!(
+            apic.write_msr(X2APIC_ICR, ICR_SELF | 0x52),
+            Ok(ApicMsrEffect::SelfIpi(0x52))
+        );
+        assert_eq!(apic.read_msr(X2APIC_ICR), Ok(ICR_SELF | 0x52));
+        assert_eq!(apic.next_pending(), Some(0x52));
+        assert_eq!(
+            apic.write_msr(X2APIC_ICR, (1_u64 << 32) | 0x53),
+            Err(ApicMsrError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn one_shot_timer_counts_down_and_raises_its_vector() {
+        let mut apic = x2apic();
+        apic.update_timer(100).unwrap();
+        apic.write_msr(X2APIC_DIVIDE_CONFIGURATION, 0xb).unwrap();
+        apic.write_msr(X2APIC_LVT_TIMER, 0x50).unwrap();
+        apic.write_msr(X2APIC_INITIAL_COUNT, 10).unwrap();
+        assert_eq!(apic.update_timer(105), Ok(None));
+        assert_eq!(apic.read_msr(X2APIC_CURRENT_COUNT), Ok(5));
+        assert_eq!(apic.update_timer(110), Ok(Some(0x50)));
+        assert_eq!(apic.read_msr(X2APIC_CURRENT_COUNT), Ok(0));
+        assert_eq!(apic.next_pending(), Some(0x50));
+    }
+
+    #[test]
+    fn periodic_timer_reloads_after_each_expiration() {
+        let mut apic = x2apic();
+        apic.update_timer(100).unwrap();
+        apic.write_msr(X2APIC_DIVIDE_CONFIGURATION, 0xb).unwrap();
+        apic.write_msr(X2APIC_LVT_TIMER, u64::from(LVT_PERIODIC | 0x50))
+            .unwrap();
+        apic.write_msr(X2APIC_INITIAL_COUNT, 4).unwrap();
+        assert_eq!(apic.update_timer(104), Ok(Some(0x50)));
+        assert_eq!(apic.read_msr(X2APIC_CURRENT_COUNT), Ok(4));
+        apic.accept(0x50).unwrap();
+        apic.eoi().unwrap();
+        assert_eq!(apic.update_timer(108), Ok(Some(0x50)));
+    }
+
+    #[test]
+    fn masked_timer_expires_without_raising_an_interrupt() {
+        let mut apic = x2apic();
+        apic.update_timer(100).unwrap();
+        apic.write_msr(X2APIC_DIVIDE_CONFIGURATION, 0xb).unwrap();
+        apic.write_msr(X2APIC_LVT_TIMER, u64::from(LVT_MASKED))
+            .unwrap();
+        apic.write_msr(X2APIC_INITIAL_COUNT, 4).unwrap();
+        assert_eq!(apic.update_timer(104), Ok(None));
+        assert_eq!(apic.read_msr(X2APIC_CURRENT_COUNT), Ok(0));
+        assert_eq!(apic.next_pending(), None);
+    }
+
+    fn x2apic() -> VirtualLocalApic {
+        let mut apic = VirtualLocalApic::new();
+        let base = apic.read_msr(IA32_APIC_BASE).unwrap();
+        apic.write_msr(IA32_APIC_BASE, base | APIC_BASE_X2APIC)
+            .unwrap();
+        apic
     }
 }
