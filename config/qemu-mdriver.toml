@@ -19,6 +19,18 @@ required = true
 restart = "never"
 max_restarts = 0
 
+[[channels]]
+domain_a = 1
+port_a = 1
+domain_b = 2
+port_b = 1
+
+[[channels]]
+domain_a = 1
+port_a = 2
+domain_b = 2
+port_b = 2
+
 [[devices]]
 segment = 0
 requester = 0x18

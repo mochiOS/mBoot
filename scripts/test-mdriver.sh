@@ -66,6 +66,8 @@ QEMU_PID=$!
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
     if grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver block IRQ OK' "$WORK/serial.log" 2>/dev/null \
+        && grep -Fq 'mDriver: mBoot control Event Channel ready' "$WORK/serial.log" 2>/dev/null \
+        && grep -Fq 'mDriver control Event Channel verified' "$WORK/serial.log" 2>/dev/null \
         && grep -Eq 'mDriver: mBoot PCI inventory ready: [0-9]+ devices, 1 claimed' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'PCI requester 0018 mapped for DMA and claimed-disabled by Hardware Domain 2' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver: mBoot PCI frontend ready: 1 devices, 2 resources, 1 active' "$WORK/serial.log" 2>/dev/null \
@@ -86,7 +88,7 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
             fi
         fi
         if [[ $route_verified == 1 ]]; then
-            grep -E '\[mBoot\]|mDriver: mBoot PCI|mDriver (block IRQ )?OK|Linux version|PCI requester 0018|virtio_blk| vda' "$WORK/serial.log"
+            grep -E '\[mBoot\]|mDriver: mBoot (PCI|control)|mDriver (block IRQ )?OK|Linux version|PCI requester 0018|virtio_blk| vda' "$WORK/serial.log"
             echo 'test-mdriver: PASS'
             exit 0
         fi

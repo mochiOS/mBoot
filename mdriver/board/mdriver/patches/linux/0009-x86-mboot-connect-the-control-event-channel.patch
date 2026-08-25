@@ -1,0 +1,53 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/mboot: connect the control Event Channel
+
+Exchange startup notifications with the mochiOS System Domain before the
+Hardware Domain reports ready. Exercise both a waiting receiver and virtual
+Event Channel IRQ delivery so later shared-ring backends have a verified
+notification path.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -26,6 +26,8 @@
+ #define MBOOT_BACKEND_INTEL_VMX 1
+ #define MBOOT_BACKEND_AMD_SVM 2
+ #define MBOOT_HYPERCALL_READY 3
++#define MBOOT_HYPERCALL_EVENT_SEND 5
++#define MBOOT_HYPERCALL_EVENT_WAIT 6
+ #define MBOOT_HYPERCALL_DEVICE_QUERY 16
+ #define MBOOT_HYPERCALL_DEVICE_CLAIM 17
+ #define MBOOT_HYPERCALL_DEVICE_CONFIG_READ 19
+@@ -45,6 +47,8 @@
+ #define MBOOT_PCI_RESOURCE_MMIO 1
+ #define MBOOT_PCI_RESOURCE_READABLE BIT(0)
+ #define MBOOT_PCI_RESOURCE_WRITABLE BIT(1)
++#define MBOOT_CONTROL_PORT 1
++#define MBOOT_CONTROL_IRQ_PORT 2
+ 
+ struct mboot_pci_device_info {
+ 	u16 requester;
+@@ -638,6 +642,21 @@ static int __init mboot_report_ready(void)
+ 		return -EIO;
+ 	if (mboot_pci_device_count && mboot_pci_publish_frontend())
+ 		return -EIO;
++	result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_SEND,
++				 MBOOT_CONTROL_PORT, 0, 0);
++	if (result)
++		return -EIO;
++	result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_WAIT, 0, 0, 0);
++	if (result != MBOOT_CONTROL_PORT)
++		return -EIO;
++	result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_SEND,
++				 MBOOT_CONTROL_IRQ_PORT, 0, 0);
++	if (result)
++		return -EIO;
++	result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_WAIT, 0, 0, 0);
++	if (result != MBOOT_CONTROL_IRQ_PORT)
++		return -EIO;
++	pr_info("mDriver: mBoot control Event Channel ready\n");
+ 	result = mboot_hypercall(MBOOT_HYPERCALL_READY, 0, 0, 0);
+ 
+ 	if (result)
