@@ -62,6 +62,8 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
     if grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null \
         && grep -Eq 'mDriver: mBoot PCI inventory ready: [0-9]+ devices, 1 claimed' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'PCI requester 0018 mapped for DMA and claimed-disabled by Hardware Domain 2' "$WORK/serial.log" 2>/dev/null \
+        && grep -Fq 'PCI requester 0018 active: host IRQ 0x50 -> Domain 2 vector 0x42' "$WORK/serial.log" 2>/dev/null \
+        && grep -Fq 'mDriver: mBoot PCI frontend ready: 1 devices, 2 resources, 1 active' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq '[mBoot] Hardware Domain 2 ready' "$WORK/serial.log" 2>/dev/null; then
         grep -E '\[mBoot\]|mDriver: mBoot PCI|mDriver OK|Linux version|PCI requester 0018' "$WORK/serial.log"
         echo 'test-mdriver: PASS'
@@ -72,5 +74,5 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
 done
 
 sed -n '1,240p' "$WORK/serial.log" >&2
-echo 'test-mdriver: mDriver did not claim its assigned device and report Ready' >&2
+echo 'test-mdriver: mDriver did not publish and activate its assigned device' >&2
 exit 1

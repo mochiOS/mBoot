@@ -38,9 +38,9 @@ make image \
   MDRIVER_INITRAMFS=mdriver/output/artifacts/initramfs.cpio
 ```
 
-今のmDriverはmBoot上でPVH起動し、Linuxの初期化中にDevice QueryでPCI機能を調べます。Launch ManifestでmDriverへの割り当てが許可されたデバイスだけをDevice Claimで受け取ります。Intel VMXでは`vmcall`、AMD SVMでは`vmmcall`を使います。照会や割り当てに失敗した場合、mDriverはReadyを送らないため、mBootはHardware Domainを起動済みとして扱いません。
+今のmDriverはmBoot上でPVH起動し、Linuxの初期化中にDevice QueryでPCI機能を調べます。Launch ManifestでmDriverへの割り当てが許可されたデバイスだけをDevice Claimで受け取ります。続いて仮想BARをLinuxのPCI coreへ登録し、LinuxがBARの位置と大きさを正しく読めた場合にDevice Activateを呼びます。Intel VMXでは`vmcall`、AMD SVMでは`vmmcall`を使います。途中で失敗した場合、mDriverはReadyを送りません。
 
-Linuxの通常のPCI列挙はまだ無効です。mDriverはPCI設定空間を直接走査せず、mBootから渡された一覧だけを使います。次はDevice Resource QueryとDevice ActivateをLinuxのPCI層へつなぎ、その後でmochiOS向けの仮想デバイスbackendを実装します。
+Linuxの通常のPCI列挙は無効のままです。mDriverはPCI設定空間を直接走査せず、mBootから受け取った設定値と仮想BARだけをPCI coreへ見せます。現時点では一般のLinuxドライバへデバイスを公開していません。次はmBootの仮想割り込みをLinux IRQへ接続してからドライバを公開し、その後でmochiOS向けの仮想デバイスbackendを実装します。
 
 ## ライセンス
 

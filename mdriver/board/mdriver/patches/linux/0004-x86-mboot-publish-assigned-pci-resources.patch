@@ -1,0 +1,380 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/mboot: publish assigned PCI resources
+
+Build a synthetic PCI configuration view from mBoot hypercalls. Expose only
+claimed devices and their relocated MMIO BARs to the Linux PCI core, then
+activate each device after Linux has accepted the resource layout.
+
+Keep the frontend devices unpublished until mBoot interrupt delivery is
+connected to the Linux IRQ subsystem.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+ arch/x86/kernel/cpu/mboot.c | 303 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 303 insertions(+)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -5,6 +5,8 @@
+ #include <linux/build_bug.h>
+ #include <linux/errno.h>
+ #include <linux/init.h>
++#include <linux/ioport.h>
++#include <linux/pci.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ 
+@@ -14,6 +16,7 @@
+ #include <asm/cpuid.h>
+ #include <asm/hypervisor.h>
+ #include <asm/mpspec.h>
++#include <asm/pci_x86.h>
+ 
+ #define MBOOT_SIGNATURE "MochiOSmBoot"
+ #define MBOOT_BACKEND_INTEL_VMX 1
+@@ -21,6 +24,9 @@
+ #define MBOOT_HYPERCALL_READY 3
+ #define MBOOT_HYPERCALL_DEVICE_QUERY 16
+ #define MBOOT_HYPERCALL_DEVICE_CLAIM 17
++#define MBOOT_HYPERCALL_DEVICE_CONFIG_READ 19
++#define MBOOT_HYPERCALL_DEVICE_RESOURCE_QUERY 20
++#define MBOOT_HYPERCALL_DEVICE_ACTIVATE 21
+ #define MBOOT_HYPERCALL_INVALID_ARGUMENT (~0UL - 1)
+ #define MBOOT_PCI_STATE_QUARANTINED 1
+ #define MBOOT_PCI_STATE_FIRMWARE_DEFERRED 2
+@@ -28,6 +34,13 @@
+ #define MBOOT_PCI_STATE_ACTIVE 4
+ #define MBOOT_PCI_FLAG_CLAIMABLE BIT(0)
+ #define MBOOT_MAX_PCI_DEVICES 256
++#define MBOOT_MAX_ASSIGNED_DEVICES 32
++#define MBOOT_PCI_CONFIG_DWORDS 64
++#define MBOOT_PCI_MAX_BARS 6
++#define MBOOT_PCI_RESOURCE_MMIO 1
++#define MBOOT_PCI_RESOURCE_READABLE BIT(0)
++#define MBOOT_PCI_RESOURCE_WRITABLE BIT(1)
++#define MBOOT_DEVICE_VECTOR 0x42
+ 
+ struct mboot_pci_device_info {
+ 	u16 requester;
+@@ -39,6 +52,27 @@
+ 	u32 flags;
+ };
+ 
++struct mboot_pci_resource {
++	u16 requester;
++	u8 bar_index;
++	u8 kind;
++	u32 flags;
++	u64 guest_address;
++	u64 length;
++	u64 reserved;
++};
++
++struct mboot_pci_frontend {
++	struct mboot_pci_device_info info;
++	struct mboot_pci_resource resources[MBOOT_PCI_MAX_BARS];
++	u32 config[MBOOT_PCI_CONFIG_DWORDS];
++	u8 resource_count;
++};
++
++static struct mboot_pci_frontend mboot_pci_devices[MBOOT_MAX_ASSIGNED_DEVICES];
++static struct resource mboot_pci_bus_windows[256];
++static unsigned int mboot_pci_device_count;
++
+ static u32 __init mboot_detect(void)
+ {
+ 	return hypervisor_cpuid_base(MBOOT_SIGNATURE, 0);
+@@ -110,6 +144,265 @@
+ 	}
+ }
+ 
++static bool __init
++mboot_pci_resource_valid(const struct mboot_pci_resource *resource, u16 requester)
++{
++	return resource->requester == requester &&
++	       resource->bar_index < MBOOT_PCI_MAX_BARS &&
++	       resource->kind == MBOOT_PCI_RESOURCE_MMIO &&
++	       !(resource->flags & ~(MBOOT_PCI_RESOURCE_READABLE |
++				     MBOOT_PCI_RESOURCE_WRITABLE)) &&
++	       resource->flags & MBOOT_PCI_RESOURCE_READABLE &&
++	       !(resource->guest_address & (PAGE_SIZE - 1)) &&
++	       resource->length && !(resource->length & (PAGE_SIZE - 1)) &&
++	       !resource->reserved;
++}
++
++static struct mboot_pci_frontend *mboot_pci_find(unsigned int bus,
++						 unsigned int devfn)
++{
++	u16 requester = bus << 8 | devfn;
++	unsigned int index;
++
++	for (index = 0; index < mboot_pci_device_count; index++)
++		if (mboot_pci_devices[index].info.requester == requester)
++			return &mboot_pci_devices[index];
++	return NULL;
++}
++
++static const struct mboot_pci_resource *
++mboot_pci_resource_for_bar(const struct mboot_pci_frontend *device,
++			   unsigned int dword, bool *high)
++{
++	unsigned int index;
++
++	*high = false;
++	for (index = 0; index < device->resource_count; index++) {
++		const struct mboot_pci_resource *resource = &device->resources[index];
++		u32 low = device->config[PCI_BASE_ADDRESS_0 / 4 +
++					 resource->bar_index];
++
++		if (dword == PCI_BASE_ADDRESS_0 / 4 + resource->bar_index)
++			return resource;
++		if ((low & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
++		    PCI_BASE_ADDRESS_MEM_TYPE_64 &&
++		    dword == PCI_BASE_ADDRESS_0 / 4 + resource->bar_index + 1) {
++			*high = true;
++			return resource;
++		}
++	}
++	return NULL;
++}
++
++static int mboot_pci_config_read(struct pci_bus *bus, unsigned int devfn,
++				 int where, int size, u32 *value)
++{
++	struct mboot_pci_frontend *device;
++	u32 data;
++
++	if (where < 0 || where + size > PCI_CFG_SPACE_SIZE ||
++	    (size != 1 && size != 2 && size != 4) || where & (size - 1))
++		return PCIBIOS_BAD_REGISTER_NUMBER;
++	device = mboot_pci_find(bus->number, devfn);
++	if (!device) {
++		*value = ~0U;
++		return PCIBIOS_DEVICE_NOT_FOUND;
++	}
++	data = device->config[where / 4];
++	data >>= (where & 3) * 8;
++	*value = size == 1 ? data & 0xff : size == 2 ? data & 0xffff : data;
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static int mboot_pci_config_write(struct pci_bus *bus, unsigned int devfn,
++				  int where, int size, u32 value)
++{
++	struct mboot_pci_frontend *device;
++	const struct mboot_pci_resource *resource;
++	unsigned int shift;
++	u32 mask;
++	bool high;
++
++	if (where < 0 || where + size > PCI_CFG_SPACE_SIZE ||
++	    (size != 1 && size != 2 && size != 4) || where & (size - 1))
++		return PCIBIOS_BAD_REGISTER_NUMBER;
++	device = mboot_pci_find(bus->number, devfn);
++	if (!device)
++		return PCIBIOS_DEVICE_NOT_FOUND;
++	resource = mboot_pci_resource_for_bar(device, where / 4, &high);
++	if (size == 4 && !(where & 3) && value == ~0U && resource) {
++		u64 bar_mask = ~(resource->length - 1);
++
++		device->config[where / 4] = high ? bar_mask >> 32 :
++			(bar_mask & PCI_BASE_ADDRESS_MEM_MASK) |
++			(device->config[where / 4] & ~PCI_BASE_ADDRESS_MEM_MASK);
++		return PCIBIOS_SUCCESSFUL;
++	}
++	shift = (where & 3) * 8;
++	mask = size == 1 ? 0xff : size == 2 ? 0xffff : ~0U;
++	device->config[where / 4] &= ~(mask << shift);
++	device->config[where / 4] |= (value & mask) << shift;
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static struct pci_ops mboot_pci_ops = {
++	.read = mboot_pci_config_read,
++	.write = mboot_pci_config_write,
++};
++
++static int __init mboot_pci_load_config(struct mboot_pci_frontend *device)
++{
++	unsigned int offset;
++
++	for (offset = 0; offset < PCI_CFG_SPACE_SIZE; offset += 4) {
++		unsigned long value;
++
++		value = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_CONFIG_READ,
++					device->info.requester, offset, 0);
++		if (value == MBOOT_HYPERCALL_INVALID_ARGUMENT || value > U32_MAX)
++			return -EIO;
++		device->config[offset / 4] = value;
++	}
++	return 0;
++}
++
++static int __init mboot_pci_load_resources(struct mboot_pci_frontend *device)
++{
++	unsigned int index;
++
++	BUILD_BUG_ON(sizeof(struct mboot_pci_resource) != 32);
++	for (index = 0; index < MBOOT_PCI_MAX_BARS; index++) {
++		struct mboot_pci_resource *resource = &device->resources[index];
++		unsigned long result;
++		u32 attributes;
++
++		memset(resource, 0, sizeof(*resource));
++		result = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_RESOURCE_QUERY,
++					 device->info.requester, index,
++					 virt_to_phys(resource));
++		if (result == MBOOT_HYPERCALL_INVALID_ARGUMENT)
++			break;
++		if (result ||
++		    !mboot_pci_resource_valid(resource, device->info.requester))
++			return -EIO;
++		attributes = device->config[PCI_BASE_ADDRESS_0 / 4 +
++					    resource->bar_index] &
++			     ~PCI_BASE_ADDRESS_MEM_MASK;
++		device->config[PCI_BASE_ADDRESS_0 / 4 + resource->bar_index] =
++			(resource->guest_address & PCI_BASE_ADDRESS_MEM_MASK) |
++			attributes;
++		if ((attributes & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
++		    PCI_BASE_ADDRESS_MEM_TYPE_64)
++			device->config[PCI_BASE_ADDRESS_0 / 4 +
++				       resource->bar_index + 1] =
++				resource->guest_address >> 32;
++	}
++	device->resource_count = index;
++	return index ? 0 : -ENODEV;
++}
++
++static int __init mboot_pci_scan_bus(unsigned int bus_number)
++{
++	struct pci_bus *bus;
++	struct resource *window = &mboot_pci_bus_windows[bus_number];
++	struct pci_sysdata *sysdata;
++	unsigned int index;
++	LIST_HEAD(resources);
++
++	sysdata = kzalloc(sizeof(*sysdata), GFP_KERNEL);
++	if (!sysdata)
++		return -ENOMEM;
++	sysdata->node = x86_pci_root_bus_node(bus_number);
++
++	for (index = 0; index < mboot_pci_device_count; index++) {
++		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
++		unsigned int resource_index;
++
++		if (device->info.requester >> 8 != bus_number)
++			continue;
++		for (resource_index = 0;
++		     resource_index < device->resource_count; resource_index++) {
++			const struct mboot_pci_resource *resource =
++				&device->resources[resource_index];
++			resource_size_t end = resource->guest_address +
++					      resource->length - 1;
++
++			if (!window->flags || resource->guest_address < window->start)
++				window->start = resource->guest_address;
++			if (!window->flags || end > window->end)
++				window->end = end;
++			window->flags = IORESOURCE_MEM | IORESOURCE_PCI_FIXED;
++			window->name = "mBoot PCI MMIO";
++		}
++	}
++	if (!window->flags) {
++		kfree(sysdata);
++		return -ENODEV;
++	}
++	pci_add_resource(&resources, window);
++	bus = pci_scan_root_bus(NULL, bus_number, &mboot_pci_ops, sysdata,
++				&resources);
++	if (!bus) {
++		pci_free_resource_list(&resources);
++		kfree(sysdata);
++		return -ENOMEM;
++	}
++	return 0;
++}
++
++static int __init mboot_pci_publish_frontend(void)
++{
++	unsigned int active = 0;
++	unsigned int resource_count = 0;
++	unsigned int index;
++	u8 last_bus = 0xff;
++
++	for (index = 0; index < mboot_pci_device_count; index++) {
++		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
++		u8 bus = device->info.requester >> 8;
++
++		if (bus != last_bus && mboot_pci_scan_bus(bus))
++			return -EIO;
++		last_bus = bus;
++	}
++	for (index = 0; index < mboot_pci_device_count; index++) {
++		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
++		struct pci_dev *pdev;
++		unsigned int resource_index;
++		unsigned long result;
++		u8 bus = device->info.requester >> 8;
++		u8 devfn = device->info.requester & 0xff;
++
++		pdev = pci_get_domain_bus_and_slot(0, bus, devfn);
++		if (!pdev)
++			return -ENODEV;
++		for (resource_index = 0;
++		     resource_index < device->resource_count; resource_index++) {
++			const struct mboot_pci_resource *resource =
++				&device->resources[resource_index];
++			struct resource *linux_resource =
++				&pdev->resource[resource->bar_index];
++
++			if (linux_resource->start != resource->guest_address ||
++			    resource_size(linux_resource) != resource->length) {
++				pci_dev_put(pdev);
++				return -EIO;
++			}
++			resource_count++;
++		}
++		pci_dev_put(pdev);
++		result = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_ACTIVATE,
++					 device->info.requester,
++					 MBOOT_DEVICE_VECTOR, 0);
++		if (result)
++			return -EIO;
++		active++;
++	}
++	pr_info("mDriver: mBoot PCI frontend ready: %u devices, %u resources, %u active\n",
++		mboot_pci_device_count, resource_count, active);
++	return 0;
++}
++
+ static int __init mboot_query_and_claim_devices(void)
+ {
+ 	struct mboot_pci_device_info *info;
+@@ -160,6 +453,17 @@
+ 			kfree(info);
+ 			return -EIO;
+ 		}
++		if (mboot_pci_device_count == MBOOT_MAX_ASSIGNED_DEVICES) {
++			kfree(info);
++			return -ENOSPC;
++		}
++		mboot_pci_devices[mboot_pci_device_count].info = *info;
++		if (mboot_pci_load_config(&mboot_pci_devices[mboot_pci_device_count]) ||
++		    mboot_pci_load_resources(&mboot_pci_devices[mboot_pci_device_count])) {
++			kfree(info);
++			return -EIO;
++		}
++		mboot_pci_device_count++;
+ 		claimed++;
+ 	}
+ 
+@@ -175,6 +479,8 @@
+ 
+ 	if (mboot_query_and_claim_devices())
+ 		return -EIO;
++	if (mboot_pci_device_count && mboot_pci_publish_frontend())
++		return -EIO;
+ 	result = mboot_hypercall(MBOOT_HYPERCALL_READY, 0, 0, 0);
+ 
+ 	if (result)
+
