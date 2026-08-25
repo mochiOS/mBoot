@@ -34,6 +34,7 @@ cleanup() {
 trap cleanup EXIT
 cp "$OVMF_VARS" "$WORK/OVMF_VARS.fd"
 cp --sparse=always "$IMAGE" "$WORK/mdriver.iso"
+truncate -s 1M "$WORK/device.img"
 
 "$QEMU" \
     -accel "$ACCEL" \
@@ -45,7 +46,10 @@ cp --sparse=always "$IMAGE" "$WORK/mdriver.iso"
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd" \
     -drive "if=none,id=disk,format=raw,file=$WORK/mdriver.iso" \
-    -device virtio-blk-pci,drive=disk,bootindex=1 \
+    -device virtio-blk-pci,drive=disk,addr=0x2,bootindex=1 \
+    -drive "if=none,id=device,format=raw,file=$WORK/device.img" \
+    -device virtio-blk-pci,drive=device,addr=0x3,disable-legacy=on,iommu_platform=on \
+    -device amd-iommu,dma-remap=on \
     -display none \
     -monitor none \
     -serial "file:$WORK/serial.log" \
@@ -56,8 +60,10 @@ QEMU_PID=$!
 
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
     if grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null \
+        && grep -Eq 'mDriver: mBoot PCI inventory ready: [0-9]+ devices, 1 claimed' "$WORK/serial.log" 2>/dev/null \
+        && grep -Fq 'PCI requester 0018 mapped for DMA and claimed-disabled by Hardware Domain 2' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq '[mBoot] Hardware Domain 2 ready' "$WORK/serial.log" 2>/dev/null; then
-        grep -E '\[mBoot\]|mDriver OK|Linux version' "$WORK/serial.log"
+        grep -E '\[mBoot\]|mDriver: mBoot PCI|mDriver OK|Linux version|PCI requester 0018' "$WORK/serial.log"
         echo 'test-mdriver: PASS'
         exit 0
     fi
@@ -66,5 +72,5 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
 done
 
 sed -n '1,240p' "$WORK/serial.log" >&2
-echo 'test-mdriver: mDriver did not complete init and its Ready hypercall' >&2
+echo 'test-mdriver: mDriver did not claim its assigned device and report Ready' >&2
 exit 1

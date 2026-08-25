@@ -19,6 +19,13 @@ required = true
 restart = "never"
 max_restarts = 0
 
+[[devices]]
+segment = 0
+requester = 0x18
+kind = "block"
+domain = 2
+required = true
+
 [[domains]]
 id = 2
 role = "hardware"

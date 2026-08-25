@@ -20,6 +20,7 @@ const PVH_COMMAND_LINE_GPA: u64 = 0x40c0;
 const PVH_COMMAND_LINE_LIMIT: usize = 1024;
 const XEN_HVM_START_MAGIC_VALUE: u32 = 0x336e_c578;
 const XEN_HVM_MEMMAP_TYPE_RAM: u32 = 1;
+const XEN_HVM_MEMMAP_TYPE_RESERVED: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuestImage {
@@ -179,14 +180,21 @@ pub unsafe fn load_linux_pvh(
     initramfs: Option<&[u8]>,
     command_line: &str,
     rsdp: u64,
+    usable_memory_size: u64,
     memory: &NestedPageTable,
 ) -> Result<GuestImage, Error> {
     if command_line.len() + 1 > PVH_COMMAND_LINE_LIMIT || !command_line.is_ascii() {
         return Err(Error::InvalidImage);
     }
+    if usable_memory_size < MINIMUM_LOAD_GPA
+        || usable_memory_size & 0xfff != 0
+        || usable_memory_size >= memory.guest_memory_size()
+    {
+        return Err(Error::InvalidImage);
+    }
     let header = elf_header(kernel)?;
     let entry = pvh_entry(kernel, header)?;
-    if entry < MINIMUM_LOAD_GPA || entry >= memory.guest_memory_size() {
+    if entry < MINIMUM_LOAD_GPA || entry >= usable_memory_size {
         return Err(Error::ImageTooLarge);
     }
 
@@ -207,6 +215,13 @@ pub unsafe fn load_linux_pvh(
         let source = kernel
             .get(source_start..source_end)
             .ok_or(Error::InvalidImage)?;
+        let segment_end = segment
+            .physical_address
+            .checked_add(segment.memory_size)
+            .ok_or(Error::InvalidImage)?;
+        if segment_end > usable_memory_size {
+            return Err(Error::ImageTooLarge);
+        }
         let destination = memory
             .guest_host_address(segment.physical_address, segment.memory_size)
             .ok_or(Error::ImageTooLarge)?;
@@ -214,12 +229,7 @@ pub unsafe fn load_linux_pvh(
             write_bytes(destination as *mut u8, 0, segment.memory_size as usize);
             copy_nonoverlapping(source.as_ptr(), destination as *mut u8, source.len());
         }
-        load_end = load_end.max(
-            segment
-                .physical_address
-                .checked_add(segment.memory_size)
-                .ok_or(Error::InvalidImage)?,
-        );
+        load_end = load_end.max(segment_end);
         loaded = true;
     }
     if !loaded {
@@ -229,6 +239,12 @@ pub unsafe fn load_linux_pvh(
     let mut module = HvmModule::default();
     if let Some(initramfs) = initramfs {
         let address = align_up(load_end, 4096).ok_or(Error::ImageTooLarge)?;
+        if address
+            .checked_add(initramfs.len() as u64)
+            .is_none_or(|end| end > usable_memory_size)
+        {
+            return Err(Error::ImageTooLarge);
+        }
         let destination = memory
             .guest_host_address(address, initramfs.len() as u64)
             .ok_or(Error::ImageTooLarge)?;
@@ -251,12 +267,20 @@ pub unsafe fn load_linux_pvh(
             .add(command_line.len())
             .write(0);
     }
-    let memory_map = HvmMemoryMapEntry {
-        addr: 0,
-        size: memory.guest_memory_size(),
-        kind: XEN_HVM_MEMMAP_TYPE_RAM,
-        reserved: 0,
-    };
+    let memory_map = [
+        HvmMemoryMapEntry {
+            addr: 0,
+            size: usable_memory_size,
+            kind: XEN_HVM_MEMMAP_TYPE_RAM,
+            reserved: 0,
+        },
+        HvmMemoryMapEntry {
+            addr: usable_memory_size,
+            size: memory.guest_memory_size() - usable_memory_size,
+            kind: XEN_HVM_MEMMAP_TYPE_RESERVED,
+            reserved: 0,
+        },
+    ];
     write_guest_struct(memory, PVH_MEMORY_MAP_GPA, &memory_map)?;
     let start_info = HvmStartInfo {
         magic: XEN_HVM_START_MAGIC_VALUE,
@@ -271,7 +295,7 @@ pub unsafe fn load_linux_pvh(
         cmdline_paddr: PVH_COMMAND_LINE_GPA,
         rsdp_paddr: rsdp,
         memmap_paddr: PVH_MEMORY_MAP_GPA,
-        memmap_entries: 1,
+        memmap_entries: memory_map.len() as u32,
         reserved: 0,
     };
     write_guest_struct(memory, PVH_START_INFO_GPA, &start_info)?;
@@ -491,6 +515,7 @@ mod tests {
                 Some(b"initramfs"),
                 "console=ttyS0",
                 0x1234,
+                guest.0.len() as u64 - 2 * 4096,
                 &memory,
             )
         }
@@ -510,7 +535,19 @@ mod tests {
         assert_eq!(start_info.magic, XEN_HVM_START_MAGIC_VALUE);
         assert_eq!(start_info.nr_modules, 1);
         assert_eq!(start_info.rsdp_paddr, 0x1234);
-        assert_eq!(start_info.memmap_entries, 1);
+        assert_eq!(start_info.memmap_entries, 2);
+        let memory_map: [HvmMemoryMapEntry; 2] = unsafe {
+            guest
+                .0
+                .as_ptr()
+                .add(PVH_MEMORY_MAP_GPA as usize)
+                .cast::<[HvmMemoryMapEntry; 2]>()
+                .read_unaligned()
+        };
+        assert_eq!(memory_map[0].size, guest.0.len() as u64 - 2 * 4096);
+        assert_eq!(memory_map[0].kind, XEN_HVM_MEMMAP_TYPE_RAM);
+        assert_eq!(memory_map[1].size, 2 * 4096);
+        assert_eq!(memory_map[1].kind, XEN_HVM_MEMMAP_TYPE_RESERVED);
     }
 
     fn write_test_struct<T: Copy>(bytes: &mut [u8], offset: usize, value: &T) {

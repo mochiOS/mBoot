@@ -1,0 +1,176 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/mboot: query and claim assigned PCI devices
+
+Discover the PCI inventory through mBoot instead of accessing physical
+configuration space. Claim only devices marked by the signed launch policy.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+ arch/x86/kernel/cpu/mboot.c | 116 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 112 insertions(+), 4 deletions(-)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -1,10 +1,16 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /* mBoot hypervisor detection support. */
+ 
++#include <linux/bits.h>
++#include <linux/build_bug.h>
++#include <linux/errno.h>
+ #include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/string.h>
+ 
+ #include <asm/apic.h>
+ #include <asm/cpufeature.h>
++#include <asm/io.h>
+ #include <asm/cpuid.h>
+ #include <asm/hypervisor.h>
+ #include <asm/mpspec.h>
+@@ -13,6 +19,25 @@
+ #define MBOOT_BACKEND_INTEL_VMX 1
+ #define MBOOT_BACKEND_AMD_SVM 2
+ #define MBOOT_HYPERCALL_READY 3
++#define MBOOT_HYPERCALL_DEVICE_QUERY 16
++#define MBOOT_HYPERCALL_DEVICE_CLAIM 17
++#define MBOOT_HYPERCALL_INVALID_ARGUMENT (~0UL - 1)
++#define MBOOT_PCI_STATE_QUARANTINED 1
++#define MBOOT_PCI_STATE_FIRMWARE_DEFERRED 2
++#define MBOOT_PCI_STATE_CLAIMED_DISABLED 3
++#define MBOOT_PCI_STATE_ACTIVE 4
++#define MBOOT_PCI_FLAG_CLAIMABLE BIT(0)
++#define MBOOT_MAX_PCI_DEVICES 256
++
++struct mboot_pci_device_info {
++	u16 requester;
++	u8 class;
++	u8 subclass;
++	u8 state;
++	u8 reserved[3];
++	u32 owner_domain;
++	u32 flags;
++};
+ 
+ static u32 __init mboot_detect(void)
+ {
+@@ -40,7 +65,9 @@
+ 	return ecx;
+ }
+ 
+-static unsigned long mboot_hypercall(unsigned long number)
++static unsigned long mboot_hypercall(unsigned long number,
++				     unsigned long arg0, unsigned long arg1,
++				     unsigned long arg2)
+ {
+ 	unsigned long result = number;
+ 
+@@ -48,13 +75,13 @@
+ 	case MBOOT_BACKEND_INTEL_VMX:
+ 		asm volatile("vmcall"
+ 			     : "+a" (result)
+-			     : "D" (0UL), "S" (0UL), "d" (0UL)
++			     : "D" (arg0), "S" (arg1), "d" (arg2)
+ 			     : "memory");
+ 		break;
+ 	case MBOOT_BACKEND_AMD_SVM:
+ 		asm volatile("vmmcall"
+ 			     : "+a" (result)
+-			     : "D" (0UL), "S" (0UL), "d" (0UL)
++			     : "D" (arg0), "S" (arg1), "d" (arg2)
+ 			     : "memory");
+ 		break;
+ 	default:
+@@ -64,9 +91,91 @@
+ 	return result;
+ }
+ 
++static bool __init mboot_pci_info_valid(const struct mboot_pci_device_info *info)
++{
++	if (memchr_inv(info->reserved, 0, sizeof(info->reserved)) ||
++	    info->flags & ~MBOOT_PCI_FLAG_CLAIMABLE)
++		return false;
++
++	switch (info->state) {
++	case MBOOT_PCI_STATE_QUARANTINED:
++		return !info->owner_domain;
++	case MBOOT_PCI_STATE_FIRMWARE_DEFERRED:
++		return !info->owner_domain && !info->flags;
++	case MBOOT_PCI_STATE_CLAIMED_DISABLED:
++	case MBOOT_PCI_STATE_ACTIVE:
++		return info->owner_domain && !info->flags;
++	default:
++		return false;
++	}
++}
++
++static int __init mboot_query_and_claim_devices(void)
++{
++	struct mboot_pci_device_info *info;
++	unsigned int claimed = 0;
++	unsigned int index;
++
++	BUILD_BUG_ON(sizeof(*info) != 16);
++	info = kzalloc(sizeof(*info), GFP_KERNEL);
++	if (!info)
++		return -ENOMEM;
++	for (index = 0; index < MBOOT_MAX_PCI_DEVICES; index++) {
++		unsigned long result;
++
++		memset(info, 0, sizeof(*info));
++		result = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_QUERY, index,
++					 virt_to_phys(info), sizeof(*info));
++		if (result == MBOOT_HYPERCALL_INVALID_ARGUMENT)
++			break;
++		if (result || !mboot_pci_info_valid(info)) {
++			pr_err("mDriver: invalid PCI inventory entry %u\n", index);
++			kfree(info);
++			return -EIO;
++		}
++
++		pr_info("mDriver: PCI %02x:%02x.%u class %02x:%02x state %u%s\n",
++			info->requester >> 8, (info->requester >> 3) & 0x1f,
++			info->requester & 0x7, info->class, info->subclass, info->state,
++			info->flags & MBOOT_PCI_FLAG_CLAIMABLE ? " claimable" : "");
++		if (!(info->flags & MBOOT_PCI_FLAG_CLAIMABLE))
++			continue;
++
++		result = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_CLAIM,
++					 info->requester, 0, 0);
++		if (result) {
++			pr_err("mDriver: PCI requester %04x claim failed: %lu\n",
++			       info->requester, result);
++			kfree(info);
++			return -EIO;
++		}
++
++		memset(info, 0, sizeof(*info));
++		result = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_QUERY, index,
++					 virt_to_phys(info), sizeof(*info));
++		if (result || !mboot_pci_info_valid(info) ||
++		    info->state != MBOOT_PCI_STATE_CLAIMED_DISABLED) {
++			pr_err("mDriver: PCI entry %u did not enter claimed-disabled\n",
++			       index);
++			kfree(info);
++			return -EIO;
++		}
++		claimed++;
++	}
++
++	pr_info("mDriver: mBoot PCI inventory ready: %u devices, %u claimed\n",
++		index, claimed);
++	kfree(info);
++	return 0;
++}
++
+ static int __init mboot_report_ready(void)
+ {
+-	unsigned long result = mboot_hypercall(MBOOT_HYPERCALL_READY);
++	unsigned long result;
++
++	if (mboot_query_and_claim_devices())
++		return -EIO;
++	result = mboot_hypercall(MBOOT_HYPERCALL_READY, 0, 0, 0);
+ 
+ 	if (result)
+ 		pr_err("mDriver: mBoot Ready hypercall failed: %lu\n", result);

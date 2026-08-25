@@ -609,6 +609,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     prepared.initramfs.as_deref(),
                     &prepared.command_line,
                     0,
+                    device_window_start(&nested),
                     &nested,
                 ),
             }
@@ -1780,6 +1781,7 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
                 runtime.initramfs.as_deref(),
                 &runtime.command_line,
                 0,
+                device_window_start(runtime.domain.nested_pages()),
                 runtime.domain.nested_pages(),
             ),
         }
