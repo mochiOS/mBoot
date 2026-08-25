@@ -179,6 +179,15 @@ impl GrantTable {
             .any(|grant| grant.owner == domain || grant.target == domain)
     }
 
+    pub fn query_target(&self, target: DomainId, ordinal: usize) -> Option<GrantRef> {
+        self.grants
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.grant.is_some_and(|grant| grant.target == target))
+            .nth(ordinal)
+            .map(|(index, slot)| GrantRef((slot.generation << 8) | (index + 1) as u32))
+    }
+
     pub fn cleanup_domain(&mut self, domain: DomainId) -> [Option<GrantMapping>; MAX_GRANTS] {
         self.cleanup_domain_inner(domain, false)
     }
@@ -288,6 +297,20 @@ mod tests {
             table.map(target, reference, 0x9000),
             Err(GrantError::UnknownGrant)
         );
+    }
+
+    #[test]
+    fn target_discovers_only_its_own_grants() {
+        let mut table = GrantTable::new();
+        let owner = DomainId::new(1);
+        let target = DomainId::new(2);
+        let first = table.create(owner, target, 0x8000, true).unwrap();
+        let other = table.create(owner, DomainId::new(3), 0x9000, true).unwrap();
+        let second = table.create(owner, target, 0xa000, false).unwrap();
+        assert_eq!(table.query_target(target, 0), Some(first));
+        assert_eq!(table.query_target(target, 1), Some(second));
+        assert_eq!(table.query_target(target, 2), None);
+        assert_eq!(table.query_target(DomainId::new(3), 0), Some(other));
     }
 
     #[test]

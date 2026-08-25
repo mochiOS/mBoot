@@ -2,7 +2,7 @@ use crate::CpuidResult;
 
 pub const MAX_BASIC_LEAF: u32 = 0x0b;
 pub const MAX_EXTENDED_LEAF: u32 = 0x8000_0008;
-pub const MAX_HYPERVISOR_LEAF: u32 = 0x4000_0001;
+pub const MAX_HYPERVISOR_LEAF: u32 = 0x4000_0002;
 
 const CPU_VENDOR: [u8; 12] = *b"MochiOS CPU ";
 const HYPERVISOR_VENDOR: [u8; 12] = *b"MochiOSmBoot";
@@ -35,6 +35,8 @@ pub fn query(
     vcpu_count: u32,
     tsc_frequency_khz: u32,
     hypervisor_backend: u32,
+    grant_window_start: u64,
+    grant_window_size: u64,
 ) -> CpuidResult {
     match leaf {
         0 => vendor_leaf(MAX_BASIC_LEAF, CPU_VENDOR, false),
@@ -52,6 +54,13 @@ pub fn query(
             ebx: tsc_frequency_khz,
             ecx: hypervisor_backend,
             ..CpuidResult::default()
+        },
+        // Domain-local Grant window. Values are guest physical addresses.
+        0x4000_0002 => CpuidResult {
+            eax: grant_window_start as u32,
+            ebx: (grant_window_start >> 32) as u32,
+            ecx: grant_window_size as u32,
+            edx: (grant_window_size >> 32) as u32,
         },
         0x8000_0000 => CpuidResult {
             eax: MAX_EXTENDED_LEAF,
@@ -136,15 +145,38 @@ fn brand_leaf(leaf: u32) -> CpuidResult {
 mod tests {
     use super::*;
 
+    fn test_query(
+        leaf: u32,
+        subleaf: u32,
+        apic_id: u32,
+        vcpu_count: u32,
+        tsc_frequency_khz: u32,
+        hypervisor_backend: u32,
+    ) -> CpuidResult {
+        query(
+            leaf,
+            subleaf,
+            apic_id,
+            vcpu_count,
+            tsc_frequency_khz,
+            hypervisor_backend,
+            0x3ff_0000,
+            0x1_0000,
+        )
+    }
+
     #[test]
     fn hides_nested_virtualization_and_identifies_mboot() {
-        let features = query(1, 0, 0, 1, 2_400_000, 1);
+        let features = test_query(1, 0, 0, 1, 2_400_000, 1);
         assert_eq!(features.ecx & (1 << 5), 0);
         assert_ne!(features.ecx & LEAF1_ECX_HYPERVISOR, 0);
         assert_ne!(features.ecx & LEAF1_ECX_X2APIC, 0);
-        assert_eq!(query(0x8000_0001, 0, 0, 1, 2_400_000, 1).ecx & (1 << 2), 0);
+        assert_eq!(
+            test_query(0x8000_0001, 0, 0, 1, 2_400_000, 1).ecx & (1 << 2),
+            0
+        );
 
-        let vendor = query(0x4000_0000, 0, 0, 1, 2_400_000, 1);
+        let vendor = test_query(0x4000_0000, 0, 0, 1, 2_400_000, 1);
         let bytes = [vendor.ebx, vendor.ecx, vendor.edx]
             .map(u32::to_le_bytes)
             .concat();
@@ -153,7 +185,7 @@ mod tests {
 
     #[test]
     fn reports_domain_topology_instead_of_host_topology() {
-        let leaf = query(0x0b, 1, 3, 4, 2_400_000, 1);
+        let leaf = test_query(0x0b, 1, 3, 4, 2_400_000, 1);
         assert_eq!(leaf.eax, 2);
         assert_eq!(leaf.ebx, 4);
         assert_eq!(leaf.edx, 3);
@@ -162,16 +194,26 @@ mod tests {
     #[test]
     fn unsupported_leaves_are_empty() {
         assert_eq!(
-            query(0x1234_5678, 0, 0, 1, 2_400_000, 1),
+            test_query(0x1234_5678, 0, 0, 1, 2_400_000, 1),
             CpuidResult::default()
         );
-        assert_eq!(query(7, 0, 0, 1, 2_400_000, 1), CpuidResult::default());
+        assert_eq!(test_query(7, 0, 0, 1, 2_400_000, 1), CpuidResult::default());
     }
 
     #[test]
     fn reports_the_virtual_tsc_frequency_to_guests() {
-        let leaf = query(0x4000_0001, 0, 0, 1, 2_400_000, 2);
+        let leaf = test_query(0x4000_0001, 0, 0, 1, 2_400_000, 2);
         assert_eq!(leaf.ebx, 2_400_000);
         assert_eq!(leaf.ecx, 2);
+    }
+
+    #[test]
+    fn reports_the_domain_grant_window() {
+        let leaf = test_query(0x4000_0002, 0, 0, 1, 2_400_000, 2);
+        assert_eq!(
+            u64::from(leaf.eax) | (u64::from(leaf.ebx) << 32),
+            0x3ff_0000
+        );
+        assert_eq!(u64::from(leaf.ecx) | (u64::from(leaf.edx) << 32), 0x1_0000);
     }
 }

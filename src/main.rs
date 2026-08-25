@@ -949,6 +949,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
                     BackendKind::AmdSvm => HYPERVISOR_BACKEND_AMD_SVM,
                 },
+                grant_window_start(runtime.domain.nested_pages()),
+                GRANT_WINDOW_PAGES as u64 * 4096,
             );
             runtime.resume_kind = ResumeKind::Cpuid(result);
             continue;
@@ -1294,6 +1296,20 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                         u64::from(reference.get())
                     }),
                 _ => HYPERCALL_INVALID_ARGUMENT,
+            };
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::GrantQuery as u64 {
+            let target = runtime_domains[index].domain.id();
+            runtime_domains[index].pending_result = if vm_exit.arg1 == 0 && vm_exit.arg2 == 0 {
+                usize::try_from(vm_exit.arg0)
+                    .ok()
+                    .and_then(|ordinal| grants.query_target(target, ordinal))
+                    .map_or(HYPERCALL_INVALID_ARGUMENT, |reference| {
+                        u64::from(reference.get())
+                    })
+            } else {
+                HYPERCALL_INVALID_ARGUMENT
             };
             continue;
         }

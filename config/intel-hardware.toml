@@ -31,6 +31,12 @@ port_a = 2
 domain_b = 2
 port_b = 2
 
+[[channels]]
+domain_a = 1
+port_a = 3
+domain_b = 2
+port_b = 3
+
 [[domains]]
 id = 2
 role = "hardware"
