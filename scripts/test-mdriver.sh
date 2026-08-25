@@ -63,12 +63,13 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
         && grep -Fq 'mDriver block IRQ OK' "$WORK/serial.log" 2>/dev/null \
         && grep -Eq 'mDriver: mBoot PCI inventory ready: [0-9]+ devices, 1 claimed' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'PCI requester 0018 mapped for DMA and claimed-disabled by Hardware Domain 2' "$WORK/serial.log" 2>/dev/null \
-        && grep -Eq 'mDriver: PCI requester 0018 uses IRQ [0-9]+ vector 0x[0-9a-f]+' "$WORK/serial.log" 2>/dev/null \
+        && grep -Eq 'mDriver: PCI requester 0018 uses config IRQ [0-9]+ vector 0x[0-9a-f]+, queue IRQ [0-9]+ vector 0x[0-9a-f]+' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver: mBoot PCI frontend ready: 1 devices, 2 resources, 1 active' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq '[mBoot] Hardware Domain 2 ready' "$WORK/serial.log" 2>/dev/null; then
-        linux_vector=$(sed -n 's/.*mDriver: PCI requester 0018 uses IRQ [0-9][0-9]* vector \(0x[0-9a-f][0-9a-f]*\).*/\1/p' "$WORK/serial.log" | head -n 1)
-        if [[ -n $linux_vector ]] \
-            && grep -Fq "PCI requester 0018 active: host IRQ 0x50 -> Domain 2 vector $linux_vector" "$WORK/serial.log"; then
+        config_vector=$(sed -n 's/.*uses config IRQ [0-9][0-9]* vector \(0x[0-9a-f][0-9a-f]*\), queue IRQ.*/\1/p' "$WORK/serial.log" | head -n 1)
+        queue_vector=$(sed -n 's/.*queue IRQ [0-9][0-9]* vector \(0x[0-9a-f][0-9a-f]*\).*/\1/p' "$WORK/serial.log" | head -n 1)
+        if [[ -n $config_vector && -n $queue_vector ]] \
+            && grep -Fq "PCI requester 0018 active: config IRQ 0x50 -> Domain 2 vector $config_vector, queue IRQ 0x51 -> vector $queue_vector" "$WORK/serial.log"; then
             grep -E '\[mBoot\]|mDriver: mBoot PCI|mDriver (block IRQ )?OK|Linux version|PCI requester 0018|virtio_blk| vda' "$WORK/serial.log"
             echo 'test-mdriver: PASS'
             exit 0

@@ -1,0 +1,224 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/mboot: separate config and queue interrupts
+
+Give each assigned PCI device two Linux IRQs. The first IRQ carries virtio
+configuration changes and the second carries completion notifications for
+all virtqueues. Pass both guest vectors to mBoot so that it can program and
+route two physical MSI-X table entries without conflating the callbacks.
+
+Keep physical MSI-X ownership in mBoot. Linux only selects the table-entry
+indices exposed by the synthetic virtio PCI frontend.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -71,7 +71,7 @@
+ 	struct mboot_pci_resource resources[MBOOT_PCI_MAX_BARS];
+ 	u32 config[MBOOT_PCI_CONFIG_DWORDS];
+ 	u8 resource_count;
+-	int irq;
++	int irqs[2];
+ };
+ 
+ static struct mboot_pci_frontend mboot_pci_devices[MBOOT_MAX_ASSIGNED_DEVICES];
+@@ -112,23 +112,31 @@
+ 				  void *arg)
+ {
+ 	struct irq_alloc_info *info = arg;
++	unsigned int index;
+ 	int ret;
+ 
+-	if (nr_irqs != 1 || !info || info->type != X86_IRQ_ALLOC_TYPE_MBOOT)
++	if (nr_irqs != ARRAY_SIZE(mboot_pci_devices[0].irqs) || !info ||
++	    info->type != X86_IRQ_ALLOC_TYPE_MBOOT)
+ 		return -EINVAL;
+ 	ret = irq_domain_alloc_irqs_parent(domain, virq, nr_irqs, arg);
+ 	if (ret)
+ 		return ret;
+-	irq_set_status_flags(virq, IRQ_NO_BALANCING);
+-	irq_domain_set_info(domain, virq, info->hwirq, &mboot_irq_chip,
+-			    info->data, handle_edge_irq, NULL, "edge");
++	for (index = 0; index < nr_irqs; index++) {
++		irq_set_status_flags(virq + index, IRQ_NO_BALANCING);
++		irq_domain_set_info(domain, virq + index, info->hwirq + index,
++				    &mboot_irq_chip, info->data, handle_edge_irq,
++				    NULL, "edge");
++	}
+ 	return 0;
+ }
+ 
+ static void mboot_irq_domain_free(struct irq_domain *domain,
+ 				  unsigned int virq, unsigned int nr_irqs)
+ {
+-	irq_clear_status_flags(virq, IRQ_NO_BALANCING);
++	unsigned int index;
++
++	for (index = 0; index < nr_irqs; index++)
++		irq_clear_status_flags(virq + index, IRQ_NO_BALANCING);
+ 	irq_domain_free_irqs_top(domain, virq, nr_irqs);
+ }
+ 
+@@ -162,9 +170,10 @@
+ 		return -ENOMEM;
+ 	init_irq_alloc_info(&info, cpumask_of(0));
+ 	info.type = X86_IRQ_ALLOC_TYPE_MBOOT;
+-	info.hwirq = device->info.requester;
++	info.hwirq = device->info.requester * ARRAY_SIZE(device->irqs);
+ 	info.data = device;
+-	return irq_domain_alloc_irqs(mboot_irq_domain, 1, NUMA_NO_NODE, &info);
++	return irq_domain_alloc_irqs(mboot_irq_domain, ARRAY_SIZE(device->irqs),
++				     NUMA_NO_NODE, &info);
+ }
+ 
+ static u32 __init mboot_detect(void)
+@@ -464,7 +473,8 @@
+ 	for (index = 0; index < mboot_pci_device_count; index++) {
+ 		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+ 		struct pci_dev *pdev;
+-		struct irq_cfg *cfg;
++		struct irq_cfg *config_cfg;
++		struct irq_cfg *queue_cfg;
+ 		unsigned int resource_index;
+ 		unsigned long result;
+ 		u8 bus = device->info.requester >> 8;
+@@ -473,18 +483,23 @@
+ 		pdev = pci_get_domain_bus_and_slot(0, bus, devfn);
+ 		if (!pdev)
+ 			return -ENODEV;
+-		device->irq = mboot_irq_alloc(device);
+-		if (device->irq < 0) {
++		device->irqs[0] = mboot_irq_alloc(device);
++		if (device->irqs[0] < 0) {
+ 			pci_dev_put(pdev);
+-			return device->irq;
++			return device->irqs[0];
+ 		}
+-		cfg = irq_cfg(device->irq);
+-		if (!cfg || cfg->vector > 0xff) {
++		device->irqs[1] = device->irqs[0] + 1;
++		config_cfg = irq_cfg(device->irqs[0]);
++		queue_cfg = irq_cfg(device->irqs[1]);
++		if (!config_cfg || !queue_cfg || config_cfg->vector > 0xff ||
++		    queue_cfg->vector > 0xff ||
++		    config_cfg->vector == queue_cfg->vector) {
+ 			pci_dev_put(pdev);
+-			irq_domain_free_irqs(device->irq, 1);
++			irq_domain_free_irqs(device->irqs[0],
++					     ARRAY_SIZE(device->irqs));
+ 			return -EIO;
+ 		}
+-		pdev->irq = device->irq;
++		pdev->irq = device->irqs[0];
+ 		for (resource_index = 0;
+ 		     resource_index < device->resource_count; resource_index++) {
+ 			const struct mboot_pci_resource *resource =
+@@ -501,16 +516,22 @@
+ 		}
+ 		pci_dev_put(pdev);
+ 		result = mboot_hypercall(MBOOT_HYPERCALL_IRQ_MASK,
+-					 cfg->vector, 1, 0);
++					 config_cfg->vector, 1, 0);
++		if (result)
++			return -EIO;
++		result = mboot_hypercall(MBOOT_HYPERCALL_IRQ_MASK,
++					 queue_cfg->vector, 1, 0);
+ 		if (result)
+ 			return -EIO;
+ 		result = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_ACTIVATE,
+ 					 device->info.requester,
+-					 cfg->vector, 0);
++					 config_cfg->vector,
++					 queue_cfg->vector);
+ 		if (result)
+ 			return -EIO;
+-		pr_info("mDriver: PCI requester %04x uses IRQ %d vector %#x\n",
+-			device->info.requester, device->irq, cfg->vector);
++		pr_info("mDriver: PCI requester %04x uses config IRQ %d vector %#x, queue IRQ %d vector %#x\n",
++			device->info.requester, device->irqs[0],
++			config_cfg->vector, device->irqs[1], queue_cfg->vector);
+ 		active++;
+ 	}
+ 	pr_info("mDriver: mBoot PCI frontend ready: %u devices, %u resources, %u active\n",
+--- a/drivers/virtio/virtio_pci_common.c
++++ b/drivers/virtio/virtio_pci_common.c
+@@ -127,15 +127,6 @@
+ 	return vp_vring_interrupt(irq, opaque);
+ }
+ 
+-#ifdef CONFIG_X86
+-static irqreturn_t vp_mboot_interrupt(int irq, void *opaque)
+-{
+-	vp_config_changed(irq, opaque);
+-	vp_vring_interrupt(irq, opaque);
+-	return IRQ_HANDLED;
+-}
+-#endif
+-
+ static int vp_request_msix_vectors(struct virtio_device *vdev, int nvectors,
+ 				   bool per_vq_vectors, struct irq_affinity *desc)
+ {
+@@ -302,6 +293,13 @@
+ 	}
+ 	vp_dev->per_vq_vectors = false;
+ 
++	if (vp_dev->mboot_irqs_enabled) {
++		vp_dev->config_vector(vp_dev, VIRTIO_MSI_NO_VECTOR);
++		free_irq(vp_dev->pci_dev->irq + 1, vp_dev);
++		free_irq(vp_dev->pci_dev->irq, vp_dev);
++		vp_dev->mboot_irqs_enabled = false;
++	}
++
+ 	if (vp_dev->intx_enabled) {
+ 		free_irq(vp_dev->pci_dev->irq, vp_dev);
+ 		vp_dev->intx_enabled = 0;
+@@ -547,11 +545,17 @@
+ 		if (err)
+ 			goto out_del_vqs;
+ 	}
+-	err = request_irq(vp_dev->pci_dev->irq, vp_mboot_interrupt, IRQF_SHARED,
++	err = request_irq(vp_dev->pci_dev->irq, vp_config_changed, 0,
+ 			  dev_name(&vdev->dev), vp_dev);
+ 	if (err)
+ 		goto out_del_vqs;
+-	vp_dev->intx_enabled = 1;
++	err = request_irq(vp_dev->pci_dev->irq + 1, vp_vring_interrupt, 0,
++			  dev_name(&vdev->dev), vp_dev);
++	if (err) {
++		free_irq(vp_dev->pci_dev->irq, vp_dev);
++		goto out_del_vqs;
++	}
++	vp_dev->mboot_irqs_enabled = true;
+ 	vp_dev->per_vq_vectors = false;
+ 	if (vp_dev->config_vector(vp_dev, 0) == VIRTIO_MSI_NO_VECTOR) {
+ 		err = -EBUSY;
+@@ -565,7 +569,7 @@
+ 			continue;
+ 		}
+ 		vqs[i] = vp_setup_vq(vdev, queue_idx, vqi->callback,
+-				     vqi->name, vqi->ctx, 0,
++				     vqi->name, vqi->ctx, 1,
+ 				     &vp_dev->vqs[queue_idx]);
+ 		queue_idx++;
+ 		if (IS_ERR(vqs[i])) {
+@@ -577,7 +581,7 @@
+ 		return 0;
+ 	sprintf(avq->name, "avq.%u", avq->vq_index);
+ 	vq = vp_setup_vq(vdev, queue_idx++, vp_modern_avq_done, avq->name,
+-			 false, 0, &vp_dev->admin_vq.info);
++			 false, 1, &vp_dev->admin_vq.info);
+ 	if (IS_ERR(vq)) {
+ 		err = PTR_ERR(vq);
+ 		goto out_del_vqs;
+--- a/drivers/virtio/virtio_pci_common.h
++++ b/drivers/virtio/virtio_pci_common.h
+@@ -83,6 +83,7 @@
+ 	/* MSI-X support */
+ 	int msix_enabled;
+ 	int intx_enabled;
++	bool mboot_irqs_enabled;
+ 	cpumask_var_t *msix_affinity_masks;
+ 	/* Name strings for interrupts. This size should be enough,
+ 	 * and I'm too lazy to allocate each name separately. */
+

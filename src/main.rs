@@ -1100,18 +1100,24 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         if vm_exit.hypercall_number == HypercallNumber::DeviceActivate as u64 {
             let domain_id = runtime_domains[index].domain.id().get();
             let requester = u16::try_from(vm_exit.arg0).ok();
-            let guest_vector = u8::try_from(vm_exit.arg1).ok();
+            let config_vector = u8::try_from(vm_exit.arg1).ok();
+            let queue_vector = u8::try_from(vm_exit.arg2).ok();
             let activated = requester
-                .zip(guest_vector)
-                .is_some_and(|(requester, guest_vector)| {
-                    if vm_exit.arg2 != 0
-                        || runtime_domains[index].domain.role() != DomainRole::Hardware
+                .zip(config_vector.zip(queue_vector))
+                .is_some_and(|(requester, (config_vector, queue_vector))| {
+                    if runtime_domains[index].domain.role() != DomainRole::Hardware
                         || devices.can_activate(domain_id, requester).is_err()
                     {
                         return false;
                     }
-                    match unsafe { pci_assignments.activate(domain_id, requester, guest_vector) } {
-                        Ok(physical_vector) => {
+                    match unsafe {
+                        pci_assignments.activate(
+                            domain_id,
+                            requester,
+                            [config_vector, queue_vector],
+                        )
+                    } {
+                        Ok([config_physical, queue_physical]) => {
                             if devices.activate(domain_id, requester).is_err() {
                                 halt_with_error(
                                     "PCI activation state",
@@ -1119,11 +1125,13 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                                 )
                             }
                             log!(
-                                "PCI requester {:04x} active: host IRQ {:#x} -> Domain {} vector {:#x}",
+                                "PCI requester {:04x} active: config IRQ {:#x} -> Domain {} vector {:#x}, queue IRQ {:#x} -> vector {:#x}",
                                 requester,
-                                physical_vector,
+                                config_physical,
                                 domain_id,
-                                guest_vector
+                                config_vector,
+                                queue_physical,
+                                queue_vector
                             );
                             true
                         }
