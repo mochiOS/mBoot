@@ -1117,22 +1117,38 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                             [config_vector, queue_vector],
                         )
                     } {
-                        Ok([config_physical, queue_physical]) => {
+                        Ok(activation) => {
                             if devices.activate(domain_id, requester).is_err() {
                                 halt_with_error(
                                     "PCI activation state",
                                     mboot::Error::InvalidState,
                                 )
                             }
-                            log!(
-                                "PCI requester {:04x} active: config IRQ {:#x} -> Domain {} vector {:#x}, queue IRQ {:#x} -> vector {:#x}",
-                                requester,
-                                config_physical,
-                                domain_id,
-                                config_vector,
-                                queue_physical,
-                                queue_vector
-                            );
+                            match activation.mode {
+                                pci::PciInterruptMode::MsixSplit => log!(
+                                    "PCI requester {:04x} active: config IRQ {:#x} -> Domain {} vector {:#x}, queue IRQ {:#x} -> vector {:#x}",
+                                    requester,
+                                    activation.physical_vectors[0],
+                                    domain_id,
+                                    config_vector,
+                                    activation.physical_vectors[1],
+                                    queue_vector
+                                ),
+                                pci::PciInterruptMode::MsixShared => log!(
+                                    "PCI requester {:04x} active: shared MSI-X IRQ {:#x} -> Domain {} vector {:#x}",
+                                    requester,
+                                    activation.physical_vectors[0],
+                                    domain_id,
+                                    config_vector
+                                ),
+                                pci::PciInterruptMode::Msi => log!(
+                                    "PCI requester {:04x} active: MSI IRQ {:#x} -> Domain {} vector {:#x}",
+                                    requester,
+                                    activation.physical_vectors[0],
+                                    domain_id,
+                                    config_vector
+                                ),
+                            }
                             true
                         }
                         Err(_) => false,

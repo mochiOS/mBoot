@@ -22,6 +22,8 @@ const CAPABILITY_MSI: u8 = 0x05;
 const CAPABILITY_PCIE: u8 = 0x10;
 const CAPABILITY_MSIX: u8 = 0x11;
 const MSI_ENABLE: u16 = 1;
+const MSI_64_BIT: u16 = 1 << 7;
+const MSI_PER_VECTOR_MASK: u16 = 1 << 8;
 const MSIX_FUNCTION_MASK: u16 = 1 << 14;
 const MSIX_ENABLE: u16 = 1 << 15;
 const MSIX_TABLE_BIR: u32 = 0x7;
@@ -70,7 +72,30 @@ struct Assignment {
     active: bool,
     domain_id: u32,
     guest_vectors: [u8; PCI_DEVICE_INTERRUPT_COUNT],
+    interrupt_count: u8,
     descriptor: PciDescriptor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PciInterruptMode {
+    Msi,
+    MsixShared,
+    MsixSplit,
+}
+
+impl PciInterruptMode {
+    const fn interrupt_count(self) -> usize {
+        match self {
+            Self::Msi | Self::MsixShared => 1,
+            Self::MsixSplit => PCI_DEVICE_INTERRUPT_COUNT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciActivation {
+    pub physical_vectors: [u8; PCI_DEVICE_INTERRUPT_COUNT],
+    pub mode: PciInterruptMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +128,7 @@ impl AssignmentTable {
                 active: false,
                 domain_id: 0,
                 guest_vectors: [0; PCI_DEVICE_INTERRUPT_COUNT],
+                interrupt_count: 0,
                 descriptor: PciDescriptor {
                     requester: 0,
                     original_command: 0,
@@ -182,6 +208,7 @@ impl AssignmentTable {
             active: false,
             domain_id,
             guest_vectors: [0; PCI_DEVICE_INTERRUPT_COUNT],
+            interrupt_count: 0,
             descriptor,
         };
         Ok(&self.assignments[slot].descriptor.bars[..descriptor.bar_count])
@@ -231,14 +258,7 @@ impl AssignmentTable {
         domain_id: u32,
         requester: u16,
         guest_vectors: [u8; PCI_DEVICE_INTERRUPT_COUNT],
-    ) -> Result<[u8; PCI_DEVICE_INTERRUPT_COUNT], PciError> {
-        if guest_vectors[PCI_DEVICE_INTERRUPT_CONFIG] == guest_vectors[PCI_DEVICE_INTERRUPT_QUEUE]
-            || guest_vectors
-                .iter()
-                .any(|vector| !(0x20..=0xef).contains(vector) || matches!(vector, 0x40 | 0x41))
-        {
-            return Err(PciError::InvalidState);
-        }
+    ) -> Result<PciActivation, PciError> {
         let slot = self
             .assignments
             .iter()
@@ -249,16 +269,25 @@ impl AssignmentTable {
                     && assignment.descriptor.requester == requester
             })
             .ok_or(PciError::InvalidState)?;
+        let mode = unsafe { interrupt_mode(&self.assignments[slot].descriptor)? };
+        let interrupt_count = mode.interrupt_count();
+        if !valid_guest_vectors(&guest_vectors, interrupt_count) {
+            return Err(PciError::InvalidState);
+        }
         let physical_vectors = [
             physical_vector(slot, PCI_DEVICE_INTERRUPT_CONFIG),
             physical_vector(slot, PCI_DEVICE_INTERRUPT_QUEUE),
         ];
         let pending_mask = 0b11_u64 << (slot * PCI_DEVICE_INTERRUPT_COUNT);
         PENDING_DEVICE_INTERRUPTS.fetch_and(!pending_mask, Ordering::AcqRel);
-        unsafe { activate_descriptor(&self.assignments[slot].descriptor, physical_vectors)? };
+        unsafe { activate_descriptor(&self.assignments[slot].descriptor, physical_vectors, mode)? };
         self.assignments[slot].active = true;
         self.assignments[slot].guest_vectors = guest_vectors;
-        Ok(physical_vectors)
+        self.assignments[slot].interrupt_count = interrupt_count as u8;
+        Ok(PciActivation {
+            physical_vectors,
+            mode,
+        })
     }
 
     pub unsafe fn deactivate(
@@ -282,6 +311,7 @@ impl AssignmentTable {
         PENDING_DEVICE_INTERRUPTS.fetch_and(!pending_mask, Ordering::AcqRel);
         self.assignments[slot].active = false;
         self.assignments[slot].guest_vectors = [0; PCI_DEVICE_INTERRUPT_COUNT];
+        self.assignments[slot].interrupt_count = 0;
         Ok(assignment.descriptor.bars)
     }
 
@@ -309,6 +339,7 @@ impl AssignmentTable {
                     .guest_vectors
                     .iter()
                     .copied()
+                    .take(usize::from(assignment.interrupt_count))
                     .enumerate()
                     .filter_map(move |(index, guest_vector)| {
                         let pending_index = slot * PCI_DEVICE_INTERRUPT_COUNT + index;
@@ -355,6 +386,16 @@ fn page_mask(first: usize, pages: usize) -> Result<u64, PciError> {
 
 fn physical_vector(slot: usize, index: usize) -> u8 {
     DEVICE_VECTOR_FIRST + (slot * PCI_DEVICE_INTERRUPT_COUNT + index) as u8
+}
+
+fn valid_guest_vectors(vectors: &[u8; PCI_DEVICE_INTERRUPT_COUNT], count: usize) -> bool {
+    count > 0
+        && count <= vectors.len()
+        && vectors[..count]
+            .iter()
+            .all(|vector| (0x20..=0xef).contains(vector) && !matches!(vector, 0x40 | 0x41))
+        && (count == 1 || vectors[0] != vectors[1])
+        && vectors[count..].iter().all(|vector| *vector == 0)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -583,6 +624,7 @@ fn active_device_vector() -> Option<u8> {
 unsafe fn activate_descriptor(
     descriptor: &PciDescriptor,
     physical_vectors: [u8; PCI_DEVICE_INTERRUPT_COUNT],
+    mode: PciInterruptMode,
 ) -> Result<(), PciError> {
     let (bus, device, function) = requester_parts(descriptor.requester)?;
     let apic_base = unsafe { read_msr(IA32_APIC_BASE) };
@@ -598,10 +640,23 @@ unsafe fn activate_descriptor(
     let memory_command = (descriptor.original_command | COMMAND_MEMORY | COMMAND_INTERRUPT_DISABLE)
         & !COMMAND_BUS_MASTER;
     unsafe { write_u16(bus, device, function, 4, memory_command) };
-    if descriptor.msix_capability == 0 {
-        return Err(PciError::InterruptUnavailable);
+    match mode {
+        PciInterruptMode::Msi => unsafe {
+            enable_msi(
+                descriptor,
+                message_address,
+                physical_vectors[PCI_DEVICE_INTERRUPT_CONFIG],
+            )?
+        },
+        PciInterruptMode::MsixShared | PciInterruptMode::MsixSplit => unsafe {
+            enable_msix(
+                descriptor,
+                message_address,
+                physical_vectors,
+                mode.interrupt_count(),
+            )?
+        },
     }
-    unsafe { enable_msix(descriptor, message_address, physical_vectors)? };
     asm_fence();
     unsafe {
         write_u16(
@@ -617,6 +672,34 @@ unsafe fn activate_descriptor(
         return Err(PciError::RegisterWriteFailed);
     }
     Ok(())
+}
+
+unsafe fn interrupt_mode(descriptor: &PciDescriptor) -> Result<PciInterruptMode, PciError> {
+    if descriptor.msix_capability != 0 {
+        let (bus, device, function) = requester_parts(descriptor.requester)?;
+        let control = unsafe { read_u16(bus, device, function, descriptor.msix_capability + 2) };
+        return select_interrupt_mode(
+            usize::from(control & 0x07ff) + 1,
+            descriptor.msi_capability != 0,
+        )
+        .ok_or(PciError::InterruptUnavailable);
+    }
+    select_interrupt_mode(0, descriptor.msi_capability != 0).ok_or(PciError::InterruptUnavailable)
+}
+
+const fn select_interrupt_mode(
+    msix_table_entries: usize,
+    has_msi: bool,
+) -> Option<PciInterruptMode> {
+    if msix_table_entries >= PCI_DEVICE_INTERRUPT_COUNT {
+        Some(PciInterruptMode::MsixSplit)
+    } else if msix_table_entries == 1 {
+        Some(PciInterruptMode::MsixShared)
+    } else if has_msi {
+        Some(PciInterruptMode::Msi)
+    } else {
+        None
+    }
 }
 
 unsafe fn disable_descriptor(descriptor: &PciDescriptor, reset: bool) -> Result<(), PciError> {
@@ -646,12 +729,16 @@ unsafe fn enable_msix(
     descriptor: &PciDescriptor,
     address: u64,
     vectors: [u8; PCI_DEVICE_INTERRUPT_COUNT],
+    vector_count: usize,
 ) -> Result<(), PciError> {
     let (bus, device, function) = requester_parts(descriptor.requester)?;
     let capability = descriptor.msix_capability;
     let mut control = unsafe { read_u16(bus, device, function, capability + 2) };
     let table_entries = usize::from(control & 0x07ff) + 1;
-    if table_entries < PCI_DEVICE_INTERRUPT_COUNT {
+    if vector_count == 0
+        || vector_count > PCI_DEVICE_INTERRUPT_COUNT
+        || table_entries < vector_count
+    {
         return Err(PciError::InterruptUnavailable);
     }
     unsafe {
@@ -671,13 +758,13 @@ unsafe fn enable_msix(
         .find(|bar| bar.index == bar_index)
         .ok_or(PciError::InvalidBar)?;
     if table_offset
-        .checked_add((PCI_DEVICE_INTERRUPT_COUNT * 16) as u64)
+        .checked_add((vector_count * 16) as u64)
         .is_none_or(|end| end > bar.length)
     {
         return Err(PciError::InvalidBar);
     }
     let table = (bar.physical_address + table_offset) as *mut u32;
-    for (index, vector) in vectors.into_iter().enumerate() {
+    for (index, vector) in vectors.iter().copied().take(vector_count).enumerate() {
         let entry = unsafe { table.add(index * 4) };
         unsafe {
             write_volatile(entry.add(3), MSIX_ENTRY_MASKED);
@@ -687,13 +774,57 @@ unsafe fn enable_msix(
         }
     }
     asm_fence();
-    for index in 0..PCI_DEVICE_INTERRUPT_COUNT {
+    for index in 0..vector_count {
         unsafe { write_volatile(table.add(index * 4 + 3), 0) };
     }
     control = (control | MSIX_ENABLE) & !MSIX_FUNCTION_MASK;
     unsafe { write_u16(bus, device, function, capability + 2, control) };
     let installed = unsafe { read_u16(bus, device, function, capability + 2) };
     if installed & (MSIX_ENABLE | MSIX_FUNCTION_MASK) != MSIX_ENABLE {
+        return Err(PciError::RegisterWriteFailed);
+    }
+    Ok(())
+}
+
+unsafe fn enable_msi(descriptor: &PciDescriptor, address: u64, vector: u8) -> Result<(), PciError> {
+    let (bus, device, function) = requester_parts(descriptor.requester)?;
+    let capability = descriptor.msi_capability;
+    if capability == 0 {
+        return Err(PciError::InterruptUnavailable);
+    }
+    let mut control = unsafe { read_u16(bus, device, function, capability + 2) };
+    control &= !(0b111 << 4 | MSI_ENABLE);
+    let mask_offset = if control & MSI_64_BIT != 0 {
+        0x10
+    } else {
+        0x0c
+    };
+    unsafe { write_u16(bus, device, function, capability + 2, control) };
+    if control & MSI_PER_VECTOR_MASK != 0 {
+        unsafe { write_u32(bus, device, function, capability + mask_offset, u32::MAX) };
+    }
+    unsafe {
+        write_u32(bus, device, function, capability + 4, address as u32);
+        if control & MSI_64_BIT != 0 {
+            write_u32(
+                bus,
+                device,
+                function,
+                capability + 8,
+                (address >> 32) as u32,
+            );
+            write_u16(bus, device, function, capability + 0x0c, u16::from(vector));
+        } else {
+            write_u16(bus, device, function, capability + 8, u16::from(vector));
+        }
+        asm_fence();
+        write_u16(bus, device, function, capability + 2, control | MSI_ENABLE);
+        if control & MSI_PER_VECTOR_MASK != 0 {
+            write_u32(bus, device, function, capability + mask_offset, !1);
+        }
+    }
+    let installed = unsafe { read_u16(bus, device, function, capability + 2) };
+    if installed & (MSI_ENABLE | 0b111 << 4) != MSI_ENABLE {
         return Err(PciError::RegisterWriteFailed);
     }
     Ok(())
@@ -1107,6 +1238,7 @@ mod tests {
         assert!(!assignments.has_active_for_domain(2));
         assignments.assignments[0].active = true;
         assignments.assignments[0].guest_vectors = [0x42, 0x43];
+        assignments.assignments[0].interrupt_count = 2;
         assert!(assignments.has_active_for_domain(2));
         assert!(!assignments.has_active_for_domain(3));
         let mut routed = assignments.route_pending(0b11);
@@ -1114,6 +1246,42 @@ mod tests {
         assert_eq!(routed.next(), Some((2, 0x43)));
         assert_eq!(routed.next(), None);
         assert!(assignments.route_pending(0b100).next().is_none());
+    }
+
+    #[test]
+    fn shared_interrupt_routes_only_the_registered_guest_vector() {
+        let mut assignments = AssignmentTable::new();
+        assignments
+            .insert(2, descriptor(0x10, &[0x1000]), 0x1b_0000, 0x4_0000)
+            .unwrap();
+        assignments.assignments[0].active = true;
+        assignments.assignments[0].guest_vectors = [0x42, 0];
+        assignments.assignments[0].interrupt_count = 1;
+        let mut routed = assignments.route_pending(0b01);
+        assert_eq!(routed.next(), Some((2, 0x42)));
+        assert_eq!(routed.next(), None);
+    }
+
+    #[test]
+    fn interrupt_mode_prefers_msix_and_falls_back_to_msi() {
+        assert_eq!(
+            select_interrupt_mode(2, true),
+            Some(PciInterruptMode::MsixSplit)
+        );
+        assert_eq!(
+            select_interrupt_mode(1, true),
+            Some(PciInterruptMode::MsixShared)
+        );
+        assert_eq!(select_interrupt_mode(0, true), Some(PciInterruptMode::Msi));
+        assert_eq!(select_interrupt_mode(0, false), None);
+    }
+
+    #[test]
+    fn shared_and_split_guest_vectors_have_distinct_contracts() {
+        assert!(valid_guest_vectors(&[0x42, 0], 1));
+        assert!(!valid_guest_vectors(&[0x42, 0x43], 1));
+        assert!(valid_guest_vectors(&[0x42, 0x43], 2));
+        assert!(!valid_guest_vectors(&[0x42, 0x42], 2));
     }
 
     #[test]
