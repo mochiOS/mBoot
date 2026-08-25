@@ -1,0 +1,421 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/mboot: provide the device control protocol
+
+Replace the one-shot shared-ring probe with a versioned device control
+service. Negotiate capabilities, enumerate and describe assigned devices,
+start a session, answer health checks, and return stable status codes.
+Keep servicing requests after boot from a poll-based kernel worker.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -9,8 +9,10 @@
+ #include <linux/irq.h>
+ #include <linux/irqdomain.h>
+ #include <linux/ioport.h>
++#include <linux/kthread.h>
+ #include <linux/numa.h>
+ #include <linux/pci.h>
++#include <linux/delay.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ 
+@@ -37,6 +39,7 @@
+ #define MBOOT_HYPERCALL_DEVICE_RESOURCE_QUERY 20
+ #define MBOOT_HYPERCALL_DEVICE_ACTIVATE 21
+ #define MBOOT_HYPERCALL_GRANT_QUERY 22
++#define MBOOT_HYPERCALL_EVENT_POLL 23
+ #define MBOOT_HYPERCALL_IRQ_MASK 13
+ #define MBOOT_HYPERCALL_INVALID_ARGUMENT (~0UL - 1)
+ #define MBOOT_PCI_STATE_QUARANTINED 1
+@@ -61,7 +64,29 @@
+ #define MBOOT_CONTROL_RING_GENERATION 1
+ #define MBOOT_CONTROL_REQUEST_KIND 1
+ #define MBOOT_CONTROL_RESPONSE_KIND 2
+-#define MBOOT_CONTROL_REQUEST_ID 1
++#define MBOOT_EVENT_NO_EVENT 0
++#define MBOOT_CONTROL_VERSION 1
++#define MBOOT_CONTROL_NEGOTIATE 1
++#define MBOOT_CONTROL_ENUMERATE 2
++#define MBOOT_CONTROL_DESCRIBE 3
++#define MBOOT_CONTROL_PING 4
++#define MBOOT_CONTROL_START_SESSION 5
++#define MBOOT_CONTROL_STATUS_OK 0
++#define MBOOT_CONTROL_STATUS_UNSUPPORTED_VERSION 1
++#define MBOOT_CONTROL_STATUS_INVALID_REQUEST 2
++#define MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION 3
++#define MBOOT_CONTROL_STATUS_NOT_FOUND 4
++#define MBOOT_CONTROL_STATUS_BAD_STATE 5
++#define MBOOT_CONTROL_STATUS_END 6
++#define MBOOT_CONTROL_CAPABILITIES GENMASK_ULL(3, 0)
++#define MBOOT_DEVICE_KIND_OTHER 0
++#define MBOOT_DEVICE_KIND_BLOCK 1
++#define MBOOT_DEVICE_KIND_NETWORK 2
++#define MBOOT_DEVICE_KIND_DISPLAY 3
++#define MBOOT_DEVICE_KIND_USB 4
++#define MBOOT_DEVICE_KIND_SOUND 5
++#define MBOOT_DEVICE_STATE_ONLINE 1
++#define MBOOT_DEVICE_FEATURES GENMASK_ULL(2, 0)
+ 
+ struct mboot_ring_header {
+ 	u64 magic;
+@@ -90,6 +115,24 @@
+ 	u8 reserved[64];
+ };
+ 
++struct mboot_control_request {
++	u16 version;
++	u16 operation;
++	u32 flags;
++	u32 device_id;
++	u32 reserved;
++	u64 arguments[4];
++};
++
++struct mboot_control_response {
++	u16 version;
++	u16 operation;
++	u32 status;
++	u32 device_id;
++	u32 reserved;
++	u64 values[4];
++};
++
+ struct mboot_pci_device_info {
+ 	u16 requester;
+ 	u8 class;
+@@ -584,6 +627,7 @@
+ 					 queue_cfg ? queue_cfg->vector : 0);
+ 		if (result)
+ 			return -EIO;
++		device->info.state = MBOOT_PCI_STATE_ACTIVE;
+ 		if (device->irq_count == 2)
+ 			pr_info("mDriver: PCI requester %04x uses config IRQ %d vector %#x, queue IRQ %d vector %#x\n",
+ 				device->info.requester, device->irqs[0],
+@@ -684,27 +728,238 @@
+ 			   sizeof(ring->header.reserved));
+ }
+ 
+-static int __init mboot_control_ring_reply(void)
++static struct mboot_ring_page *mboot_control_ring;
++static bool mboot_control_negotiated;
++static bool mboot_control_active;
++
++static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info)
++{
++	switch (info->class) {
++	case PCI_BASE_CLASS_STORAGE:
++		return MBOOT_DEVICE_KIND_BLOCK;
++	case PCI_BASE_CLASS_NETWORK:
++		return MBOOT_DEVICE_KIND_NETWORK;
++	case PCI_BASE_CLASS_DISPLAY:
++		return MBOOT_DEVICE_KIND_DISPLAY;
++	case PCI_BASE_CLASS_MULTIMEDIA:
++		return MBOOT_DEVICE_KIND_SOUND;
++	case PCI_BASE_CLASS_SERIAL:
++		return info->subclass == (PCI_CLASS_SERIAL_USB & 0xff) ?
++			MBOOT_DEVICE_KIND_USB : MBOOT_DEVICE_KIND_OTHER;
++	default:
++		return MBOOT_DEVICE_KIND_OTHER;
++	}
++}
++
++static bool mboot_control_zero_arguments(const u64 arguments[4])
++{
++	return !memchr_inv(arguments, 0, sizeof(u64) * 4);
++}
++
++static void mboot_control_handle(const struct mboot_control_request *request,
++				 struct mboot_control_response *response)
+ {
+-	struct mboot_ring_message response = {
+-		.kind = MBOOT_CONTROL_RESPONSE_KIND,
+-		.len = 5,
+-		.request_id = MBOOT_CONTROL_REQUEST_ID,
+-		.payload = "ready",
+-	};
++	const struct mboot_pci_frontend *device;
++	u32 index;
++
++	memset(response, 0, sizeof(*response));
++	response->version = MBOOT_CONTROL_VERSION;
++	response->operation = request->operation;
++	response->device_id = request->device_id;
++	response->status = MBOOT_CONTROL_STATUS_INVALID_REQUEST;
++	if (request->flags || request->reserved)
++		return;
++	if (request->version != MBOOT_CONTROL_VERSION) {
++		response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_VERSION;
++		return;
++	}
++	if (request->operation == MBOOT_CONTROL_NEGOTIATE) {
++		if (request->device_id || request->arguments[2] ||
++		    request->arguments[3])
++			return;
++		if (request->arguments[0] > MBOOT_CONTROL_VERSION ||
++		    request->arguments[1] < MBOOT_CONTROL_VERSION) {
++			response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_VERSION;
++			return;
++		}
++		mboot_control_negotiated = true;
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = MBOOT_CONTROL_VERSION;
++		response->values[1] = MBOOT_CONTROL_CAPABILITIES;
++		response->values[2] = mboot_pci_device_count;
++		response->values[3] = mboot_control_ring->header.generation;
++		return;
++	}
++	if (!mboot_control_negotiated) {
++		response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
++		return;
++	}
++	switch (request->operation) {
++	case MBOOT_CONTROL_ENUMERATE:
++		if (request->device_id || request->arguments[1] ||
++		    request->arguments[2] || request->arguments[3] ||
++		    request->arguments[0] > U32_MAX)
++			return;
++		index = request->arguments[0];
++		if (index >= mboot_pci_device_count) {
++			response->status = MBOOT_CONTROL_STATUS_END;
++			return;
++		}
++		device = &mboot_pci_devices[index];
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->device_id = index + 1;
++		response->values[0] = index + 1;
++		response->values[1] = mboot_control_device_kind(&device->info);
++		response->values[2] = MBOOT_DEVICE_STATE_ONLINE;
++		response->values[3] = MBOOT_DEVICE_FEATURES;
++		return;
++	case MBOOT_CONTROL_DESCRIBE:
++		if (!mboot_control_zero_arguments(request->arguments))
++			return;
++		if (!request->device_id ||
++		    request->device_id > mboot_pci_device_count) {
++			response->status = MBOOT_CONTROL_STATUS_NOT_FOUND;
++			return;
++		}
++		device = &mboot_pci_devices[request->device_id - 1];
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = mboot_control_device_kind(&device->info);
++		response->values[1] = MBOOT_DEVICE_STATE_ONLINE;
++		response->values[2] = MBOOT_DEVICE_FEATURES;
++		response->values[3] = device->info.requester |
++				      (u64)device->info.class << 16 |
++				      (u64)device->info.subclass << 24;
++		return;
++	case MBOOT_CONTROL_PING:
++		if (request->device_id || request->arguments[1] ||
++		    request->arguments[2] || request->arguments[3])
++			return;
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = request->arguments[0];
++		return;
++	case MBOOT_CONTROL_START_SESSION:
++		if (request->device_id ||
++		    !mboot_control_zero_arguments(request->arguments))
++			return;
++		if (mboot_control_active) {
++			response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
++			return;
++		}
++		mboot_control_active = true;
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = mboot_control_ring->header.generation;
++		return;
++	default:
++		response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
++	}
++}
++
++static int mboot_control_process(bool *session_started)
++{
++	struct mboot_control_response control_response;
++	struct mboot_control_request control_request;
++	struct mboot_ring_message response;
+ 	struct mboot_ring_message request;
+-	struct mboot_ring_page *ring;
++	u32 response_producer;
++	u32 response_consumer;
++	u32 response_index;
++	u32 producer;
++	u32 consumer;
++	bool processed = false;
++
++	/* Pair with the System Domain's request publication. */
++	producer = smp_load_acquire(&mboot_control_ring->header.request_producer);
++	consumer = READ_ONCE(mboot_control_ring->header.request_consumer);
++	if (producer - consumer > MBOOT_CONTROL_RING_SLOTS)
++		return -EIO;
++	while (consumer != producer) {
++		bool valid_request;
++
++		memcpy(&request,
++		       &mboot_control_ring->requests[consumer % MBOOT_CONTROL_RING_SLOTS],
++		       sizeof(request));
++		memset(&control_request, 0, sizeof(control_request));
++		valid_request = request.kind == MBOOT_CONTROL_REQUEST_KIND &&
++				!request.flags &&
++				request.len == sizeof(control_request);
++		if (valid_request)
++			memcpy(&control_request, request.payload,
++			       sizeof(control_request));
++		if (valid_request) {
++			mboot_control_handle(&control_request, &control_response);
++		} else {
++			memset(&control_response, 0, sizeof(control_response));
++			control_response.version = MBOOT_CONTROL_VERSION;
++			control_response.status =
++				MBOOT_CONTROL_STATUS_INVALID_REQUEST;
++		}
++		memset(&response, 0, sizeof(response));
++		response.kind = MBOOT_CONTROL_RESPONSE_KIND;
++		response.len = sizeof(control_response);
++		response.request_id = request.request_id;
++		memcpy(response.payload, &control_response,
++		       sizeof(control_response));
++
++		response_producer = READ_ONCE(mboot_control_ring->header.response_producer);
++		/* Pair with the System Domain returning a response slot. */
++		response_consumer = smp_load_acquire(&mboot_control_ring->header.response_consumer);
++		if (response_producer - response_consumer >= MBOOT_CONTROL_RING_SLOTS)
++			return -ENOSPC;
++		response_index = response_producer % MBOOT_CONTROL_RING_SLOTS;
++		memcpy(&mboot_control_ring->responses[response_index], &response,
++		       sizeof(response));
++		/* Publish the response only after its contents are visible. */
++		smp_store_release(&mboot_control_ring->header.response_producer,
++				  response_producer + 1);
++		consumer++;
++		/* Finish reading the request before returning its slot. */
++		smp_store_release(&mboot_control_ring->header.request_consumer,
++				  consumer);
++		if (control_request.operation == MBOOT_CONTROL_START_SESSION &&
++		    control_response.status == MBOOT_CONTROL_STATUS_OK)
++			*session_started = true;
++		processed = true;
++	}
++	if (!processed)
++		return 0;
++	return mboot_hypercall(MBOOT_HYPERCALL_EVENT_SEND,
++			       MBOOT_CONTROL_RING_PORT, 0, 0) ? -EIO : 0;
++}
++
++static int mboot_control_worker(void *unused)
++{
++	while (!kthread_should_stop()) {
++		unsigned long result;
++		bool ignored = false;
++
++		result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_POLL, 0, 0, 0);
++		if (result == MBOOT_CONTROL_RING_PORT) {
++			if (mboot_control_process(&ignored))
++				break;
++		} else if (result != MBOOT_EVENT_NO_EVENT) {
++			break;
++		}
++		msleep_interruptible(10);
++	}
++	pr_err("mDriver: device control worker stopped\n");
++	return -EIO;
++}
++
++static int __init mboot_control_ring_start(void)
++{
++	struct task_struct *worker;
+ 	unsigned long grant_ref;
+ 	unsigned long result;
+ 	u64 grant_window_start;
+ 	u64 grant_window_size;
+-	u32 producer;
+-	u32 consumer;
+ 	u32 eax, ebx, ecx, edx;
++	bool session_started = false;
+ 
+ 	BUILD_BUG_ON(sizeof(struct mboot_ring_header) != 64);
+ 	BUILD_BUG_ON(sizeof(struct mboot_ring_message) != 64);
+ 	BUILD_BUG_ON(sizeof(struct mboot_ring_page) != PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(struct mboot_control_request) != 48);
++	BUILD_BUG_ON(sizeof(struct mboot_control_response) != 48);
+ 
+ 	result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_WAIT, 0, 0, 0);
+ 	if (result != MBOOT_CONTROL_RING_PORT)
+@@ -722,48 +977,29 @@
+ 				 grant_window_start, 0);
+ 	if (result)
+ 		return -EIO;
+-	ring = memremap(grant_window_start, PAGE_SIZE, MEMREMAP_WB);
+-	if (!ring)
++	mboot_control_ring = memremap(grant_window_start, PAGE_SIZE, MEMREMAP_WB);
++	if (!mboot_control_ring)
+ 		goto unmap;
+-	if (!mboot_control_ring_valid(ring))
+-		goto unmap_memory;
+-
+-	/* Pair with the System Domain's request publication. */
+-	producer = smp_load_acquire(&ring->header.request_producer);
+-	consumer = READ_ONCE(ring->header.request_consumer);
+-	if (producer == consumer || producer - consumer > MBOOT_CONTROL_RING_SLOTS)
++	if (!mboot_control_ring_valid(mboot_control_ring))
+ 		goto unmap_memory;
+-	memcpy(&request, &ring->requests[consumer % MBOOT_CONTROL_RING_SLOTS],
+-	       sizeof(request));
+-	if (request.kind != MBOOT_CONTROL_REQUEST_KIND || request.flags ||
+-	    request.len != 5 || request.request_id != MBOOT_CONTROL_REQUEST_ID ||
+-	    memcmp(request.payload, "probe", 5))
+-		goto unmap_memory;
+-	/* Finish reading the request before returning its slot. */
+-	smp_store_release(&ring->header.request_consumer, consumer + 1);
+-
+-	producer = READ_ONCE(ring->header.response_producer);
+-	/* Pair with the System Domain returning a response slot. */
+-	consumer = smp_load_acquire(&ring->header.response_consumer);
+-	if (producer - consumer >= MBOOT_CONTROL_RING_SLOTS)
++	while (!session_started) {
++		if (mboot_control_process(&session_started))
++			goto unmap_memory;
++		if (!session_started) {
++			result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_WAIT, 0, 0, 0);
++			if (result != MBOOT_CONTROL_RING_PORT)
++				goto unmap_memory;
++		}
++	}
++	worker = kthread_run(mboot_control_worker, NULL, "mboot-control");
++	if (IS_ERR(worker))
+ 		goto unmap_memory;
+-	memcpy(&ring->responses[producer % MBOOT_CONTROL_RING_SLOTS], &response,
+-	       sizeof(response));
+-	/* Publish the response only after its contents are visible. */
+-	smp_store_release(&ring->header.response_producer, producer + 1);
+-	memunmap(ring);
+-	result = mboot_hypercall(MBOOT_HYPERCALL_GRANT_UNMAP, grant_ref, 0, 0);
+-	if (result)
+-		return -EIO;
+-	result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_SEND,
+-				 MBOOT_CONTROL_RING_PORT, 0, 0);
+-	if (result)
+-		return -EIO;
+-	pr_info("mDriver: mBoot control Shared Ring ready\n");
++	pr_info("mDriver: mBoot device control protocol ready\n");
+ 	return 0;
+ 
+ unmap_memory:
+-	memunmap(ring);
++	memunmap(mboot_control_ring);
++	mboot_control_ring = NULL;
+ unmap:
+ 	mboot_hypercall(MBOOT_HYPERCALL_GRANT_UNMAP, grant_ref, 0, 0);
+ 	return -EIO;
+@@ -792,7 +1028,7 @@
+ 	if (result != MBOOT_CONTROL_IRQ_PORT)
+ 		return -EIO;
+ 	pr_info("mDriver: mBoot control Event Channel ready\n");
+-	if (mboot_control_ring_reply())
++	if (mboot_control_ring_start())
+ 		return -EIO;
+ 	result = mboot_hypercall(MBOOT_HYPERCALL_READY, 0, 0, 0);
+ 
+

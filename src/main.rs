@@ -33,8 +33,8 @@ use mnu_abi::hypervisor::{
     DomainBootInfo, DomainCrashInfo, HypercallNumber, PciDeviceInfo, PciDeviceResource,
     DOMAIN_CAPABILITY_DEVICE_CLAIM, DOMAIN_CAPABILITY_DEVICE_QUERY, DOMAIN_CRASH_STATUS_CRASHED,
     DOMAIN_CRASH_STATUS_RESTARTED, DOMAIN_MANAGEMENT_VECTOR, DOMAIN_ROLE_APPLICATION,
-    DOMAIN_ROLE_HARDWARE, DOMAIN_ROLE_SYSTEM, EVENT_CHANNEL_VECTOR, GRANT_FLAG_WRITABLE,
-    HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED,
+    DOMAIN_ROLE_HARDWARE, DOMAIN_ROLE_SYSTEM, EVENT_CHANNEL_NO_EVENT, EVENT_CHANNEL_VECTOR,
+    GRANT_FLAG_WRITABLE, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED,
     HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
 };
 use uefi::fs::Error as FsError;
@@ -1539,6 +1539,18 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             } else {
                 runtime_domains[index].pending_result = HYPERCALL_INVALID_ARGUMENT;
             }
+            continue;
+        }
+        if vm_exit.hypercall_number == HypercallNumber::EventPoll as u64 {
+            let receiver = runtime_domains[index].domain.id();
+            runtime_domains[index].pending_result =
+                if vm_exit.arg0 == 0 && vm_exit.arg1 == 0 && vm_exit.arg2 == 0 {
+                    event_channels
+                        .receive(receiver)
+                        .map_or(EVENT_CHANNEL_NO_EVENT, |port| u64::from(port))
+                } else {
+                    HYPERCALL_INVALID_ARGUMENT
+                };
             continue;
         }
         if vm_exit.hypercall_number == HypercallNumber::EventWait as u64 {

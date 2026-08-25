@@ -68,8 +68,8 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
         && grep -Fq 'mDriver block IRQ OK' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver: mBoot control Event Channel ready' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver control Event Channel verified' "$WORK/serial.log" 2>/dev/null \
-        && grep -Fq 'mDriver: mBoot control Shared Ring ready' "$WORK/serial.log" 2>/dev/null \
-        && grep -Fq 'mDriver control Shared Ring verified' "$WORK/serial.log" 2>/dev/null \
+        && grep -Fq 'mDriver: mBoot device control protocol ready' "$WORK/serial.log" 2>/dev/null \
+        && grep -Fq 'mDriver device control protocol ready' "$WORK/serial.log" 2>/dev/null \
         && grep -Eq 'mDriver: mBoot PCI inventory ready: [0-9]+ devices, 1 claimed' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'PCI requester 0018 mapped for DMA and claimed-disabled by Hardware Domain 2' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver: mBoot PCI frontend ready: 1 devices, 2 resources, 1 active' "$WORK/serial.log" 2>/dev/null \
