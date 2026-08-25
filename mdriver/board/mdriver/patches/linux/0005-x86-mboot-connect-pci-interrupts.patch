@@ -1,0 +1,212 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/mboot: connect assigned PCI interrupts
+
+Allocate each assigned device interrupt through a child of the x86 vector
+domain. This lets Linux select a collision-free vector while the mBoot IRQ
+chip controls masking and acknowledges delivery through the virtual x2APIC.
+
+Keep the descriptor pinned to the hardware domain's boot vCPU because mBoot
+currently starts that domain with one vCPU. Publish the Linux IRQ number in
+the synthetic PCI device before asking mBoot to activate its physical
+route.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+ arch/x86/include/asm/hw_irq.h |   1 +
+ arch/x86/kernel/cpu/mboot.c   | 114 ++++++++++++++++++++++++++++++++--
+ 2 files changed, 111 insertions(+), 4 deletions(-)
+
+--- a/arch/x86/include/asm/hw_irq.h
++++ b/arch/x86/include/asm/hw_irq.h
+@@ -39,6 +39,7 @@
+ 	X86_IRQ_ALLOC_TYPE_DMAR,
+ 	X86_IRQ_ALLOC_TYPE_AMDVI,
+ 	X86_IRQ_ALLOC_TYPE_UV,
++	X86_IRQ_ALLOC_TYPE_MBOOT,
+ };
+ 
+ struct ioapic_alloc_info {
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -5,7 +5,10 @@
+ #include <linux/build_bug.h>
+ #include <linux/errno.h>
+ #include <linux/init.h>
++#include <linux/irq.h>
++#include <linux/irqdomain.h>
+ #include <linux/ioport.h>
++#include <linux/numa.h>
+ #include <linux/pci.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+@@ -15,6 +18,7 @@
+ #include <asm/io.h>
+ #include <asm/cpuid.h>
+ #include <asm/hypervisor.h>
++#include <asm/irqdomain.h>
+ #include <asm/mpspec.h>
+ #include <asm/pci_x86.h>
+ 
+@@ -27,6 +31,7 @@
+ #define MBOOT_HYPERCALL_DEVICE_CONFIG_READ 19
+ #define MBOOT_HYPERCALL_DEVICE_RESOURCE_QUERY 20
+ #define MBOOT_HYPERCALL_DEVICE_ACTIVATE 21
++#define MBOOT_HYPERCALL_IRQ_MASK 13
+ #define MBOOT_HYPERCALL_INVALID_ARGUMENT (~0UL - 1)
+ #define MBOOT_PCI_STATE_QUARANTINED 1
+ #define MBOOT_PCI_STATE_FIRMWARE_DEFERRED 2
+@@ -40,7 +45,6 @@
+ #define MBOOT_PCI_RESOURCE_MMIO 1
+ #define MBOOT_PCI_RESOURCE_READABLE BIT(0)
+ #define MBOOT_PCI_RESOURCE_WRITABLE BIT(1)
+-#define MBOOT_DEVICE_VECTOR 0x42
+ 
+ struct mboot_pci_device_info {
+ 	u16 requester;
+@@ -67,11 +71,100 @@
+ 	struct mboot_pci_resource resources[MBOOT_PCI_MAX_BARS];
+ 	u32 config[MBOOT_PCI_CONFIG_DWORDS];
+ 	u8 resource_count;
++	int irq;
+ };
+ 
+ static struct mboot_pci_frontend mboot_pci_devices[MBOOT_MAX_ASSIGNED_DEVICES];
+ static struct resource mboot_pci_bus_windows[256];
+ static unsigned int mboot_pci_device_count;
++static struct irq_domain *mboot_irq_domain;
++
++static unsigned long mboot_hypercall(unsigned long number,
++				     unsigned long arg0, unsigned long arg1,
++				     unsigned long arg2);
++
++static void mboot_irq_mask(struct irq_data *data)
++{
++	struct irq_cfg *cfg = irqd_cfg(data);
++
++	if (cfg)
++		mboot_hypercall(MBOOT_HYPERCALL_IRQ_MASK, cfg->vector, 1, 0);
++}
++
++static void mboot_irq_unmask(struct irq_data *data)
++{
++	struct irq_cfg *cfg = irqd_cfg(data);
++
++	if (cfg)
++		mboot_hypercall(MBOOT_HYPERCALL_IRQ_MASK, cfg->vector, 0, 0);
++}
++
++static struct irq_chip mboot_irq_chip = {
++	.name = "mBoot",
++	.irq_mask = mboot_irq_mask,
++	.irq_unmask = mboot_irq_unmask,
++	.irq_ack = irq_chip_ack_parent,
++};
++
++static int mboot_irq_domain_alloc(struct irq_domain *domain,
++				  unsigned int virq, unsigned int nr_irqs,
++				  void *arg)
++{
++	struct irq_alloc_info *info = arg;
++	int ret;
++
++	if (nr_irqs != 1 || !info || info->type != X86_IRQ_ALLOC_TYPE_MBOOT)
++		return -EINVAL;
++	ret = irq_domain_alloc_irqs_parent(domain, virq, nr_irqs, arg);
++	if (ret)
++		return ret;
++	irq_set_status_flags(virq, IRQ_NO_BALANCING);
++	irq_domain_set_info(domain, virq, info->hwirq, &mboot_irq_chip,
++			    info->data, handle_edge_irq, NULL, "edge");
++	return 0;
++}
++
++static void mboot_irq_domain_free(struct irq_domain *domain,
++				  unsigned int virq, unsigned int nr_irqs)
++{
++	irq_clear_status_flags(virq, IRQ_NO_BALANCING);
++	irq_domain_free_irqs_top(domain, virq, nr_irqs);
++}
++
++static const struct irq_domain_ops mboot_irq_domain_ops = {
++	.alloc = mboot_irq_domain_alloc,
++	.free = mboot_irq_domain_free,
++};
++
++static int __init mboot_irq_init(void)
++{
++	struct fwnode_handle *fwnode;
++
++	fwnode = irq_domain_alloc_named_fwnode("mBoot-PCI");
++	if (!fwnode)
++		return -ENOMEM;
++	mboot_irq_domain =
++		irq_domain_create_hierarchy(x86_vector_domain, 0, 0, fwnode,
++					    &mboot_irq_domain_ops, NULL);
++	if (!mboot_irq_domain) {
++		irq_domain_free_fwnode(fwnode);
++		return -ENOMEM;
++	}
++	return 0;
++}
++
++static int __init mboot_irq_alloc(struct mboot_pci_frontend *device)
++{
++	struct irq_alloc_info info;
++
++	if (!mboot_irq_domain && mboot_irq_init())
++		return -ENOMEM;
++	init_irq_alloc_info(&info, cpumask_of(0));
++	info.type = X86_IRQ_ALLOC_TYPE_MBOOT;
++	info.hwirq = device->info.requester;
++	info.data = device;
++	return irq_domain_alloc_irqs(mboot_irq_domain, 1, NUMA_NO_NODE, &info);
++}
+ 
+ static u32 __init mboot_detect(void)
+ {
+@@ -368,6 +461,7 @@
+ 	for (index = 0; index < mboot_pci_device_count; index++) {
+ 		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+ 		struct pci_dev *pdev;
++		struct irq_cfg *cfg;
+ 		unsigned int resource_index;
+ 		unsigned long result;
+ 		u8 bus = device->info.requester >> 8;
+@@ -376,6 +470,18 @@
+ 		pdev = pci_get_domain_bus_and_slot(0, bus, devfn);
+ 		if (!pdev)
+ 			return -ENODEV;
++		device->irq = mboot_irq_alloc(device);
++		if (device->irq < 0) {
++			pci_dev_put(pdev);
++			return device->irq;
++		}
++		cfg = irq_cfg(device->irq);
++		if (!cfg || cfg->vector > 0xff) {
++			pci_dev_put(pdev);
++			irq_domain_free_irqs(device->irq, 1);
++			return -EIO;
++		}
++		pdev->irq = device->irq;
+ 		for (resource_index = 0;
+ 		     resource_index < device->resource_count; resource_index++) {
+ 			const struct mboot_pci_resource *resource =
+@@ -391,11 +497,17 @@
+ 			resource_count++;
+ 		}
+ 		pci_dev_put(pdev);
++		result = mboot_hypercall(MBOOT_HYPERCALL_IRQ_MASK,
++					 cfg->vector, 1, 0);
++		if (result)
++			return -EIO;
+ 		result = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_ACTIVATE,
+ 					 device->info.requester,
+-					 MBOOT_DEVICE_VECTOR, 0);
++					 cfg->vector, 0);
+ 		if (result)
+ 			return -EIO;
++		pr_info("mDriver: PCI requester %04x uses IRQ %d vector %#x\n",
++			device->info.requester, device->irq, cfg->vector);
+ 		active++;
+ 	}
+ 	pr_info("mDriver: mBoot PCI frontend ready: %u devices, %u resources, %u active\n",

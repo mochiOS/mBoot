@@ -62,12 +62,16 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
     if grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null \
         && grep -Eq 'mDriver: mBoot PCI inventory ready: [0-9]+ devices, 1 claimed' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'PCI requester 0018 mapped for DMA and claimed-disabled by Hardware Domain 2' "$WORK/serial.log" 2>/dev/null \
-        && grep -Fq 'PCI requester 0018 active: host IRQ 0x50 -> Domain 2 vector 0x42' "$WORK/serial.log" 2>/dev/null \
+        && grep -Eq 'mDriver: PCI requester 0018 uses IRQ [0-9]+ vector 0x[0-9a-f]+' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver: mBoot PCI frontend ready: 1 devices, 2 resources, 1 active' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq '[mBoot] Hardware Domain 2 ready' "$WORK/serial.log" 2>/dev/null; then
-        grep -E '\[mBoot\]|mDriver: mBoot PCI|mDriver OK|Linux version|PCI requester 0018' "$WORK/serial.log"
-        echo 'test-mdriver: PASS'
-        exit 0
+        linux_vector=$(sed -n 's/.*mDriver: PCI requester 0018 uses IRQ [0-9][0-9]* vector \(0x[0-9a-f][0-9a-f]*\).*/\1/p' "$WORK/serial.log" | head -n 1)
+        if [[ -n $linux_vector ]] \
+            && grep -Fq "PCI requester 0018 active: host IRQ 0x50 -> Domain 2 vector $linux_vector" "$WORK/serial.log"; then
+            grep -E '\[mBoot\]|mDriver: mBoot PCI|mDriver OK|Linux version|PCI requester 0018' "$WORK/serial.log"
+            echo 'test-mdriver: PASS'
+            exit 0
+        fi
     fi
     kill -0 "$QEMU_PID" 2>/dev/null || break
     sleep 0.1
