@@ -60,6 +60,7 @@ QEMU_PID=$!
 
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
     if grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null \
+        && grep -Fq 'mDriver block IRQ OK' "$WORK/serial.log" 2>/dev/null \
         && grep -Eq 'mDriver: mBoot PCI inventory ready: [0-9]+ devices, 1 claimed' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'PCI requester 0018 mapped for DMA and claimed-disabled by Hardware Domain 2' "$WORK/serial.log" 2>/dev/null \
         && grep -Eq 'mDriver: PCI requester 0018 uses IRQ [0-9]+ vector 0x[0-9a-f]+' "$WORK/serial.log" 2>/dev/null \
@@ -68,7 +69,7 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
         linux_vector=$(sed -n 's/.*mDriver: PCI requester 0018 uses IRQ [0-9][0-9]* vector \(0x[0-9a-f][0-9a-f]*\).*/\1/p' "$WORK/serial.log" | head -n 1)
         if [[ -n $linux_vector ]] \
             && grep -Fq "PCI requester 0018 active: host IRQ 0x50 -> Domain 2 vector $linux_vector" "$WORK/serial.log"; then
-            grep -E '\[mBoot\]|mDriver: mBoot PCI|mDriver OK|Linux version|PCI requester 0018' "$WORK/serial.log"
+            grep -E '\[mBoot\]|mDriver: mBoot PCI|mDriver (block IRQ )?OK|Linux version|PCI requester 0018|virtio_blk| vda' "$WORK/serial.log"
             echo 'test-mdriver: PASS'
             exit 0
         fi
@@ -78,5 +79,5 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
 done
 
 sed -n '1,240p' "$WORK/serial.log" >&2
-echo 'test-mdriver: mDriver did not publish and activate its assigned device' >&2
+echo 'test-mdriver: assigned block I/O did not complete through the mBoot interrupt route' >&2
 exit 1

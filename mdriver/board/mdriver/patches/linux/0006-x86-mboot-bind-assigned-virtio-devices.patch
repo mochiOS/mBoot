@@ -1,0 +1,157 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/mboot: bind assigned virtio PCI devices
+
+Claim the fixed BAR resources supplied by mBoot before publishing
+synthetic PCI devices to Linux drivers. Keep the devices hidden until
+mBoot has mapped their DMA and installed their physical interrupt routes.
+
+mBoot owns the physical MSI-X table and currently assigns one entry to each
+device. Reuse entry zero for configuration changes and all virtqueues
+instead of letting Linux allocate and program additional physical vectors.
+Until mBoot supports a separate physical configuration entry, dispatch both
+configuration and queue callbacks from the shared MSI-X interrupt without
+using the legacy ISR byte.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+ arch/x86/kernel/cpu/mboot.c         |  6 +++
+ drivers/virtio/virtio_pci_common.c | 78 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 84 insertions(+)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -76,6 +76,7 @@
+ 
+ static struct mboot_pci_frontend mboot_pci_devices[MBOOT_MAX_ASSIGNED_DEVICES];
+ static struct resource mboot_pci_bus_windows[256];
++static struct pci_bus *mboot_pci_buses[256];
+ static unsigned int mboot_pci_device_count;
+ static struct irq_domain *mboot_irq_domain;
+ 
+@@ -440,6 +441,8 @@
+ 		kfree(sysdata);
+ 		return -ENOMEM;
+ 	}
++	pci_bus_claim_resources(bus);
++	mboot_pci_buses[bus_number] = bus;
+ 	return 0;
+ }
+ 
+@@ -512,6 +515,9 @@
+ 	}
+ 	pr_info("mDriver: mBoot PCI frontend ready: %u devices, %u resources, %u active\n",
+ 		mboot_pci_device_count, resource_count, active);
++	for (index = 0; index < ARRAY_SIZE(mboot_pci_buses); index++)
++		if (mboot_pci_buses[index])
++			pci_bus_add_devices(mboot_pci_buses[index]);
+ 	return 0;
+ }
+ 
+--- a/drivers/virtio/virtio_pci_common.c
++++ b/drivers/virtio/virtio_pci_common.c
+@@ -16,6 +16,10 @@
+ 
+ #include "virtio_pci_common.h"
+ 
++#ifdef CONFIG_X86
++#include <asm/hypervisor.h>
++#endif
++
+ static bool force_legacy = false;
+ 
+ #if IS_ENABLED(CONFIG_VIRTIO_PCI_LEGACY)
+@@ -123,6 +127,15 @@
+ 	return vp_vring_interrupt(irq, opaque);
+ }
+ 
++#ifdef CONFIG_X86
++static irqreturn_t vp_mboot_interrupt(int irq, void *opaque)
++{
++	vp_config_changed(irq, opaque);
++	vp_vring_interrupt(irq, opaque);
++	return IRQ_HANDLED;
++}
++#endif
++
+ static int vp_request_msix_vectors(struct virtio_device *vdev, int nvectors,
+ 				   bool per_vq_vectors, struct irq_affinity *desc)
+ {
+@@ -516,6 +529,66 @@
+ 	return err;
+ }
+ 
++static int vp_find_vqs_mboot(struct virtio_device *vdev, unsigned int nvqs,
++			     struct virtqueue *vqs[],
++			     struct virtqueue_info vqs_info[])
++{
++	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
++	struct virtio_pci_admin_vq *avq = &vp_dev->admin_vq;
++	int i, err, queue_idx = 0;
++	struct virtqueue *vq;
++	u16 avq_num = 0;
++
++	vp_dev->vqs = kcalloc(nvqs, sizeof(*vp_dev->vqs), GFP_KERNEL);
++	if (!vp_dev->vqs)
++		return -ENOMEM;
++	if (vp_dev->avq_index) {
++		err = vp_dev->avq_index(vdev, &avq->vq_index, &avq_num);
++		if (err)
++			goto out_del_vqs;
++	}
++	err = request_irq(vp_dev->pci_dev->irq, vp_mboot_interrupt, IRQF_SHARED,
++			  dev_name(&vdev->dev), vp_dev);
++	if (err)
++		goto out_del_vqs;
++	vp_dev->intx_enabled = 1;
++	vp_dev->per_vq_vectors = false;
++	if (vp_dev->config_vector(vp_dev, 0) == VIRTIO_MSI_NO_VECTOR) {
++		err = -EBUSY;
++		goto out_del_vqs;
++	}
++	for (i = 0; i < nvqs; ++i) {
++		struct virtqueue_info *vqi = &vqs_info[i];
++
++		if (!vqi->name) {
++			vqs[i] = NULL;
++			continue;
++		}
++		vqs[i] = vp_setup_vq(vdev, queue_idx, vqi->callback,
++				     vqi->name, vqi->ctx, 0,
++				     &vp_dev->vqs[queue_idx]);
++		queue_idx++;
++		if (IS_ERR(vqs[i])) {
++			err = PTR_ERR(vqs[i]);
++			goto out_del_vqs;
++		}
++	}
++	if (!avq_num)
++		return 0;
++	sprintf(avq->name, "avq.%u", avq->vq_index);
++	vq = vp_setup_vq(vdev, queue_idx++, vp_modern_avq_done, avq->name,
++			 false, 0, &vp_dev->admin_vq.info);
++	if (IS_ERR(vq)) {
++		err = PTR_ERR(vq);
++		goto out_del_vqs;
++	}
++	return 0;
++
++out_del_vqs:
++	vp_del_vqs(vdev);
++	return err;
++}
++
+ /* the config->find_vqs() implementation */
+ int vp_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
+ 		struct virtqueue *vqs[], struct virtqueue_info vqs_info[],
+@@ -523,6 +596,11 @@
+ {
+ 	int err;
+ 
++#ifdef CONFIG_X86
++	if (x86_hyper_type == X86_HYPER_MBOOT)
++		return vp_find_vqs_mboot(vdev, nvqs, vqs, vqs_info);
++#endif
++
+ 	/* Try MSI-X with one vector per queue. */
+ 	err = vp_find_vqs_msix(vdev, nvqs, vqs, vqs_info,
+ 			       VP_VQ_VECTOR_POLICY_EACH, desc);
