@@ -18,7 +18,10 @@ pub const DOMAIN_FLAG_REQUIRED: u16 = 1 << 1;
 const DOMAIN_FLAGS_KNOWN: u16 = DOMAIN_FLAG_AUTO_START | DOMAIN_FLAG_REQUIRED;
 pub const DEVICE_FLAG_REQUIRED: u16 = 1 << 0;
 pub const DEVICE_FLAG_EPHEMERAL: u16 = 1 << 1;
-const DEVICE_FLAGS_KNOWN: u16 = DEVICE_FLAG_REQUIRED | DEVICE_FLAG_EPHEMERAL;
+pub const DEVICE_FLAG_READ_ONLY: u16 = 1 << 2;
+const DEVICE_FLAGS_KNOWN: u16 =
+    DEVICE_FLAG_REQUIRED | DEVICE_FLAG_EPHEMERAL | DEVICE_FLAG_READ_ONLY;
+pub const AUTO_REQUESTER: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -52,6 +55,7 @@ pub enum ManifestDeviceKind {
     Network = 3,
     Usb = 4,
     Audio = 5,
+    Nvme = 6,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +100,10 @@ impl ManifestDevice {
 
     pub const fn is_ephemeral(self) -> bool {
         self.flags & DEVICE_FLAG_EPHEMERAL != 0
+    }
+
+    pub const fn is_read_only(self) -> bool {
+        self.flags & DEVICE_FLAG_READ_ONLY != 0
     }
 }
 
@@ -405,6 +413,7 @@ impl<'a> LaunchManifest<'a> {
             3 => ManifestDeviceKind::Network,
             4 => ManifestDeviceKind::Usb,
             5 => ManifestDeviceKind::Audio,
+            6 => ManifestDeviceKind::Nvme,
             _ => return Err(Error::InvalidManifest),
         };
         let device = ManifestDevice {
@@ -414,9 +423,17 @@ impl<'a> LaunchManifest<'a> {
             flags: read_u16(entry, 6)?,
             domain_id: read_u32(entry, 8)?,
         };
+        let block_device = matches!(
+            device.kind,
+            ManifestDeviceKind::Block | ManifestDeviceKind::Nvme
+        );
         if device.requester == 0
             || device.flags & !DEVICE_FLAGS_KNOWN != 0
             || device.domain_id == 0
+            || (device.requester == AUTO_REQUESTER
+                && (device.segment != 0 || device.kind != ManifestDeviceKind::Nvme))
+            || (block_device && device.is_ephemeral() == device.is_read_only())
+            || (!block_device && (device.is_ephemeral() || device.is_read_only()))
             || entry[12..].iter().any(|byte| *byte != 0)
         {
             return Err(Error::InvalidManifest);
@@ -613,6 +630,40 @@ mod tests {
             }
         );
         assert!(manifest.device(0).unwrap().is_ephemeral());
+    }
+
+    #[test]
+    fn parses_an_automatic_read_only_nvme_policy() {
+        let mut bytes = manifest_with_device();
+        let device = MANIFEST_HEADER_SIZE + 2 * DOMAIN_ENTRY_SIZE;
+        bytes[device + 2..device + 4].copy_from_slice(&AUTO_REQUESTER.to_le_bytes());
+        bytes[device + 4..device + 6]
+            .copy_from_slice(&(ManifestDeviceKind::Nvme as u16).to_le_bytes());
+        bytes[device + 6..device + 8]
+            .copy_from_slice(&(DEVICE_FLAG_REQUIRED | DEVICE_FLAG_READ_ONLY).to_le_bytes());
+
+        let digest = Sha256::digest(&bytes).into();
+        let manifest = LaunchManifest::parse(&bytes, digest).unwrap();
+        let device = manifest.device(0).unwrap();
+        assert_eq!(device.requester, AUTO_REQUESTER);
+        assert_eq!(device.kind, ManifestDeviceKind::Nvme);
+        assert!(device.is_read_only());
+        assert!(!device.is_ephemeral());
+    }
+
+    #[test]
+    fn rejects_a_block_policy_with_read_only_and_ephemeral_modes() {
+        let mut bytes = manifest_with_device();
+        let device = MANIFEST_HEADER_SIZE + 2 * DOMAIN_ENTRY_SIZE;
+        bytes[device + 6..device + 8].copy_from_slice(
+            &(DEVICE_FLAG_REQUIRED | DEVICE_FLAG_EPHEMERAL | DEVICE_FLAG_READ_ONLY).to_le_bytes(),
+        );
+
+        let digest = Sha256::digest(&bytes).into();
+        assert_eq!(
+            LaunchManifest::parse(&bytes, digest),
+            Err(Error::InvalidManifest)
+        );
     }
 
     #[test]

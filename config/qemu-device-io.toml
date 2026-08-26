@@ -39,3 +39,4 @@ requester = 0x18
 kind = "block"
 domain = 2
 required = true
+ephemeral = true

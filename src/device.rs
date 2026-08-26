@@ -1,10 +1,10 @@
 use mnu_abi::hypervisor::{
-    PciDeviceInfo, PCI_DEVICE_FLAG_CLAIMABLE, PCI_DEVICE_FLAG_EPHEMERAL, PCI_DEVICE_STATE_ACTIVE,
-    PCI_DEVICE_STATE_CLAIMED_DISABLED, PCI_DEVICE_STATE_FIRMWARE_DEFERRED,
+    PciDeviceInfo, PCI_DEVICE_FLAG_CLAIMABLE, PCI_DEVICE_FLAG_EPHEMERAL, PCI_DEVICE_FLAG_READ_ONLY,
+    PCI_DEVICE_STATE_ACTIVE, PCI_DEVICE_STATE_CLAIMED_DISABLED, PCI_DEVICE_STATE_FIRMWARE_DEFERRED,
     PCI_DEVICE_STATE_QUARANTINED,
 };
 
-use crate::manifest::{ManifestDevice, ManifestDeviceKind};
+use crate::manifest::{ManifestDevice, ManifestDeviceKind, AUTO_REQUESTER};
 use crate::pci::PciFunction;
 
 const MAX_DEVICES: usize = 256;
@@ -73,14 +73,34 @@ impl DeviceTable {
             if policy.segment != 0 {
                 return Err(DeviceError::InvalidPolicy);
             }
-            let Some(record) = table.devices[..table.count]
-                .iter_mut()
-                .find(|record| record.info.requester == policy.requester)
-            else {
-                if policy.is_required() {
-                    return Err(DeviceError::DeviceUnavailable);
+            let record = if policy.requester == AUTO_REQUESTER {
+                let mut candidate = None;
+                for (index, record) in table.devices[..table.count].iter().enumerate() {
+                    if !kind_matches(record.info, policy.kind) {
+                        continue;
+                    }
+                    if candidate.replace(index).is_some() {
+                        return Err(DeviceError::InvalidPolicy);
+                    }
                 }
-                continue;
+                let Some(index) = candidate else {
+                    if policy.is_required() {
+                        return Err(DeviceError::DeviceUnavailable);
+                    }
+                    continue;
+                };
+                &mut table.devices[index]
+            } else {
+                let Some(record) = table.devices[..table.count]
+                    .iter_mut()
+                    .find(|record| record.info.requester == policy.requester)
+                else {
+                    if policy.is_required() {
+                        return Err(DeviceError::DeviceUnavailable);
+                    }
+                    continue;
+                };
+                record
             };
             if record.allowed_domain != 0 || !kind_matches(record.info, policy.kind) {
                 return Err(DeviceError::InvalidPolicy);
@@ -88,6 +108,9 @@ impl DeviceTable {
             record.allowed_domain = policy.domain_id;
             if policy.is_ephemeral() {
                 record.info.flags |= PCI_DEVICE_FLAG_EPHEMERAL;
+            }
+            if policy.is_read_only() {
+                record.info.flags |= PCI_DEVICE_FLAG_READ_ONLY;
             }
         }
         Ok(table)
@@ -227,13 +250,14 @@ const fn kind_matches(info: PciDeviceInfo, kind: ManifestDeviceKind) -> bool {
         ManifestDeviceKind::Network => info.class == 0x02,
         ManifestDeviceKind::Usb => info.class == 0x0c && info.subclass == 0x03,
         ManifestDeviceKind::Audio => info.class == 0x04,
+        ManifestDeviceKind::Nvme => info.class == 0x01 && info.subclass == 0x08,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{DEVICE_FLAG_EPHEMERAL, DEVICE_FLAG_REQUIRED};
+    use crate::manifest::{DEVICE_FLAG_EPHEMERAL, DEVICE_FLAG_READ_ONLY, DEVICE_FLAG_REQUIRED};
 
     fn policy(requester: u16, kind: ManifestDeviceKind) -> ManifestDevice {
         ManifestDevice {
@@ -329,5 +353,51 @@ mod tests {
             ),
             Err(DeviceError::InvalidPolicy)
         ));
+    }
+
+    #[test]
+    fn automatic_nvme_policy_selects_one_matching_controller_read_only() {
+        let functions = [
+            PciFunction {
+                requester: 0x001f,
+                class: 0x01,
+                subclass: 0x06,
+            },
+            PciFunction {
+                requester: 0x0100,
+                class: 0x01,
+                subclass: 0x08,
+            },
+        ];
+        let mut nvme = policy(AUTO_REQUESTER, ManifestDeviceKind::Nvme);
+        nvme.flags |= DEVICE_FLAG_READ_ONLY;
+        let table = DeviceTable::from_pci(&functions, None, &[nvme]).unwrap();
+        assert_eq!(table.query(2, 0).unwrap().flags, 0);
+        assert_eq!(
+            table.query(2, 1).unwrap().flags,
+            PCI_DEVICE_FLAG_CLAIMABLE | PCI_DEVICE_FLAG_READ_ONLY
+        );
+    }
+
+    #[test]
+    fn automatic_nvme_policy_rejects_an_ambiguous_machine() {
+        let functions = [
+            PciFunction {
+                requester: 0x0100,
+                class: 0x01,
+                subclass: 0x08,
+            },
+            PciFunction {
+                requester: 0x0200,
+                class: 0x01,
+                subclass: 0x08,
+            },
+        ];
+        let mut nvme = policy(AUTO_REQUESTER, ManifestDeviceKind::Nvme);
+        nvme.flags |= DEVICE_FLAG_READ_ONLY;
+        assert_eq!(
+            DeviceTable::from_pci(&functions, None, &[nvme]).err(),
+            Some(DeviceError::InvalidPolicy)
+        );
     }
 }

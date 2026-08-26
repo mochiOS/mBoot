@@ -112,14 +112,16 @@ for my $channel (@{$config->{channels}}) {
 
 my %device_kinds = (
     other => 0, display => 1, block => 2,
-    network => 3, usb => 4, audio => 5,
+    network => 3, usb => 4, audio => 5, nvme => 6,
 );
 my $device_entries = '';
 for my $device (@{$config->{devices}}) {
-    my $flags = ($device->{required} ? 1 : 0) | ($device->{ephemeral} ? 2 : 0);
+    my $flags = ($device->{required} ? 1 : 0) |
+        ($device->{ephemeral} ? 2 : 0) | ($device->{read_only} ? 4 : 0);
+    my $requester = $device->{requester} eq 'auto' ? 0xffff : $device->{requester};
     $device_entries .= pack(
         'v v v v V a20',
-        $device->{segment}, $device->{requester}, $device_kinds{$device->{kind}},
+        $device->{segment}, $requester, $device_kinds{$device->{kind}},
         $flags, $device->{domain}, '',
     );
 }

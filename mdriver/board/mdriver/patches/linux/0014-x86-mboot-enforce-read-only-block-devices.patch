@@ -1,0 +1,141 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/mboot: enforce read-only block devices
+
+Carry the signed mBoot read-only policy into mDriver, open protected block
+devices without write access, and reject both synchronous and asynchronous
+write or flush requests.  Writable scratch devices remain available only
+when the launch manifest marks them ephemeral.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -52,6 +52,7 @@
+ #define MBOOT_PCI_STATE_ACTIVE 4
+ #define MBOOT_PCI_FLAG_CLAIMABLE BIT(0)
+ #define MBOOT_PCI_FLAG_EPHEMERAL BIT(1)
++#define MBOOT_PCI_FLAG_READ_ONLY BIT(2)
+ #define MBOOT_MAX_PCI_DEVICES 256
+ #define MBOOT_MAX_ASSIGNED_DEVICES 32
+ #define MBOOT_PCI_CONFIG_DWORDS 64
+@@ -108,6 +109,7 @@
+ #define MBOOT_DEVICE_FEATURE_INTERRUPT_ACTIVE BIT_ULL(1)
+ #define MBOOT_DEVICE_FEATURE_PHYSICAL BIT_ULL(2)
+ #define MBOOT_DEVICE_FEATURE_EPHEMERAL BIT_ULL(3)
++#define MBOOT_DEVICE_FEATURE_READ_ONLY BIT_ULL(4)
+ #define MBOOT_DEVICE_FEATURE_BLOCK_READ BIT_ULL(8)
+ #define MBOOT_DEVICE_FEATURE_BLOCK_WRITE BIT_ULL(9)
+ #define MBOOT_DEVICE_FEATURE_BLOCK_FLUSH BIT_ULL(10)
+@@ -130,6 +132,7 @@
+ #define MBOOT_BLOCK_STATUS_IO_ERROR 2
+ #define MBOOT_BLOCK_STATUS_OUT_OF_RANGE 3
+ #define MBOOT_BLOCK_STATUS_BAD_STATE 4
++#define MBOOT_BLOCK_STATUS_READ_ONLY 5
+ 
+ struct mboot_ring_header {
+ 	u64 magic;
+@@ -389,7 +392,10 @@ static bool __init mboot_pci_info_valid(const struct mboot_pci_device_info *info
+ {
+ 	if (memchr_inv(info->reserved, 0, sizeof(info->reserved)) ||
+ 	    info->flags & ~(MBOOT_PCI_FLAG_CLAIMABLE |
+-			    MBOOT_PCI_FLAG_EPHEMERAL))
++			    MBOOT_PCI_FLAG_EPHEMERAL |
++			    MBOOT_PCI_FLAG_READ_ONLY) ||
++	    (info->flags & MBOOT_PCI_FLAG_EPHEMERAL &&
++	     info->flags & MBOOT_PCI_FLAG_READ_ONLY))
+ 		return false;
+ 
+ 	switch (info->state) {
+@@ -400,7 +406,8 @@ static bool __init mboot_pci_info_valid(const struct mboot_pci_device_info *info
+ 	case MBOOT_PCI_STATE_CLAIMED_DISABLED:
+ 	case MBOOT_PCI_STATE_ACTIVE:
+ 		return info->owner_domain &&
+-		       !(info->flags & ~MBOOT_PCI_FLAG_EPHEMERAL);
++		       !(info->flags & ~(MBOOT_PCI_FLAG_EPHEMERAL |
++				       MBOOT_PCI_FLAG_READ_ONLY));
+ 	default:
+ 		return false;
+ 	}
+@@ -839,6 +846,8 @@ static u64 mboot_control_device_features(const struct mboot_pci_device_info *inf
+ 
+ 	if (info->flags & MBOOT_PCI_FLAG_EPHEMERAL)
+ 		features |= MBOOT_DEVICE_FEATURE_EPHEMERAL;
++	if (info->flags & MBOOT_PCI_FLAG_READ_ONLY)
++		features |= MBOOT_DEVICE_FEATURE_READ_ONLY;
+ 	if (mboot_control_device_kind(info) == MBOOT_DEVICE_KIND_BLOCK)
+ 		features |= MBOOT_DEVICE_FEATURE_BLOCK_READ |
+ 			    MBOOT_DEVICE_FEATURE_BLOCK_WRITE |
+@@ -846,6 +855,8 @@ static u64 mboot_control_device_features(const struct mboot_pci_device_info *inf
+ 		features |= MBOOT_DEVICE_FEATURE_BLOCK_READ |
+-			    MBOOT_DEVICE_FEATURE_BLOCK_WRITE |
+-			    MBOOT_DEVICE_FEATURE_BLOCK_FLUSH |
+ 			    MBOOT_DEVICE_FEATURE_BLOCK_ASYNC_QUEUE;
++	if (mboot_control_device_kind(info) == MBOOT_DEVICE_KIND_BLOCK &&
++	    !(info->flags & MBOOT_PCI_FLAG_READ_ONLY))
++		features |= MBOOT_DEVICE_FEATURE_BLOCK_WRITE |
++			    MBOOT_DEVICE_FEATURE_BLOCK_FLUSH;
+ 	return features;
+ }
+@@ -878,7 +890,11 @@ static struct file *mboot_block_open(const struct mboot_pci_device_info *info)
+ 		if (!disk_live(disk))
+ 			continue;
++		if (info->flags & MBOOT_PCI_FLAG_READ_ONLY)
++			set_disk_ro(disk, true);
+ 		file = bdev_file_open_by_dev(disk_devt(disk),
+-					     BLK_OPEN_READ | BLK_OPEN_WRITE,
++					     BLK_OPEN_READ |
++					     (info->flags & MBOOT_PCI_FLAG_READ_ONLY ?
++					      0 : BLK_OPEN_WRITE),
+ 					     NULL, NULL);
+ 		break;
+ 	}
+@@ -1257,6 +1271,12 @@ static void mboot_control_handle(const struct mboot_control_request *request,
+ 				MBOOT_CONTROL_STATUS_INVALID_REQUEST;
+ 			return;
+ 		}
++		if (request->operation == MBOOT_CONTROL_BLOCK_WRITE &&
++		    mboot_pci_devices[request->device_id - 1].info.flags &
++			MBOOT_PCI_FLAG_READ_ONLY) {
++			response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
++			return;
++		}
+ 		if (request->operation == MBOOT_CONTROL_BLOCK_READ)
+ 			transferred = kernel_read(mboot_block_file,
+ 						  mboot_block_buffer + buffer_offset,
+@@ -1285,6 +1305,11 @@ static void mboot_control_handle(const struct mboot_control_request *request,
+ 			response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
+ 			return;
+ 		}
++		if (mboot_pci_devices[request->device_id - 1].info.flags &
++		    MBOOT_PCI_FLAG_READ_ONLY) {
++			response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
++			return;
++		}
+ 		response->status = vfs_fsync(mboot_block_file, 0) ?
+ 			MBOOT_CONTROL_STATUS_IO_ERROR : MBOOT_CONTROL_STATUS_OK;
+ 		return;
+@@ -1460,6 +1485,11 @@ static void mboot_block_handle(const struct mboot_block_request *request,
+ 		    request->buffer_id || request->sector || request->length ||
+ 		    request->buffer_offset)
+ 			return;
++		if (mboot_pci_devices[request->device_id - 1].info.flags &
++		    MBOOT_PCI_FLAG_READ_ONLY) {
++			response->status = MBOOT_BLOCK_STATUS_READ_ONLY;
++			return;
++		}
+ 		response->status = vfs_fsync(mboot_block_file, 0) ?
+ 			MBOOT_BLOCK_STATUS_IO_ERROR : MBOOT_BLOCK_STATUS_OK;
+ 		return;
+@@ -1477,6 +1507,12 @@ static void mboot_block_handle(const struct mboot_block_request *request,
+ 			MBOOT_BLOCK_STATUS_INVALID_REQUEST;
+ 		return;
+ 	}
++	if (request->operation == MBOOT_BLOCK_WRITE &&
++	    mboot_pci_devices[request->device_id - 1].info.flags &
++		MBOOT_PCI_FLAG_READ_ONLY) {
++		response->status = MBOOT_BLOCK_STATUS_READ_ONLY;
++		return;
++	}
+ 	if (request->operation == MBOOT_BLOCK_READ)
+ 		transferred = kernel_read(mboot_block_file,
+ 					  mboot_block_buffers[request->buffer_id] +

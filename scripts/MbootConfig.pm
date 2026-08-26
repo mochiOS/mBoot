@@ -128,12 +128,25 @@ sub read_mboot_config {
             exists $device->{$key} or die "$path: device is missing $key\n";
         }
         $device->{ephemeral} = 0 unless exists $device->{ephemeral};
+        $device->{read_only} = 0 unless exists $device->{read_only};
         $device->{segment} >= 0 && $device->{segment} <= 0xffff
             or die "$path: device segment is outside u16\n";
-        $device->{requester} > 0 && $device->{requester} <= 0xffff
-            or die "$path: device requester is outside a valid PCI BDF\n";
-        $device->{kind} =~ /^(?:other|display|block|network|usb|audio)$/
+        ($device->{requester} eq 'auto' ||
+            ($device->{requester} > 0 && $device->{requester} < 0xffff))
+            or die "$path: device requester must be a PCI BDF or auto\n";
+        $device->{kind} =~ /^(?:other|display|block|network|usb|audio|nvme)$/
             or die "$path: invalid device kind\n";
+        if ($device->{requester} eq 'auto') {
+            $device->{segment} == 0 && $device->{kind} eq 'nvme'
+                or die "$path: automatic selection is limited to a segment 0 NVMe controller\n";
+        }
+        if ($device->{kind} =~ /^(?:block|nvme)$/) {
+            $device->{ephemeral} != $device->{read_only}
+                or die "$path: block devices must be explicitly ephemeral or read_only\n";
+        }
+        elsif ($device->{ephemeral} || $device->{read_only}) {
+            die "$path: ephemeral and read_only apply only to block devices\n";
+        }
         $ids{$device->{domain}}
             or die "$path: device refers to an unknown Domain\n";
         my ($owner) = grep { $_->{id} == $device->{domain} } @domains;
@@ -141,7 +154,7 @@ sub read_mboot_config {
             or die "$path: physical devices belong only to Hardware Domains\n";
         $owner->{capabilities} & 0x2
             or die "$path: device owner lacks DeviceClaim capability\n";
-        my $key = "$device->{segment}:$device->{requester}";
+        my $key = "$device->{segment}:$device->{requester}:$device->{kind}";
         !$requesters{$key}++
             or die "$path: duplicate device requester $key\n";
     }

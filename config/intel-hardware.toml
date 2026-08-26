@@ -19,6 +19,14 @@ required = true
 restart = "never"
 max_restarts = 0
 
+[[devices]]
+segment = 0
+requester = "auto"
+kind = "nvme"
+domain = 2
+required = true
+read_only = true
+
 [[channels]]
 domain_a = 1
 port_a = 1
