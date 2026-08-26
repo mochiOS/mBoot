@@ -1,5 +1,5 @@
 use mnu_abi::hypervisor::{
-    PciDeviceInfo, PCI_DEVICE_FLAG_CLAIMABLE, PCI_DEVICE_STATE_ACTIVE,
+    PciDeviceInfo, PCI_DEVICE_FLAG_CLAIMABLE, PCI_DEVICE_FLAG_EPHEMERAL, PCI_DEVICE_STATE_ACTIVE,
     PCI_DEVICE_STATE_CLAIMED_DISABLED, PCI_DEVICE_STATE_FIRMWARE_DEFERRED,
     PCI_DEVICE_STATE_QUARANTINED,
 };
@@ -86,6 +86,9 @@ impl DeviceTable {
                 return Err(DeviceError::InvalidPolicy);
             }
             record.allowed_domain = policy.domain_id;
+            if policy.is_ephemeral() {
+                record.info.flags |= PCI_DEVICE_FLAG_EPHEMERAL;
+            }
         }
         Ok(table)
     }
@@ -230,7 +233,7 @@ const fn kind_matches(info: PciDeviceInfo, kind: ManifestDeviceKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::DEVICE_FLAG_REQUIRED;
+    use crate::manifest::{DEVICE_FLAG_EPHEMERAL, DEVICE_FLAG_REQUIRED};
 
     fn policy(requester: u16, kind: ManifestDeviceKind) -> ManifestDevice {
         ManifestDevice {
@@ -285,6 +288,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(table.claim(2, 0x0010), Err(DeviceError::InvalidState));
+    }
+
+    #[test]
+    fn ephemeral_policy_survives_claim_and_activation() {
+        let functions = [PciFunction {
+            requester: 0x0018,
+            class: 0x01,
+            subclass: 0,
+        }];
+        let mut ephemeral = policy(0x0018, ManifestDeviceKind::Block);
+        ephemeral.flags |= DEVICE_FLAG_EPHEMERAL;
+        let mut table = DeviceTable::from_pci(&functions, None, &[ephemeral]).unwrap();
+        table.claim(2, 0x0018).unwrap();
+        assert_eq!(table.query(2, 0).unwrap().flags, PCI_DEVICE_FLAG_EPHEMERAL);
+        table.activate(2, 0x0018).unwrap();
+        assert_eq!(table.query(2, 0).unwrap().flags, PCI_DEVICE_FLAG_EPHEMERAL);
     }
 
     #[test]

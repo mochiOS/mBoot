@@ -1,0 +1,417 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/mboot: provide block data I/O
+
+Connect block devices owned by the Hardware Domain to the System Domain's
+control protocol. Map a separate Grant page for payload data and support
+bounded reads, writes, flushes, and device lifetime management. Find each
+Linux block device through its assigned PCI ancestor instead of relying on
+a device name.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -2,8 +2,12 @@
+ /* mBoot hypervisor detection support. */
+ 
+ #include <linux/bits.h>
++#include <linux/blkdev.h>
+ #include <linux/build_bug.h>
++#include <linux/delay.h>
++#include <linux/device/class.h>
+ #include <linux/errno.h>
++#include <linux/fs.h>
+ #include <linux/init.h>
+ #include <linux/io.h>
+ #include <linux/irq.h>
+@@ -11,8 +15,8 @@
+ #include <linux/ioport.h>
+ #include <linux/kthread.h>
+ #include <linux/numa.h>
++#include <linux/overflow.h>
+ #include <linux/pci.h>
+-#include <linux/delay.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ 
+@@ -47,6 +51,7 @@
+ #define MBOOT_PCI_STATE_CLAIMED_DISABLED 3
+ #define MBOOT_PCI_STATE_ACTIVE 4
+ #define MBOOT_PCI_FLAG_CLAIMABLE BIT(0)
++#define MBOOT_PCI_FLAG_EPHEMERAL BIT(1)
+ #define MBOOT_MAX_PCI_DEVICES 256
+ #define MBOOT_MAX_ASSIGNED_DEVICES 32
+ #define MBOOT_PCI_CONFIG_DWORDS 64
+@@ -71,6 +76,11 @@
+ #define MBOOT_CONTROL_DESCRIBE 3
+ #define MBOOT_CONTROL_PING 4
+ #define MBOOT_CONTROL_START_SESSION 5
++#define MBOOT_CONTROL_OPEN_DEVICE 6
++#define MBOOT_CONTROL_CLOSE_DEVICE 7
++#define MBOOT_CONTROL_BLOCK_READ 8
++#define MBOOT_CONTROL_BLOCK_WRITE 9
++#define MBOOT_CONTROL_BLOCK_FLUSH 10
+ #define MBOOT_CONTROL_STATUS_OK 0
+ #define MBOOT_CONTROL_STATUS_UNSUPPORTED_VERSION 1
+ #define MBOOT_CONTROL_STATUS_INVALID_REQUEST 2
+@@ -78,7 +88,10 @@
+ #define MBOOT_CONTROL_STATUS_NOT_FOUND 4
+ #define MBOOT_CONTROL_STATUS_BAD_STATE 5
+ #define MBOOT_CONTROL_STATUS_END 6
+-#define MBOOT_CONTROL_CAPABILITIES GENMASK_ULL(3, 0)
++#define MBOOT_CONTROL_STATUS_INTERNAL_ERROR 7
++#define MBOOT_CONTROL_STATUS_IO_ERROR 8
++#define MBOOT_CONTROL_STATUS_OUT_OF_RANGE 9
++#define MBOOT_CONTROL_CAPABILITIES GENMASK_ULL(4, 0)
+ #define MBOOT_DEVICE_KIND_OTHER 0
+ #define MBOOT_DEVICE_KIND_BLOCK 1
+ #define MBOOT_DEVICE_KIND_NETWORK 2
+@@ -86,7 +99,17 @@
+ #define MBOOT_DEVICE_KIND_USB 4
+ #define MBOOT_DEVICE_KIND_SOUND 5
+ #define MBOOT_DEVICE_STATE_ONLINE 1
+-#define MBOOT_DEVICE_FEATURES GENMASK_ULL(2, 0)
++#define MBOOT_DEVICE_FEATURE_DMA_ISOLATED BIT_ULL(0)
++#define MBOOT_DEVICE_FEATURE_INTERRUPT_ACTIVE BIT_ULL(1)
++#define MBOOT_DEVICE_FEATURE_PHYSICAL BIT_ULL(2)
++#define MBOOT_DEVICE_FEATURE_EPHEMERAL BIT_ULL(3)
++#define MBOOT_DEVICE_FEATURE_BLOCK_READ BIT_ULL(8)
++#define MBOOT_DEVICE_FEATURE_BLOCK_WRITE BIT_ULL(9)
++#define MBOOT_DEVICE_FEATURE_BLOCK_FLUSH BIT_ULL(10)
++#define MBOOT_DEVICE_FEATURES_BASE GENMASK_ULL(2, 0)
++#define MBOOT_BLOCK_DATA_PAGE 1
++#define MBOOT_BLOCK_SECTOR_SIZE 512
++#define MBOOT_BLOCK_MAX_TRANSFER PAGE_SIZE
+ 
+ struct mboot_ring_header {
+ 	u64 magic;
+@@ -320,7 +343,8 @@
+ static bool __init mboot_pci_info_valid(const struct mboot_pci_device_info *info)
+ {
+ 	if (memchr_inv(info->reserved, 0, sizeof(info->reserved)) ||
+-	    info->flags & ~MBOOT_PCI_FLAG_CLAIMABLE)
++	    info->flags & ~(MBOOT_PCI_FLAG_CLAIMABLE |
++			    MBOOT_PCI_FLAG_EPHEMERAL))
+ 		return false;
+ 
+ 	switch (info->state) {
+@@ -330,7 +354,8 @@
+ 		return !info->owner_domain && !info->flags;
+ 	case MBOOT_PCI_STATE_CLAIMED_DISABLED:
+ 	case MBOOT_PCI_STATE_ACTIVE:
+-		return info->owner_domain && !info->flags;
++		return info->owner_domain &&
++		       !(info->flags & ~MBOOT_PCI_FLAG_EPHEMERAL);
+ 	default:
+ 		return false;
+ 	}
+@@ -731,6 +756,12 @@
+ static struct mboot_ring_page *mboot_control_ring;
+ static bool mboot_control_negotiated;
+ static bool mboot_control_active;
++static struct file *mboot_block_file;
++static void *mboot_block_buffer;
++static unsigned long mboot_block_grant_ref;
++static u32 mboot_block_device_id;
++static u64 mboot_grant_window_start;
++static bool mboot_block_io_verified;
+ 
+ static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info)
+ {
+@@ -751,6 +782,145 @@
+ 	}
+ }
+ 
++static u64 mboot_control_device_features(const struct mboot_pci_device_info *info)
++{
++	u64 features = MBOOT_DEVICE_FEATURES_BASE;
++
++	if (info->flags & MBOOT_PCI_FLAG_EPHEMERAL)
++		features |= MBOOT_DEVICE_FEATURE_EPHEMERAL;
++	if (mboot_control_device_kind(info) == MBOOT_DEVICE_KIND_BLOCK)
++		features |= MBOOT_DEVICE_FEATURE_BLOCK_READ |
++			    MBOOT_DEVICE_FEATURE_BLOCK_WRITE |
++			    MBOOT_DEVICE_FEATURE_BLOCK_FLUSH;
++	return features;
++}
++
++static bool mboot_device_descends_from(struct device *device,
++				       const struct device *ancestor)
++{
++	for (; device; device = device->parent)
++		if (device == ancestor)
++			return true;
++	return false;
++}
++
++static struct file *mboot_block_open(const struct mboot_pci_device_info *info)
++{
++	struct class_dev_iter iterator;
++	struct pci_dev *pdev;
++	struct device *device;
++	struct file *file = ERR_PTR(-ENODEV);
++	u8 bus = info->requester >> 8;
++	u8 devfn = info->requester & 0xff;
++
++	pdev = pci_get_domain_bus_and_slot(0, bus, devfn);
++	if (!pdev)
++		return file;
++	class_dev_iter_init(&iterator, &block_class, NULL, &disk_type);
++	while ((device = class_dev_iter_next(&iterator))) {
++		struct gendisk *disk;
++
++		if (!mboot_device_descends_from(device, &pdev->dev))
++			continue;
++		disk = dev_to_disk(device);
++		if (!disk_live(disk))
++			continue;
++		file = bdev_file_open_by_dev(disk_devt(disk),
++					     BLK_OPEN_READ | BLK_OPEN_WRITE,
++					     NULL, NULL);
++		break;
++	}
++	class_dev_iter_exit(&iterator);
++	pci_dev_put(pdev);
++	return file;
++}
++
++static void mboot_block_close(void)
++{
++	if (mboot_block_file) {
++		fput(mboot_block_file);
++		mboot_block_file = NULL;
++	}
++	if (mboot_block_buffer) {
++		memunmap(mboot_block_buffer);
++		mboot_block_buffer = NULL;
++	}
++	if (mboot_block_grant_ref) {
++		mboot_hypercall(MBOOT_HYPERCALL_GRANT_UNMAP,
++				mboot_block_grant_ref, 0, 0);
++		mboot_block_grant_ref = 0;
++	}
++	mboot_block_device_id = 0;
++}
++
++static int mboot_block_open_grant(u32 device_id, unsigned long grant_ref)
++{
++	const struct mboot_pci_frontend *device;
++	unsigned long result;
++	u64 address;
++
++	if (!device_id || device_id > mboot_pci_device_count ||
++	    mboot_block_file || mboot_block_buffer || mboot_block_grant_ref)
++		return -EINVAL;
++	device = &mboot_pci_devices[device_id - 1];
++	if (mboot_control_device_kind(&device->info) != MBOOT_DEVICE_KIND_BLOCK)
++		return -ENODEV;
++	address = mboot_grant_window_start + MBOOT_BLOCK_DATA_PAGE * PAGE_SIZE;
++	result = mboot_hypercall(MBOOT_HYPERCALL_GRANT_MAP, grant_ref, address, 0);
++	if (result)
++		return -EINVAL;
++	mboot_block_grant_ref = grant_ref;
++	mboot_block_buffer = memremap(address, PAGE_SIZE, MEMREMAP_WB);
++	if (!mboot_block_buffer)
++		goto fail;
++	mboot_block_file = mboot_block_open(&device->info);
++	if (IS_ERR(mboot_block_file)) {
++		mboot_block_file = NULL;
++		goto fail;
++	}
++	mboot_block_device_id = device_id;
++	return 0;
++
++fail:
++	mboot_block_close();
++	return -EIO;
++}
++
++static int mboot_block_request_valid(const struct mboot_control_request *request,
++				     loff_t *position, size_t *length,
++				     size_t *buffer_offset)
++{
++	struct block_device *bdev;
++	u64 byte_position;
++	u64 end_sector;
++	u64 logical_block_size;
++
++	if (!mboot_block_file || request->device_id != mboot_block_device_id ||
++	    request->arguments[3] || !request->arguments[1] ||
++	    request->arguments[1] > MBOOT_BLOCK_MAX_TRANSFER ||
++	    request->arguments[1] > SIZE_MAX || request->arguments[2] > SIZE_MAX)
++		return -EINVAL;
++	*length = request->arguments[1];
++	*buffer_offset = request->arguments[2];
++	if (*buffer_offset > PAGE_SIZE - *length)
++		return -EINVAL;
++	bdev = file_bdev(mboot_block_file);
++	logical_block_size = bdev_logical_block_size(bdev);
++	if (*length % logical_block_size || *buffer_offset % logical_block_size)
++		return -EINVAL;
++	if (check_mul_overflow(request->arguments[0],
++			       (u64)MBOOT_BLOCK_SECTOR_SIZE, &byte_position) ||
++	    check_add_overflow(request->arguments[0],
++			       request->arguments[1] / MBOOT_BLOCK_SECTOR_SIZE,
++			       &end_sector) ||
++	    end_sector > bdev_nr_sectors(bdev) || byte_position > LLONG_MAX)
++		return -ERANGE;
++	if (byte_position % logical_block_size)
++		return -EINVAL;
++	*position = byte_position;
++	return 0;
++}
++
+ static bool mboot_control_zero_arguments(const u64 arguments[4])
+ {
+ 	return !memchr_inv(arguments, 0, sizeof(u64) * 4);
+@@ -811,7 +981,7 @@
+ 		response->values[0] = index + 1;
+ 		response->values[1] = mboot_control_device_kind(&device->info);
+ 		response->values[2] = MBOOT_DEVICE_STATE_ONLINE;
+-		response->values[3] = MBOOT_DEVICE_FEATURES;
++		response->values[3] = mboot_control_device_features(&device->info);
+ 		return;
+ 	case MBOOT_CONTROL_DESCRIBE:
+ 		if (!mboot_control_zero_arguments(request->arguments))
+@@ -825,7 +995,7 @@
+ 		response->status = MBOOT_CONTROL_STATUS_OK;
+ 		response->values[0] = mboot_control_device_kind(&device->info);
+ 		response->values[1] = MBOOT_DEVICE_STATE_ONLINE;
+-		response->values[2] = MBOOT_DEVICE_FEATURES;
++		response->values[2] = mboot_control_device_features(&device->info);
+ 		response->values[3] = device->info.requester |
+ 				      (u64)device->info.class << 16 |
+ 				      (u64)device->info.subclass << 24;
+@@ -849,6 +1019,88 @@
+ 		response->status = MBOOT_CONTROL_STATUS_OK;
+ 		response->values[0] = mboot_control_ring->header.generation;
+ 		return;
++	case MBOOT_CONTROL_OPEN_DEVICE:
++		if (!mboot_control_active || !request->device_id ||
++		    !request->arguments[0] ||
++		    request->arguments[0] > U32_MAX ||
++		    request->arguments[1] != MBOOT_BLOCK_MAX_TRANSFER ||
++		    request->arguments[2] || request->arguments[3])
++			return;
++		if (mboot_block_open_grant(request->device_id,
++					   request->arguments[0])) {
++			response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
++			return;
++		}
++		device = &mboot_pci_devices[request->device_id - 1];
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = bdev_nr_sectors(file_bdev(mboot_block_file));
++		response->values[1] =
++			bdev_logical_block_size(file_bdev(mboot_block_file));
++		response->values[2] = MBOOT_BLOCK_MAX_TRANSFER;
++		response->values[3] = mboot_control_device_features(&device->info);
++		return;
++	case MBOOT_CONTROL_CLOSE_DEVICE:
++		if (!mboot_control_active ||
++		    !mboot_control_zero_arguments(request->arguments))
++			return;
++		if (!mboot_block_file ||
++		    request->device_id != mboot_block_device_id) {
++			response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
++			return;
++		}
++		mboot_block_close();
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		return;
++	case MBOOT_CONTROL_BLOCK_READ:
++	case MBOOT_CONTROL_BLOCK_WRITE: {
++		loff_t position;
++		size_t length;
++		size_t buffer_offset;
++		ssize_t transferred;
++		int validation;
++
++		if (!mboot_control_active)
++			return;
++		validation = mboot_block_request_valid(request, &position,
++						       &length, &buffer_offset);
++		if (validation) {
++			response->status = validation == -ERANGE ?
++				MBOOT_CONTROL_STATUS_OUT_OF_RANGE :
++				MBOOT_CONTROL_STATUS_INVALID_REQUEST;
++			return;
++		}
++		if (request->operation == MBOOT_CONTROL_BLOCK_READ)
++			transferred = kernel_read(mboot_block_file,
++						  mboot_block_buffer + buffer_offset,
++						  length, &position);
++		else
++			transferred = kernel_write(mboot_block_file,
++						   mboot_block_buffer + buffer_offset,
++						   length, &position);
++		if (transferred != (ssize_t)length) {
++			response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
++			return;
++		}
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = transferred;
++		if (!mboot_block_io_verified) {
++			mboot_block_io_verified = true;
++			pr_info("mDriver: block data I/O completed\n");
++		}
++		return;
++	}
++	case MBOOT_CONTROL_BLOCK_FLUSH:
++		if (!mboot_control_active ||
++		    !mboot_control_zero_arguments(request->arguments))
++			return;
++		if (!mboot_block_file ||
++		    request->device_id != mboot_block_device_id) {
++			response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
++			return;
++		}
++		response->status = vfs_fsync(mboot_block_file, 0) ?
++			MBOOT_CONTROL_STATUS_IO_ERROR : MBOOT_CONTROL_STATUS_OK;
++		return;
+ 	default:
+ 		response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
+ 	}
+@@ -941,6 +1193,7 @@
+ 		}
+ 		msleep_interruptible(10);
+ 	}
++	mboot_block_close();
+ 	pr_err("mDriver: device control worker stopped\n");
+ 	return -EIO;
+ }
+@@ -950,7 +1203,6 @@
+ 	struct task_struct *worker;
+ 	unsigned long grant_ref;
+ 	unsigned long result;
+-	u64 grant_window_start;
+ 	u64 grant_window_size;
+ 	u32 eax, ebx, ecx, edx;
+ 	bool session_started = false;
+@@ -965,19 +1217,21 @@
+ 	if (result != MBOOT_CONTROL_RING_PORT)
+ 		return -EIO;
+ 	cpuid(0x40000002, &eax, &ebx, &ecx, &edx);
+-	grant_window_start = (u64)ebx << 32 | eax;
++	mboot_grant_window_start = (u64)ebx << 32 | eax;
+ 	grant_window_size = (u64)edx << 32 | ecx;
+-	if (!grant_window_start || grant_window_start & (PAGE_SIZE - 1) ||
+-	    grant_window_size < PAGE_SIZE)
++	if (!mboot_grant_window_start ||
++	    mboot_grant_window_start & (PAGE_SIZE - 1) ||
++	    grant_window_size < (MBOOT_BLOCK_DATA_PAGE + 1) * PAGE_SIZE)
+ 		return -EIO;
+ 	grant_ref = mboot_hypercall(MBOOT_HYPERCALL_GRANT_QUERY, 0, 0, 0);
+ 	if (grant_ref == MBOOT_HYPERCALL_INVALID_ARGUMENT || grant_ref > U32_MAX)
+ 		return -EIO;
+ 	result = mboot_hypercall(MBOOT_HYPERCALL_GRANT_MAP, grant_ref,
+-				 grant_window_start, 0);
++				 mboot_grant_window_start, 0);
+ 	if (result)
+ 		return -EIO;
+-	mboot_control_ring = memremap(grant_window_start, PAGE_SIZE, MEMREMAP_WB);
++	mboot_control_ring = memremap(mboot_grant_window_start, PAGE_SIZE,
++				      MEMREMAP_WB);
+ 	if (!mboot_control_ring)
+ 		goto unmap;
+ 	if (!mboot_control_ring_valid(mboot_control_ring))

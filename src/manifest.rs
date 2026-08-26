@@ -17,7 +17,8 @@ pub const DOMAIN_FLAG_AUTO_START: u16 = 1 << 0;
 pub const DOMAIN_FLAG_REQUIRED: u16 = 1 << 1;
 const DOMAIN_FLAGS_KNOWN: u16 = DOMAIN_FLAG_AUTO_START | DOMAIN_FLAG_REQUIRED;
 pub const DEVICE_FLAG_REQUIRED: u16 = 1 << 0;
-const DEVICE_FLAGS_KNOWN: u16 = DEVICE_FLAG_REQUIRED;
+pub const DEVICE_FLAG_EPHEMERAL: u16 = 1 << 1;
+const DEVICE_FLAGS_KNOWN: u16 = DEVICE_FLAG_REQUIRED | DEVICE_FLAG_EPHEMERAL;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -91,6 +92,10 @@ pub struct ManifestDevice {
 impl ManifestDevice {
     pub const fn is_required(self) -> bool {
         self.flags & DEVICE_FLAG_REQUIRED != 0
+    }
+
+    pub const fn is_ephemeral(self) -> bool {
+        self.flags & DEVICE_FLAG_EPHEMERAL != 0
     }
 }
 
@@ -520,7 +525,8 @@ mod tests {
         bytes[device + 2..device + 4].copy_from_slice(&0x0010_u16.to_le_bytes());
         bytes[device + 4..device + 6]
             .copy_from_slice(&(ManifestDeviceKind::Block as u16).to_le_bytes());
-        bytes[device + 6..device + 8].copy_from_slice(&DEVICE_FLAG_REQUIRED.to_le_bytes());
+        bytes[device + 6..device + 8]
+            .copy_from_slice(&(DEVICE_FLAG_REQUIRED | DEVICE_FLAG_EPHEMERAL).to_le_bytes());
         bytes[device + 8..device + 12].copy_from_slice(&2_u32.to_le_bytes());
         bytes[14..16].copy_from_slice(&2_u16.to_le_bytes());
         let total_size = bytes.len() as u32;
@@ -602,10 +608,11 @@ mod tests {
                 segment: 0,
                 requester: 0x0010,
                 kind: ManifestDeviceKind::Block,
-                flags: DEVICE_FLAG_REQUIRED,
+                flags: DEVICE_FLAG_REQUIRED | DEVICE_FLAG_EPHEMERAL,
                 domain_id: 2,
             }
         );
+        assert!(manifest.device(0).unwrap().is_ephemeral());
     }
 
     #[test]

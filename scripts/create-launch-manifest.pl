@@ -116,7 +116,7 @@ my %device_kinds = (
 );
 my $device_entries = '';
 for my $device (@{$config->{devices}}) {
-    my $flags = $device->{required} ? 1 : 0;
+    my $flags = ($device->{required} ? 1 : 0) | ($device->{ephemeral} ? 2 : 0);
     $device_entries .= pack(
         'v v v v V a20',
         $device->{segment}, $device->{requester}, $device_kinds{$device->{kind}},

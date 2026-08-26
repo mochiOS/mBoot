@@ -127,6 +127,7 @@ sub read_mboot_config {
         for my $key (qw(segment requester kind domain required)) {
             exists $device->{$key} or die "$path: device is missing $key\n";
         }
+        $device->{ephemeral} = 0 unless exists $device->{ephemeral};
         $device->{segment} >= 0 && $device->{segment} <= 0xffff
             or die "$path: device segment is outside u16\n";
         $device->{requester} > 0 && $device->{requester} <= 0xffff
