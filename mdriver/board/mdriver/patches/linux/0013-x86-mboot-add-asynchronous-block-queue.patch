@@ -1,0 +1,535 @@
+From: mochiOS Developers <developers@mochios.dev>
+Subject: [PATCH] x86/mboot: add asynchronous block queue
+
+Keep block data traffic off the control ring by adding a dedicated shared
+request and completion queue.  The System Domain registers four
+Grant-backed buffers, submits correlated requests in batches, and receives
+one Event Channel notification after the backend publishes completions.
+
+The synchronous operations remain available for compatibility and early
+diagnostics.
+
+Signed-off-by: mochiOS Developers <developers@mochios.dev>
+---
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -62,6 +62,7 @@
+ #define MBOOT_CONTROL_PORT 1
+ #define MBOOT_CONTROL_IRQ_PORT 2
+ #define MBOOT_CONTROL_RING_PORT 3
++#define MBOOT_BLOCK_RING_PORT 4
+ #define MBOOT_CONTROL_RING_MAGIC 0x474e524948434f4dULL
+ #define MBOOT_CONTROL_RING_VERSION 1
+ #define MBOOT_CONTROL_RING_SLOTS 31
+@@ -81,6 +82,10 @@
+ #define MBOOT_CONTROL_BLOCK_READ 8
+ #define MBOOT_CONTROL_BLOCK_WRITE 9
+ #define MBOOT_CONTROL_BLOCK_FLUSH 10
++#define MBOOT_CONTROL_OPEN_BLOCK_QUEUE 11
++#define MBOOT_CONTROL_REGISTER_BLOCK_BUFFER 12
++#define MBOOT_CONTROL_START_BLOCK_QUEUE 13
++#define MBOOT_CONTROL_STOP_BLOCK_QUEUE 14
+ #define MBOOT_CONTROL_STATUS_OK 0
+ #define MBOOT_CONTROL_STATUS_UNSUPPORTED_VERSION 1
+ #define MBOOT_CONTROL_STATUS_INVALID_REQUEST 2
+@@ -106,10 +111,26 @@
+ #define MBOOT_DEVICE_FEATURE_BLOCK_READ BIT_ULL(8)
+ #define MBOOT_DEVICE_FEATURE_BLOCK_WRITE BIT_ULL(9)
+ #define MBOOT_DEVICE_FEATURE_BLOCK_FLUSH BIT_ULL(10)
++#define MBOOT_DEVICE_FEATURE_BLOCK_ASYNC_QUEUE BIT_ULL(11)
+ #define MBOOT_DEVICE_FEATURES_BASE GENMASK_ULL(2, 0)
+ #define MBOOT_BLOCK_DATA_PAGE 1
++#define MBOOT_BLOCK_RING_PAGE 2
++#define MBOOT_BLOCK_BUFFER_FIRST_PAGE 3
++#define MBOOT_BLOCK_BUFFER_COUNT 4
++#define MBOOT_BLOCK_RING_GENERATION 1
++#define MBOOT_BLOCK_REQUEST_KIND 3
++#define MBOOT_BLOCK_RESPONSE_KIND 4
+ #define MBOOT_BLOCK_SECTOR_SIZE 512
+ #define MBOOT_BLOCK_MAX_TRANSFER PAGE_SIZE
++#define MBOOT_BLOCK_VERSION 1
++#define MBOOT_BLOCK_READ 1
++#define MBOOT_BLOCK_WRITE 2
++#define MBOOT_BLOCK_FLUSH 3
++#define MBOOT_BLOCK_STATUS_OK 0
++#define MBOOT_BLOCK_STATUS_INVALID_REQUEST 1
++#define MBOOT_BLOCK_STATUS_IO_ERROR 2
++#define MBOOT_BLOCK_STATUS_OUT_OF_RANGE 3
++#define MBOOT_BLOCK_STATUS_BAD_STATE 4
+ 
+ struct mboot_ring_header {
+ 	u64 magic;
+@@ -156,6 +177,30 @@
+ 	u64 values[4];
+ };
+ 
++struct mboot_block_request {
++	u16 version;
++	u16 operation;
++	u32 flags;
++	u32 device_id;
++	u32 buffer_id;
++	u64 sector;
++	u32 length;
++	u32 buffer_offset;
++	u64 reserved[2];
++};
++
++struct mboot_block_response {
++	u16 version;
++	u16 operation;
++	u32 status;
++	u32 device_id;
++	u32 buffer_id;
++	u32 transferred;
++	u32 reserved0;
++	u64 sector;
++	u64 reserved[2];
++};
++
+ struct mboot_pci_device_info {
+ 	u16 requester;
+ 	u8 class;
+@@ -743,12 +788,12 @@
+ 	return 0;
+ }
+ 
+-static bool __init mboot_control_ring_valid(struct mboot_ring_page *ring)
++static bool mboot_ring_valid(struct mboot_ring_page *ring, u64 generation)
+ {
+ 	return READ_ONCE(ring->header.magic) == MBOOT_CONTROL_RING_MAGIC &&
+ 	       READ_ONCE(ring->header.version) == MBOOT_CONTROL_RING_VERSION &&
+ 	       READ_ONCE(ring->header.slot_count) == MBOOT_CONTROL_RING_SLOTS &&
+-	       READ_ONCE(ring->header.generation) == MBOOT_CONTROL_RING_GENERATION &&
++	       READ_ONCE(ring->header.generation) == generation &&
+ 	       !memchr_inv(ring->header.reserved, 0,
+ 			   sizeof(ring->header.reserved));
+ }
+@@ -762,6 +807,12 @@
+ static u32 mboot_block_device_id;
+ static u64 mboot_grant_window_start;
+ static bool mboot_block_io_verified;
++static struct mboot_ring_page *mboot_block_ring;
++static void *mboot_block_buffers[MBOOT_BLOCK_BUFFER_COUNT];
++static unsigned long mboot_block_buffer_refs[MBOOT_BLOCK_BUFFER_COUNT];
++static unsigned long mboot_block_ring_ref;
++static bool mboot_block_queue_active;
++static bool mboot_block_queue_verified;
+ 
+ static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info)
+ {
+@@ -791,7 +842,8 @@
+ 	if (mboot_control_device_kind(info) == MBOOT_DEVICE_KIND_BLOCK)
+ 		features |= MBOOT_DEVICE_FEATURE_BLOCK_READ |
+ 			    MBOOT_DEVICE_FEATURE_BLOCK_WRITE |
+-			    MBOOT_DEVICE_FEATURE_BLOCK_FLUSH;
++			    MBOOT_DEVICE_FEATURE_BLOCK_FLUSH |
++			    MBOOT_DEVICE_FEATURE_BLOCK_ASYNC_QUEUE;
+ 	return features;
+ }
+ 
+@@ -921,6 +973,143 @@
+ 	return 0;
+ }
+ 
++static void mboot_block_queue_close(void)
++{
++	unsigned int index;
++
++	mboot_block_queue_active = false;
++	for (index = 0; index < MBOOT_BLOCK_BUFFER_COUNT; index++) {
++		if (mboot_block_buffers[index]) {
++			memunmap(mboot_block_buffers[index]);
++			mboot_block_buffers[index] = NULL;
++		}
++		if (mboot_block_buffer_refs[index]) {
++			mboot_hypercall(MBOOT_HYPERCALL_GRANT_UNMAP,
++					mboot_block_buffer_refs[index], 0, 0);
++			mboot_block_buffer_refs[index] = 0;
++		}
++	}
++	if (mboot_block_ring) {
++		memunmap(mboot_block_ring);
++		mboot_block_ring = NULL;
++	}
++	if (mboot_block_ring_ref) {
++		mboot_hypercall(MBOOT_HYPERCALL_GRANT_UNMAP,
++				mboot_block_ring_ref, 0, 0);
++		mboot_block_ring_ref = 0;
++	}
++	if (mboot_block_file) {
++		fput(mboot_block_file);
++		mboot_block_file = NULL;
++	}
++	mboot_block_device_id = 0;
++}
++
++static int mboot_block_queue_open(u32 device_id, unsigned long grant_ref)
++{
++	const struct mboot_pci_frontend *device;
++	unsigned long result;
++	u64 address;
++
++	if (!device_id || device_id > mboot_pci_device_count ||
++	    mboot_block_file || mboot_block_ring || mboot_block_ring_ref)
++		return -EINVAL;
++	device = &mboot_pci_devices[device_id - 1];
++	if (mboot_control_device_kind(&device->info) != MBOOT_DEVICE_KIND_BLOCK)
++		return -ENODEV;
++	address = mboot_grant_window_start + MBOOT_BLOCK_RING_PAGE * PAGE_SIZE;
++	result = mboot_hypercall(MBOOT_HYPERCALL_GRANT_MAP, grant_ref, address, 0);
++	if (result)
++		return -EINVAL;
++	mboot_block_ring_ref = grant_ref;
++	mboot_block_ring = memremap(address, PAGE_SIZE, MEMREMAP_WB);
++	if (!mboot_block_ring ||
++	    !mboot_ring_valid(mboot_block_ring, MBOOT_BLOCK_RING_GENERATION))
++		goto fail;
++	mboot_block_file = mboot_block_open(&device->info);
++	if (IS_ERR(mboot_block_file)) {
++		mboot_block_file = NULL;
++		goto fail;
++	}
++	mboot_block_device_id = device_id;
++	return 0;
++
++fail:
++	mboot_block_queue_close();
++	return -EIO;
++}
++
++static int mboot_block_queue_register(unsigned int buffer_id,
++				      unsigned long grant_ref)
++{
++	unsigned long result;
++	u64 address;
++
++	if (!mboot_block_ring || !mboot_block_file || mboot_block_queue_active ||
++	    buffer_id >= MBOOT_BLOCK_BUFFER_COUNT ||
++	    mboot_block_buffers[buffer_id] || mboot_block_buffer_refs[buffer_id])
++		return -EINVAL;
++	address = mboot_grant_window_start +
++		  (MBOOT_BLOCK_BUFFER_FIRST_PAGE + buffer_id) * PAGE_SIZE;
++	result = mboot_hypercall(MBOOT_HYPERCALL_GRANT_MAP, grant_ref, address, 0);
++	if (result)
++		return -EINVAL;
++	mboot_block_buffer_refs[buffer_id] = grant_ref;
++	mboot_block_buffers[buffer_id] = memremap(address, PAGE_SIZE, MEMREMAP_WB);
++	if (!mboot_block_buffers[buffer_id]) {
++		mboot_hypercall(MBOOT_HYPERCALL_GRANT_UNMAP, grant_ref, 0, 0);
++		mboot_block_buffer_refs[buffer_id] = 0;
++		return -EIO;
++	}
++	return 0;
++}
++
++static bool mboot_block_queue_complete(void)
++{
++	unsigned int index;
++
++	for (index = 0; index < MBOOT_BLOCK_BUFFER_COUNT; index++)
++		if (!mboot_block_buffers[index])
++			return false;
++	return true;
++}
++
++static int mboot_block_queue_request_valid(const struct mboot_block_request *request,
++					   loff_t *position, size_t *length,
++					   size_t *buffer_offset)
++{
++	struct block_device *bdev;
++	u64 byte_position;
++	u64 end_sector;
++	u64 logical_block_size;
++
++	if (!mboot_block_queue_active || !mboot_block_file ||
++	    request->device_id != mboot_block_device_id ||
++	    request->buffer_id >= MBOOT_BLOCK_BUFFER_COUNT ||
++	    !mboot_block_buffers[request->buffer_id] || !request->length ||
++	    request->length > MBOOT_BLOCK_MAX_TRANSFER)
++		return -EINVAL;
++	*length = request->length;
++	*buffer_offset = request->buffer_offset;
++	if (*buffer_offset > PAGE_SIZE - *length)
++		return -EINVAL;
++	bdev = file_bdev(mboot_block_file);
++	logical_block_size = bdev_logical_block_size(bdev);
++	if (*length % logical_block_size || *buffer_offset % logical_block_size)
++		return -EINVAL;
++	if (check_mul_overflow(request->sector,
++			       (u64)MBOOT_BLOCK_SECTOR_SIZE, &byte_position) ||
++	    check_add_overflow(request->sector,
++			       request->length / MBOOT_BLOCK_SECTOR_SIZE,
++			       &end_sector) ||
++	    end_sector > bdev_nr_sectors(bdev) || byte_position > LLONG_MAX)
++		return -ERANGE;
++	if (byte_position % logical_block_size)
++		return -EINVAL;
++	*position = byte_position;
++	return 0;
++}
++
+ static bool mboot_control_zero_arguments(const u64 arguments[4])
+ {
+ 	return !memchr_inv(arguments, 0, sizeof(u64) * 4);
+@@ -1101,6 +1290,69 @@
+ 		response->status = vfs_fsync(mboot_block_file, 0) ?
+ 			MBOOT_CONTROL_STATUS_IO_ERROR : MBOOT_CONTROL_STATUS_OK;
+ 		return;
++	case MBOOT_CONTROL_OPEN_BLOCK_QUEUE:
++		if (!mboot_control_active || !request->device_id ||
++		    !request->arguments[0] || request->arguments[0] > U32_MAX ||
++		    request->arguments[1] != MBOOT_BLOCK_RING_GENERATION ||
++		    request->arguments[2] != MBOOT_BLOCK_BUFFER_COUNT ||
++		    request->arguments[3] != MBOOT_BLOCK_MAX_TRANSFER)
++			return;
++		if (mboot_block_queue_open(request->device_id,
++					   request->arguments[0])) {
++			response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
++			return;
++		}
++		device = &mboot_pci_devices[request->device_id - 1];
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = bdev_nr_sectors(file_bdev(mboot_block_file));
++		response->values[1] =
++			bdev_logical_block_size(file_bdev(mboot_block_file));
++		response->values[2] = MBOOT_BLOCK_BUFFER_COUNT;
++		response->values[3] = mboot_control_device_features(&device->info);
++		return;
++	case MBOOT_CONTROL_REGISTER_BLOCK_BUFFER:
++		if (!mboot_control_active ||
++		    request->device_id != mboot_block_device_id ||
++		    request->arguments[0] >= MBOOT_BLOCK_BUFFER_COUNT ||
++		    !request->arguments[1] || request->arguments[1] > U32_MAX ||
++		    request->arguments[2] || request->arguments[3])
++			return;
++		if (mboot_block_queue_register(request->arguments[0],
++					       request->arguments[1])) {
++			response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
++			return;
++		}
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = request->arguments[0];
++		return;
++	case MBOOT_CONTROL_START_BLOCK_QUEUE:
++		if (!mboot_control_active ||
++		    request->device_id != mboot_block_device_id ||
++		    !mboot_control_zero_arguments(request->arguments))
++			return;
++		if (!mboot_block_ring || mboot_block_queue_active ||
++		    !mboot_block_queue_complete()) {
++			response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
++			return;
++		}
++		mboot_block_queue_active = true;
++		pr_info("mDriver: asynchronous block queue ready\n");
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = MBOOT_BLOCK_RING_GENERATION;
++		response->values[1] = MBOOT_BLOCK_BUFFER_COUNT;
++		return;
++	case MBOOT_CONTROL_STOP_BLOCK_QUEUE:
++		if (!mboot_control_active ||
++		    request->device_id != mboot_block_device_id ||
++		    !mboot_control_zero_arguments(request->arguments))
++			return;
++		if (!mboot_block_queue_active) {
++			response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
++			return;
++		}
++		mboot_block_queue_close();
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		return;
+ 	default:
+ 		response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
+ 	}
+@@ -1174,10 +1426,146 @@
+ 	}
+ 	if (!processed)
+ 		return 0;
++	if (!mboot_block_queue_verified) {
++		mboot_block_queue_verified = true;
++		pr_info("mDriver: asynchronous block batch completed\n");
++	}
+ 	return mboot_hypercall(MBOOT_HYPERCALL_EVENT_SEND,
+ 			       MBOOT_CONTROL_RING_PORT, 0, 0) ? -EIO : 0;
+ }
+ 
++static void mboot_block_handle(const struct mboot_block_request *request,
++			       struct mboot_block_response *response)
++{
++	loff_t position;
++	size_t length;
++	size_t buffer_offset;
++	ssize_t transferred;
++	int validation;
++
++	memset(response, 0, sizeof(*response));
++	response->version = MBOOT_BLOCK_VERSION;
++	response->operation = request->operation;
++	response->device_id = request->device_id;
++	response->buffer_id = request->buffer_id;
++	response->sector = request->sector;
++	response->status = MBOOT_BLOCK_STATUS_INVALID_REQUEST;
++	if (request->version != MBOOT_BLOCK_VERSION || request->flags ||
++	    memchr_inv(request->reserved, 0, sizeof(request->reserved)))
++		return;
++	if (!mboot_block_queue_active) {
++		response->status = MBOOT_BLOCK_STATUS_BAD_STATE;
++		return;
++	}
++	if (request->operation == MBOOT_BLOCK_FLUSH) {
++		if (request->device_id != mboot_block_device_id ||
++		    request->buffer_id || request->sector || request->length ||
++		    request->buffer_offset)
++			return;
++		response->status = vfs_fsync(mboot_block_file, 0) ?
++			MBOOT_BLOCK_STATUS_IO_ERROR : MBOOT_BLOCK_STATUS_OK;
++		return;
++	}
++	if (request->operation != MBOOT_BLOCK_READ &&
++	    request->operation != MBOOT_BLOCK_WRITE)
++		return;
++	validation = mboot_block_queue_request_valid(request, &position, &length,
++						     &buffer_offset);
++	if (validation) {
++		response->status = validation == -ERANGE ?
++			MBOOT_BLOCK_STATUS_OUT_OF_RANGE :
++			MBOOT_BLOCK_STATUS_INVALID_REQUEST;
++		return;
++	}
++	if (request->operation == MBOOT_BLOCK_READ)
++		transferred = kernel_read(mboot_block_file,
++					  mboot_block_buffers[request->buffer_id] +
++						buffer_offset,
++					  length, &position);
++	else
++		transferred = kernel_write(mboot_block_file,
++					   mboot_block_buffers[request->buffer_id] +
++						 buffer_offset,
++					   length, &position);
++	if (transferred != (ssize_t)length) {
++		response->status = MBOOT_BLOCK_STATUS_IO_ERROR;
++		return;
++	}
++	response->status = MBOOT_BLOCK_STATUS_OK;
++	response->transferred = transferred;
++}
++
++static int mboot_block_process(void)
++{
++	struct mboot_block_response block_response;
++	struct mboot_block_request block_request;
++	struct mboot_ring_message response;
++	struct mboot_ring_message request;
++	u32 response_producer;
++	u32 response_consumer;
++	u32 response_index;
++	u32 producer;
++	u32 consumer;
++	bool processed = false;
++
++	if (!mboot_block_queue_active || !mboot_block_ring)
++		return -EIO;
++	/* Pair with the System Domain's request publication. */
++	producer = smp_load_acquire(&mboot_block_ring->header.request_producer);
++	consumer = READ_ONCE(mboot_block_ring->header.request_consumer);
++	if (producer - consumer > MBOOT_BLOCK_BUFFER_COUNT)
++		return -EIO;
++	while (consumer != producer) {
++		bool valid_request;
++
++		memcpy(&request,
++		       &mboot_block_ring->requests[consumer % MBOOT_CONTROL_RING_SLOTS],
++		       sizeof(request));
++		memset(&block_request, 0, sizeof(block_request));
++		valid_request = request.kind == MBOOT_BLOCK_REQUEST_KIND &&
++				!request.flags &&
++				request.len == sizeof(block_request);
++		if (valid_request)
++			memcpy(&block_request, request.payload,
++			       sizeof(block_request));
++		if (valid_request) {
++			mboot_block_handle(&block_request, &block_response);
++		} else {
++			memset(&block_response, 0, sizeof(block_response));
++			block_response.version = MBOOT_BLOCK_VERSION;
++			block_response.status = MBOOT_BLOCK_STATUS_INVALID_REQUEST;
++		}
++		memset(&response, 0, sizeof(response));
++		response.kind = MBOOT_BLOCK_RESPONSE_KIND;
++		response.len = sizeof(block_response);
++		response.request_id = request.request_id;
++		memcpy(response.payload, &block_response,
++		       sizeof(block_response));
++		response_producer =
++			READ_ONCE(mboot_block_ring->header.response_producer);
++		response_consumer =
++			/* Pair with the System Domain returning a response slot. */
++			smp_load_acquire(&mboot_block_ring->header.response_consumer);
++		if (response_producer - response_consumer >= MBOOT_CONTROL_RING_SLOTS)
++			return -ENOSPC;
++		response_index = response_producer % MBOOT_CONTROL_RING_SLOTS;
++		memcpy(&mboot_block_ring->responses[response_index], &response,
++		       sizeof(response));
++		/* Publish the response after its contents are visible. */
++		smp_store_release(&mboot_block_ring->header.response_producer,
++				  response_producer + 1);
++		consumer++;
++		/* Finish reading the request before returning its slot. */
++		smp_store_release(&mboot_block_ring->header.request_consumer,
++				  consumer);
++		processed = true;
++	}
++	if (!processed)
++		return 0;
++	return mboot_hypercall(MBOOT_HYPERCALL_EVENT_SEND,
++			       MBOOT_BLOCK_RING_PORT, 0, 0) ? -EIO : 0;
++}
++
+ static int mboot_control_worker(void *unused)
+ {
+ 	while (!kthread_should_stop()) {
+@@ -1188,11 +1576,15 @@
+ 		if (result == MBOOT_CONTROL_RING_PORT) {
+ 			if (mboot_control_process(&ignored))
+ 				break;
++		} else if (result == MBOOT_BLOCK_RING_PORT) {
++			if (mboot_block_process())
++				break;
+ 		} else if (result != MBOOT_EVENT_NO_EVENT) {
+ 			break;
+ 		}
+ 		msleep_interruptible(10);
+ 	}
++	mboot_block_queue_close();
+ 	mboot_block_close();
+ 	pr_err("mDriver: device control worker stopped\n");
+ 	return -EIO;
+@@ -1212,6 +1604,8 @@
+ 	BUILD_BUG_ON(sizeof(struct mboot_ring_page) != PAGE_SIZE);
+ 	BUILD_BUG_ON(sizeof(struct mboot_control_request) != 48);
+ 	BUILD_BUG_ON(sizeof(struct mboot_control_response) != 48);
++	BUILD_BUG_ON(sizeof(struct mboot_block_request) != 48);
++	BUILD_BUG_ON(sizeof(struct mboot_block_response) != 48);
+ 
+ 	result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_WAIT, 0, 0, 0);
+ 	if (result != MBOOT_CONTROL_RING_PORT)
+@@ -1221,7 +1615,8 @@
+ 	grant_window_size = (u64)edx << 32 | ecx;
+ 	if (!mboot_grant_window_start ||
+ 	    mboot_grant_window_start & (PAGE_SIZE - 1) ||
+-	    grant_window_size < (MBOOT_BLOCK_DATA_PAGE + 1) * PAGE_SIZE)
++	    grant_window_size <
++		(MBOOT_BLOCK_BUFFER_FIRST_PAGE + MBOOT_BLOCK_BUFFER_COUNT) * PAGE_SIZE)
+ 		return -EIO;
+ 	grant_ref = mboot_hypercall(MBOOT_HYPERCALL_GRANT_QUERY, 0, 0, 0);
+ 	if (grant_ref == MBOOT_HYPERCALL_INVALID_ARGUMENT || grant_ref > U32_MAX)
+@@ -1234,7 +1629,7 @@
+ 				      MEMREMAP_WB);
+ 	if (!mboot_control_ring)
+ 		goto unmap;
+-	if (!mboot_control_ring_valid(mboot_control_ring))
++	if (!mboot_ring_valid(mboot_control_ring, MBOOT_CONTROL_RING_GENERATION))
+ 		goto unmap_memory;
+ 	while (!session_started) {
+ 		if (mboot_control_process(&session_started))

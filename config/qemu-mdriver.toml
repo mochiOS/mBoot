@@ -37,6 +37,12 @@ port_a = 3
 domain_b = 2
 port_b = 3
 
+[[channels]]
+domain_a = 1
+port_a = 4
+domain_b = 2
+port_b = 4
+
 [[devices]]
 segment = 0
 requester = 0x18
