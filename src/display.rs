@@ -76,6 +76,31 @@ pub fn pci_dma_failure(requester: u16) {
     draw_hex(u64::from(requester), line_y(2));
 }
 
+pub fn nvme_candidates(first: (u16, u16, u16), second: (u16, u16, u16)) {
+    show(0x006B_2028, b"NVME", b"");
+    draw_pci_identity(first, line_y(1));
+    draw_pci_identity(second, line_y(2));
+}
+
+fn draw_pci_identity((requester, vendor, device): (u16, u16, u16), y: usize) {
+    let mut text = [b' '; 14];
+    write_hex_u16(&mut text[0..4], requester);
+    write_hex_u16(&mut text[5..9], vendor);
+    write_hex_u16(&mut text[10..14], device);
+    draw_centered(&text, y);
+}
+
+fn write_hex_u16(output: &mut [u8], value: u16) {
+    for (index, digit) in output.iter_mut().enumerate() {
+        let nibble = ((value >> ((3 - index) * 4)) & 0xf) as u8;
+        *digit = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'A' + nibble - 10
+        };
+    }
+}
+
 pub fn vmcs_failure(field: u64) {
     show(0x006B_2028, b"MBOOT", b"VMCS");
     draw_hex(field, line_y(2));

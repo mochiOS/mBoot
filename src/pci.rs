@@ -401,6 +401,8 @@ fn valid_guest_vectors(vectors: &[u8; PCI_DEVICE_INTERRUPT_COUNT], count: usize)
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PciFunction {
     pub requester: u16,
+    pub vendor: u16,
+    pub device: u16,
     pub class: u8,
     pub subclass: u8,
 }
@@ -1020,6 +1022,8 @@ unsafe fn quarantine_function(
     if report.inventory_count < report.inventory.len() {
         report.inventory[report.inventory_count] = PciFunction {
             requester: requester_id(bus, device, function),
+            vendor: unsafe { read_u16(bus, device, function, 0) },
+            device: unsafe { read_u16(bus, device, function, 2) },
             class,
             subclass,
         };

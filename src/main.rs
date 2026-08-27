@@ -542,9 +542,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 display::failure(24);
                 halt()
             }
-            Err(DeviceError::AmbiguousDevice) => {
+            Err(DeviceError::AmbiguousDevice(first, second)) => {
                 log!("PCI ownership policy failed: automatic device selection is ambiguous");
-                display::failure(25);
+                display::nvme_candidates(
+                    (first.requester, first.vendor, first.device),
+                    (second.requester, second.vendor, second.device),
+                );
                 halt()
             }
             Err(error) => {

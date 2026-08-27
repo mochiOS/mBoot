@@ -34,7 +34,7 @@ const EMPTY_RECORD: DeviceRecord = DeviceRecord {
 pub enum DeviceError {
     InvalidPolicy,
     DeviceUnavailable,
-    AmbiguousDevice,
+    AmbiguousDevice(PciFunction, PciFunction),
     PermissionDenied,
     InvalidState,
 }
@@ -76,13 +76,16 @@ impl DeviceTable {
             }
             let record = if policy.requester == AUTO_REQUESTER {
                 let mut candidate = None;
+                let mut first_candidate = None;
                 for (index, record) in table.devices[..table.count].iter().enumerate() {
                     if !kind_matches(record.info, policy.kind) {
                         continue;
                     }
-                    if candidate.replace(index).is_some() {
-                        return Err(DeviceError::AmbiguousDevice);
+                    if let Some(first) = first_candidate {
+                        return Err(DeviceError::AmbiguousDevice(first, functions[index]));
                     }
+                    first_candidate = Some(functions[index]);
+                    candidate = Some(index);
                 }
                 let Some(index) = candidate else {
                     if policy.is_required() {
@@ -276,6 +279,7 @@ mod tests {
             requester: 0x00a0,
             class: 0x0c,
             subclass: 0x03,
+            ..PciFunction::default()
         }];
         let mut table =
             DeviceTable::from_pci(&functions, None, &[policy(0x00a0, ManifestDeviceKind::Usb)])
@@ -305,6 +309,7 @@ mod tests {
             requester: 0x0010,
             class: 0x03,
             subclass: 0,
+            ..PciFunction::default()
         }];
         let mut table = DeviceTable::from_pci(
             &functions,
@@ -321,6 +326,7 @@ mod tests {
             requester: 0x0018,
             class: 0x01,
             subclass: 0,
+            ..PciFunction::default()
         }];
         let mut ephemeral = policy(0x0018, ManifestDeviceKind::Block);
         ephemeral.flags |= DEVICE_FLAG_EPHEMERAL;
@@ -337,6 +343,7 @@ mod tests {
             requester: 0x0010,
             class: 0x03,
             subclass: 0,
+            ..PciFunction::default()
         }];
         assert!(matches!(
             DeviceTable::from_pci(
@@ -363,11 +370,13 @@ mod tests {
                 requester: 0x001f,
                 class: 0x01,
                 subclass: 0x06,
+                ..PciFunction::default()
             },
             PciFunction {
                 requester: 0x0100,
                 class: 0x01,
                 subclass: 0x08,
+                ..PciFunction::default()
             },
         ];
         let mut nvme = policy(AUTO_REQUESTER, ManifestDeviceKind::Nvme);
@@ -385,11 +394,15 @@ mod tests {
         let functions = [
             PciFunction {
                 requester: 0x0100,
+                vendor: 0x144d,
+                device: 0xa808,
                 class: 0x01,
                 subclass: 0x08,
             },
             PciFunction {
                 requester: 0x0200,
+                vendor: 0x8086,
+                device: 0xf1a8,
                 class: 0x01,
                 subclass: 0x08,
             },
@@ -398,7 +411,7 @@ mod tests {
         nvme.flags |= DEVICE_FLAG_READ_ONLY;
         assert_eq!(
             DeviceTable::from_pci(&functions, None, &[nvme]).err(),
-            Some(DeviceError::AmbiguousDevice)
+            Some(DeviceError::AmbiguousDevice(functions[0], functions[1]))
         );
     }
 }
