@@ -60,6 +60,13 @@ mdriver-test:
 	HV_DISK_IMAGE="$(OUTPUT_DIR)/mdriver.iso" scripts/test-mdriver.sh
 	MDRIVER_STORAGE_CORRUPT=primary \
 		HV_DISK_IMAGE="$(OUTPUT_DIR)/mdriver.iso" scripts/test-mdriver.sh
+	$(MAKE) image \
+		CONFIG="$(CURDIR)/config/qemu-mdriver-inspection.toml" \
+		IMAGE="$(OUTPUT_DIR)/mdriver-inspection.iso" \
+		MDRIVER_KERNEL="$(MDRIVER_KERNEL)" \
+		MDRIVER_INITRAMFS="$(MDRIVER_INITRAMFS)"
+	MDRIVER_STORAGE_INSPECT=1 \
+		HV_DISK_IMAGE="$(OUTPUT_DIR)/mdriver-inspection.iso" scripts/test-mdriver.sh
 
 qemu-test:
 	$(MAKE) image CONFIG="$(CURDIR)/config/qemu.toml" IMAGE="$(OUTPUT_DIR)/qemu.iso"

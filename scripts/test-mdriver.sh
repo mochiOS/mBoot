@@ -21,6 +21,7 @@ else
 fi
 MDRIVER_VECTORS=${MDRIVER_VECTORS:-}
 STORAGE_CORRUPT=${MDRIVER_STORAGE_CORRUPT:-none}
+STORAGE_INSPECT=${MDRIVER_STORAGE_INSPECT:-0}
 OVMF_CODE="$ROOT/firmware/OVMF_CODE_4M.fd"
 OVMF_VARS="$ROOT/firmware/OVMF_VARS_4M.fd"
 STORAGE_DISK_GUID=6d426f6f-7400-4b00-8a00-00000000d001
@@ -101,6 +102,24 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
             exit 1
         }
         echo 'test-mdriver: malformed GPT rejected without writes: PASS'
+        exit 0
+    fi
+    if [[ $STORAGE_INSPECT == 1 ]] \
+        && grep -Fq '[Domain 1] mDriver read-only storage inspection ready' "$WORK/serial.log" 2>/dev/null \
+        && grep -Fq '[Domain 1] STORAGE DISK  6D426F6F-7400-4B00-8A00-00000000D001' "$WORK/serial.log" \
+        && grep -Fq '[Domain 1] STORAGE TYPE 00 6D6F6368-694F-5300-8000-6D5061727401' "$WORK/serial.log" \
+        && grep -Fq '[Domain 1] STORAGE PART 00 6D426F6F-7400-4B00-8A00-00000000D002' "$WORK/serial.log" \
+        && grep -Fq '[Domain 1] STORAGE P00 RANGE 0000000000000800 0000000000002800' "$WORK/serial.log" \
+        && grep -Fq 'mDriver asynchronous block queue ready' "$WORK/serial.log"; then
+        kill "$QEMU_PID" 2>/dev/null || true
+        wait "$QEMU_PID" 2>/dev/null || true
+        QEMU_PID=
+        whole_after=$(sha256sum "$WORK/device.img")
+        [[ $whole_before == "$whole_after" ]] || {
+            echo 'test-mdriver: read-only inspection modified storage' >&2
+            exit 1
+        }
+        echo 'test-mdriver: read-only GPT inspection without writes: PASS'
         exit 0
     fi
     if grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null \

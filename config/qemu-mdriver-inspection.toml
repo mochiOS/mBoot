@@ -1,0 +1,70 @@
+version = 6
+toolchain = "nightly-2026-05-14"
+disk_size_mib = 128
+esp_size_mib = 96
+disk_guid = "6d426f6f-7400-4b00-8a00-000000000520"
+esp_guid = "6d426f6f-7400-4b00-8a00-000000000521"
+
+[[domains]]
+id = 1
+role = "system"
+memory_mib = 2
+vcpus = 1
+capabilities = 0
+format = "native-elf"
+image = "mochios"
+path = '\EFI\MBOOT\MOCHIOS.ELF'
+autostart = true
+required = true
+restart = "never"
+max_restarts = 0
+
+[[channels]]
+domain_a = 1
+port_a = 1
+domain_b = 2
+port_b = 1
+
+[[channels]]
+domain_a = 1
+port_a = 2
+domain_b = 2
+port_b = 2
+
+[[channels]]
+domain_a = 1
+port_a = 3
+domain_b = 2
+port_b = 3
+
+[[channels]]
+domain_a = 1
+port_a = 4
+domain_b = 2
+port_b = 4
+
+[[devices]]
+segment = 0
+requester = 0x18
+kind = "block"
+domain = 2
+required = true
+read_only = true
+
+[[domains]]
+id = 2
+role = "hardware"
+memory_mib = 64
+vcpus = 1
+capabilities = 0x3
+format = "linux-pvh"
+image = "mdriver"
+path = '\EFI\MBOOT\MDRIVER.ELF'
+initramfs = "mdriver"
+initramfs_path = '\EFI\MBOOT\MDRIVER.CPIO'
+command_line = "earlycon=uart,io,0x3f8 console=ttyS0 rdinit=/init pci=off acpi=off maxcpus=0 panic=-1"
+autostart = true
+required = true
+restart = "never"
+max_restarts = 0
+

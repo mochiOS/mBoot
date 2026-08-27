@@ -101,6 +101,52 @@ pub fn storage_candidates(
     }
 }
 
+pub fn console_page(message: &[u8]) -> bool {
+    if ADDRESS.load(Ordering::Acquire) == 0 || message.is_empty() || message.len() > 4096 {
+        return false;
+    }
+    let mut line_count = 0_usize;
+    let mut line_length = 0_usize;
+    let mut maximum_length = 0_usize;
+    for &byte in message {
+        if byte == b'\n' {
+            maximum_length = maximum_length.max(line_length);
+            line_length = 0;
+            line_count += 1;
+        } else if (b' '..=b'~').contains(&byte) {
+            line_length += 1;
+        } else {
+            return false;
+        }
+    }
+    if line_length != 0 {
+        maximum_length = maximum_length.max(line_length);
+        line_count += 1;
+    }
+    if line_count == 0 || maximum_length == 0 || line_count > 32 {
+        return false;
+    }
+
+    let width = WIDTH.load(Ordering::Relaxed);
+    let height = HEIGHT.load(Ordering::Relaxed);
+    let width_scale = width / maximum_length.saturating_mul(6).max(1);
+    let height_scale = height / line_count.saturating_mul(10).max(1);
+    let scale = width_scale.min(height_scale).min(4).max(1);
+    let total_height = line_count * 10 * scale - 3 * scale;
+    let mut y = height.saturating_sub(total_height) / 2;
+    fill(0x0017_4F35);
+    for line in message.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let text_width = line.len().saturating_mul(6 * scale).saturating_sub(scale);
+        let x = width.saturating_sub(text_width) / 2;
+        draw_text(line, x, y, scale);
+        y += 10 * scale;
+    }
+    true
+}
+
 fn draw_pci_identity((requester, vendor, device): (u16, u16, u16), y: usize) {
     let mut text = [b' '; 14];
     write_hex_u16(&mut text[0..4], requester);
@@ -271,6 +317,7 @@ fn glyph(character: u8) -> [u8; 7] {
         b'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
         b'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
         b'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        b'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
         b'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
         b'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
         b'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
@@ -278,6 +325,8 @@ fn glyph(character: u8) -> [u8; 7] {
         b'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
         b'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010],
         b'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+        b'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+        b'-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
         _ => [0; 7],
     }
 }

@@ -1594,6 +1594,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         runtime.pending_result = match vm_exit.hypercall_number {
             number if number == HypercallNumber::ConsoleWrite as u64 => handle_console_write(
                 runtime.domain.id(),
+                runtime.domain.role() == DomainRole::System,
                 runtime.domain.nested_pages(),
                 vm_exit.arg0,
                 vm_exit.arg1,
@@ -2001,6 +2002,7 @@ fn notify_system_domain(runtime_domains: &mut [RuntimeDomain]) {
 
 fn handle_console_write(
     domain_id: DomainId,
+    allow_display: bool,
     memory: &NestedPageTable,
     address: u64,
     len: u64,
@@ -2018,6 +2020,11 @@ fn handle_console_write(
         return HYPERCALL_INVALID_ARGUMENT;
     };
     crate::serial::print(format_args!("[Domain {}] {}", domain_id.get(), message));
+    if allow_display {
+        if let Some(report) = bytes.strip_prefix(b"DISPLAY\n") {
+            let _ = crate::display::console_page(report);
+        }
+    }
     HYPERCALL_SUCCESS
 }
 

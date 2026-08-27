@@ -1,0 +1,260 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: inspect read-only GPT storage
+
+Expose validated GPT metadata through the mDriver control protocol for
+read-only enrollment. Keep the disk closed for writes and reject malformed
+or ambiguous GPT layouts before returning any partition information.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -90,6 +90,7 @@
+ #define MBOOT_CONTROL_REGISTER_BLOCK_BUFFER 12
+ #define MBOOT_CONTROL_START_BLOCK_QUEUE 13
+ #define MBOOT_CONTROL_STOP_BLOCK_QUEUE 14
++#define MBOOT_CONTROL_INSPECT_STORAGE 15
+ #define MBOOT_CONTROL_STATUS_OK 0
+ #define MBOOT_CONTROL_STATUS_UNSUPPORTED_VERSION 1
+ #define MBOOT_CONTROL_STATUS_INVALID_REQUEST 2
+@@ -100,7 +101,10 @@
+ #define MBOOT_CONTROL_STATUS_INTERNAL_ERROR 7
+ #define MBOOT_CONTROL_STATUS_IO_ERROR 8
+ #define MBOOT_CONTROL_STATUS_OUT_OF_RANGE 9
+-#define MBOOT_CONTROL_CAPABILITIES GENMASK_ULL(4, 0)
++#define MBOOT_CONTROL_CAPABILITIES GENMASK_ULL(5, 0)
++#define MBOOT_STORAGE_QUERY_DISK 0
++#define MBOOT_STORAGE_QUERY_PARTITION_GUIDS 1
++#define MBOOT_STORAGE_QUERY_PARTITION_RANGE 2
+ #define MBOOT_DEVICE_KIND_OTHER 0
+ #define MBOOT_DEVICE_KIND_BLOCK 1
+ #define MBOOT_DEVICE_KIND_NETWORK 2
+@@ -1022,7 +1026,8 @@
+ 		le64_to_cpu(header->last_usable_lba) ||
+ 	    le64_to_cpu(header->first_usable_lba) < 2 ||
+ 	    le64_to_cpu(header->last_usable_lba) >= total_lbas ||
+-	    memcmp(header->disk_guid, expected_disk_guid, 16))
++	    (expected_disk_guid &&
++	     memcmp(header->disk_guid, expected_disk_guid, 16)))
+ 		goto out;
+ 	header_crc = le32_to_cpu(header->header_crc32);
+ 	header->header_crc32 = 0;
+@@ -1126,6 +1131,66 @@
+ 	return matches == 1 ? 0 : -EINVAL;
+ }
+ 
++static bool mboot_gpt_copies_match(const struct mboot_gpt_copy *primary,
++				    const struct mboot_gpt_copy *backup)
++{
++	return primary->entries_size == backup->entries_size &&
++	       !memcmp(primary->entries, backup->entries, primary->entries_size) &&
++	       primary->header.first_usable_lba == backup->header.first_usable_lba &&
++	       primary->header.last_usable_lba == backup->header.last_usable_lba &&
++	       primary->header.partition_entry_count == backup->header.partition_entry_count &&
++	       primary->header.partition_entry_size == backup->header.partition_entry_size &&
++	       primary->header.partition_entry_crc32 == backup->header.partition_entry_crc32 &&
++	       !memcmp(primary->header.disk_guid, backup->header.disk_guid, 16);
++}
++
++static int mboot_gpt_partition_at(const struct mboot_gpt_copy *copy,
++				  u32 ordinal, const u8 **selected,
++				  u32 *selected_slot)
++{
++	u64 usable_first = le64_to_cpu(copy->header.first_usable_lba);
++	u64 usable_last = le64_to_cpu(copy->header.last_usable_lba);
++	u32 count = le32_to_cpu(copy->header.partition_entry_count);
++	u32 size = le32_to_cpu(copy->header.partition_entry_size);
++	u32 used = 0;
++	unsigned int index;
++
++	*selected = NULL;
++	for (index = 0; index < count; index++) {
++		const u8 *entry = copy->entries + (size_t)index * size;
++		u64 first;
++		u64 last;
++		unsigned int previous;
++
++		if (mboot_gpt_guid_zero(entry))
++			continue;
++		first = get_unaligned_le64(entry + 32);
++		last = get_unaligned_le64(entry + 40);
++		if (mboot_gpt_guid_zero(entry + 16) || first > last ||
++		    first < usable_first || last > usable_last)
++			return -EINVAL;
++		for (previous = 0; previous < index; previous++) {
++			const u8 *other = copy->entries + (size_t)previous * size;
++			u64 other_first;
++			u64 other_last;
++
++			if (mboot_gpt_guid_zero(other))
++				continue;
++			if (!memcmp(entry + 16, other + 16, 16))
++				return -EINVAL;
++			other_first = get_unaligned_le64(other + 32);
++			other_last = get_unaligned_le64(other + 40);
++			if (first <= other_last && other_first <= last)
++				return -EINVAL;
++		}
++		if (used++ == ordinal) {
++			*selected = entry;
++			*selected_slot = index;
++		}
++	}
++	return *selected ? 0 : -ENOENT;
++}
++
+ static int mboot_gpt_partition_window(struct file *file,
+ 				      const struct mboot_pci_device_info *info,
+ 				      u64 *first_sector, u64 *sector_count)
+@@ -1167,14 +1232,7 @@
+ 		pr_err("mDriver: storage policy rejected backup GPT: %d\n", result);
+ 		goto out_primary;
+ 	}
+-	if (primary.entries_size != backup.entries_size ||
+-	    memcmp(primary.entries, backup.entries, primary.entries_size) ||
+-	    primary.header.first_usable_lba != backup.header.first_usable_lba ||
+-	    primary.header.last_usable_lba != backup.header.last_usable_lba ||
+-	    primary.header.partition_entry_count != backup.header.partition_entry_count ||
+-	    primary.header.partition_entry_size != backup.header.partition_entry_size ||
+-	    primary.header.partition_entry_crc32 != backup.header.partition_entry_crc32 ||
+-	    memcmp(primary.header.disk_guid, backup.header.disk_guid, 16)) {
++	if (!mboot_gpt_copies_match(&primary, &backup)) {
+ 		result = -EINVAL;
+ 		pr_err("mDriver: storage policy rejected mismatched GPT copies\n");
+ 		goto out;
+@@ -1508,6 +1566,124 @@
+ 	return !memchr_inv(arguments, 0, sizeof(u64) * 4);
+ }
+ 
++static int mboot_storage_inspect(struct file *file, u64 query, u32 ordinal,
++				 u64 values[4])
++{
++	struct block_device *bdev = file_bdev(file);
++	struct mboot_gpt_copy primary;
++	struct mboot_gpt_copy backup;
++	u32 logical_block_size = bdev_logical_block_size(bdev);
++	u64 total_lbas;
++	const u8 *entry;
++	u32 slot = 0;
++	u64 sectors_per_lba;
++	u64 first;
++	u64 count;
++	int result;
++
++	if (logical_block_size < MBOOT_BLOCK_SECTOR_SIZE ||
++	    logical_block_size > PAGE_SIZE ||
++	    logical_block_size % MBOOT_BLOCK_SECTOR_SIZE)
++		return -EINVAL;
++	total_lbas = div_u64(bdev_nr_bytes(bdev), logical_block_size);
++	if (total_lbas < 6)
++		return -EINVAL;
++	result = mboot_gpt_validate_pmbr(file, total_lbas, logical_block_size);
++	if (result)
++		return result;
++	result = mboot_gpt_read_copy(file, 1, total_lbas - 1, total_lbas,
++				     logical_block_size, NULL, &primary);
++	if (result)
++		return result;
++	result = mboot_gpt_read_copy(file, total_lbas - 1, 1, total_lbas,
++				     logical_block_size, NULL, &backup);
++	if (result)
++		goto out_primary;
++	if (!mboot_gpt_copies_match(&primary, &backup)) {
++		result = -EINVAL;
++		goto out;
++	}
++	if (query == MBOOT_STORAGE_QUERY_DISK) {
++		values[0] = get_unaligned_le64(primary.header.disk_guid);
++		values[1] = get_unaligned_le64(primary.header.disk_guid + 8);
++		values[2] = bdev_nr_sectors(bdev);
++		values[3] = logical_block_size;
++		result = 0;
++		goto out;
++	}
++	result = mboot_gpt_partition_at(&primary, ordinal, &entry, &slot);
++	if (result)
++		goto out;
++	if (query == MBOOT_STORAGE_QUERY_PARTITION_GUIDS) {
++		values[0] = get_unaligned_le64(entry);
++		values[1] = get_unaligned_le64(entry + 8);
++		values[2] = get_unaligned_le64(entry + 16);
++		values[3] = get_unaligned_le64(entry + 24);
++		result = 0;
++		goto out;
++	}
++	if (query != MBOOT_STORAGE_QUERY_PARTITION_RANGE) {
++		result = -EINVAL;
++		goto out;
++	}
++	sectors_per_lba = logical_block_size / MBOOT_BLOCK_SECTOR_SIZE;
++	first = get_unaligned_le64(entry + 32);
++	count = get_unaligned_le64(entry + 40) - first + 1;
++	if (check_mul_overflow(first, sectors_per_lba, &values[0]) ||
++	    check_mul_overflow(count, sectors_per_lba, &values[1])) {
++		result = -ERANGE;
++		goto out;
++	}
++	values[2] = get_unaligned_le64(entry + 48);
++	values[3] = slot;
++	result = 0;
++out:
++	mboot_gpt_copy_free(&backup);
++out_primary:
++	mboot_gpt_copy_free(&primary);
++	return result;
++}
++
++static void mboot_control_inspect_storage(const struct mboot_control_request *request,
++					  struct mboot_control_response *response)
++{
++	const struct mboot_pci_frontend *device;
++	struct file *file;
++	int result;
++
++	if (!request->device_id || request->device_id > mboot_pci_device_count ||
++	    request->arguments[0] > MBOOT_STORAGE_QUERY_PARTITION_RANGE ||
++	    request->arguments[1] > U32_MAX || request->arguments[2] ||
++	    request->arguments[3])
++		return;
++	device = &mboot_pci_devices[request->device_id - 1];
++	if (mboot_control_device_kind(&device->info) != MBOOT_DEVICE_KIND_BLOCK ||
++	    !(device->info.flags & MBOOT_PCI_FLAG_READ_ONLY)) {
++		response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
++		return;
++	}
++	if (mboot_block_file || mboot_block_ring) {
++		response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
++		return;
++	}
++	file = mboot_block_open(&device->info);
++	if (IS_ERR(file)) {
++		response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
++		return;
++	}
++	result = mboot_storage_inspect(file, request->arguments[0],
++				       request->arguments[1], response->values);
++	fput(file);
++	mboot_block_first_sector = 0;
++	mboot_block_sector_count = 0;
++	if (!result)
++		response->status = MBOOT_CONTROL_STATUS_OK;
++	else if (result == -ENOENT)
++		response->status = MBOOT_CONTROL_STATUS_END;
++	else
++		response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
++}
++
+ static void mboot_control_handle(const struct mboot_control_request *request,
+ 				 struct mboot_control_response *response)
+ {
+@@ -1547,6 +1723,9 @@
+ 		return;
+ 	}
+ 	switch (request->operation) {
++	case MBOOT_CONTROL_INSPECT_STORAGE:
++		mboot_control_inspect_storage(request, response);
++		return;
+ 	case MBOOT_CONTROL_ENUMERATE:
+ 		if (request->device_id || request->arguments[1] ||
+ 		    request->arguments[2] || request->arguments[3] ||
+
