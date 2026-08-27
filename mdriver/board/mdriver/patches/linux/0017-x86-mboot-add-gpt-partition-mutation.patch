@@ -1,0 +1,376 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: add GPT partition mutation operations
+
+Allow the trusted system domain to create and delete GPT entries on a whole,
+writable block device. Validate both GPT copies before each change, write the
+backup copy first, flush it, and then update and flush the primary copy.
+Partition-scoped and read-only assignments remain unavailable for mutation.
+
+---
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -18,6 +18,7 @@
+ #include <linux/numa.h>
+ #include <linux/overflow.h>
+ #include <linux/pci.h>
++#include <linux/random.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/unaligned.h>
+@@ -91,6 +92,8 @@
+ #define MBOOT_CONTROL_START_BLOCK_QUEUE 13
+ #define MBOOT_CONTROL_STOP_BLOCK_QUEUE 14
+ #define MBOOT_CONTROL_INSPECT_STORAGE 15
++#define MBOOT_CONTROL_CREATE_PARTITION 16
++#define MBOOT_CONTROL_DELETE_PARTITION 17
+ #define MBOOT_CONTROL_STATUS_OK 0
+ #define MBOOT_CONTROL_STATUS_UNSUPPORTED_VERSION 1
+ #define MBOOT_CONTROL_STATUS_INVALID_REQUEST 2
+@@ -101,7 +104,7 @@
+ #define MBOOT_CONTROL_STATUS_INTERNAL_ERROR 7
+ #define MBOOT_CONTROL_STATUS_IO_ERROR 8
+ #define MBOOT_CONTROL_STATUS_OUT_OF_RANGE 9
+-#define MBOOT_CONTROL_CAPABILITIES GENMASK_ULL(5, 0)
++#define MBOOT_CONTROL_CAPABILITIES GENMASK_ULL(6, 0)
+ #define MBOOT_STORAGE_QUERY_DISK 0
+ #define MBOOT_STORAGE_QUERY_PARTITION_GUIDS 1
+ #define MBOOT_STORAGE_QUERY_PARTITION_RANGE 2
+@@ -942,6 +945,17 @@
+ 	return kernel_read(file, buffer, length, &position) == (ssize_t)length ? 0 : -EIO;
+ }
+ 
++static int mboot_block_write_exact(struct file *file, u64 offset,
++				   const void *buffer, size_t length)
++{
++	loff_t position;
++
++	if (offset > LLONG_MAX || length > LLONG_MAX - offset)
++		return -ERANGE;
++	position = offset;
++	return kernel_write(file, buffer, length, &position) == (ssize_t)length ? 0 : -EIO;
++}
++
+ static bool mboot_gpt_guid_zero(const u8 guid[16])
+ {
+ 	return !memchr_inv(guid, 0, 16);
+@@ -1644,6 +1658,300 @@
+ 	return result;
+ }
+ 
++static int mboot_gpt_write_copy(struct file *file,
++				struct mboot_gpt_copy *copy,
++				u32 logical_block_size)
++{
++	struct mboot_gpt_header *header;
++	u64 entries_offset;
++	u64 header_offset;
++	u32 header_size = le32_to_cpu(copy->header.header_size);
++	u32 crc;
++	u8 *sector;
++	int result;
++
++	if (header_size != sizeof(copy->header) ||
++	    copy->entries_size % logical_block_size)
++		return -EINVAL;
++	sector = kzalloc(logical_block_size, GFP_KERNEL);
++	if (!sector)
++		return -ENOMEM;
++	copy->header.partition_entry_crc32 =
++		cpu_to_le32(mboot_gpt_crc32(copy->entries, copy->entries_size));
++	copy->header.header_crc32 = 0;
++	memcpy(sector, &copy->header, sizeof(copy->header));
++	crc = mboot_gpt_crc32(sector, header_size);
++	header = (struct mboot_gpt_header *)sector;
++	header->header_crc32 = cpu_to_le32(crc);
++	copy->header.header_crc32 = cpu_to_le32(crc);
++	if (check_mul_overflow(le64_to_cpu(copy->header.partition_entry_lba),
++			       (u64)logical_block_size, &entries_offset) ||
++	    check_mul_overflow(le64_to_cpu(copy->header.current_lba),
++			       (u64)logical_block_size, &header_offset)) {
++		result = -ERANGE;
++		goto out;
++	}
++	result = mboot_block_write_exact(file, entries_offset, copy->entries,
++					 copy->entries_size);
++	if (!result)
++		result = mboot_block_write_exact(file, header_offset, sector,
++						 logical_block_size);
++out:
++	kfree(sector);
++	return result;
++}
++
++static int mboot_gpt_persist(struct file *file,
++			     struct mboot_gpt_copy *primary,
++			     struct mboot_gpt_copy *backup,
++			     u32 logical_block_size)
++{
++	int result;
++
++	result = mboot_gpt_write_copy(file, backup, logical_block_size);
++	if (result || vfs_fsync(file, 0))
++		return result ?: -EIO;
++	result = mboot_gpt_write_copy(file, primary, logical_block_size);
++	if (result || vfs_fsync(file, 0))
++		return result ?: -EIO;
++	return 0;
++}
++
++static int mboot_gpt_load_mutable(struct file *file,
++				  struct mboot_gpt_copy *primary,
++				  struct mboot_gpt_copy *backup,
++				  u32 *logical_block_size)
++{
++	struct block_device *bdev = file_bdev(file);
++	u64 total_lbas;
++	int result;
++
++	*logical_block_size = bdev_logical_block_size(bdev);
++	if (*logical_block_size < MBOOT_BLOCK_SECTOR_SIZE ||
++	    *logical_block_size > PAGE_SIZE ||
++	    *logical_block_size % MBOOT_BLOCK_SECTOR_SIZE)
++		return -EINVAL;
++	total_lbas = div_u64(bdev_nr_bytes(bdev), *logical_block_size);
++	if (total_lbas < 6)
++		return -EINVAL;
++	result = mboot_gpt_validate_pmbr(file, total_lbas, *logical_block_size);
++	if (result)
++		return result;
++	result = mboot_gpt_read_copy(file, 1, total_lbas - 1, total_lbas,
++				     *logical_block_size, NULL, primary);
++	if (result)
++		return result;
++	result = mboot_gpt_read_copy(file, total_lbas - 1, 1, total_lbas,
++				     *logical_block_size, NULL, backup);
++	if (result)
++		goto out_primary;
++	if (!mboot_gpt_copies_match(primary, backup) ||
++	    le32_to_cpu(primary->header.header_size) != sizeof(primary->header) ||
++	    primary->entries_size % *logical_block_size) {
++		result = -EINVAL;
++		goto out;
++	}
++	return 0;
++out:
++	mboot_gpt_copy_free(backup);
++out_primary:
++	mboot_gpt_copy_free(primary);
++	return result;
++}
++
++static bool mboot_gpt_unique_guid(const struct mboot_gpt_copy *copy,
++				  const u8 guid[16])
++{
++	u32 count = le32_to_cpu(copy->header.partition_entry_count);
++	u32 size = le32_to_cpu(copy->header.partition_entry_size);
++	u32 index;
++
++	if (mboot_gpt_guid_zero(guid))
++		return false;
++	for (index = 0; index < count; index++) {
++		const u8 *entry = copy->entries + (size_t)index * size;
++
++		if (!mboot_gpt_guid_zero(entry) && !memcmp(entry + 16, guid, 16))
++			return false;
++	}
++	return true;
++}
++
++static int mboot_storage_create_partition(struct file *file,
++					  const u64 arguments[4],
++					  u64 values[4])
++{
++	static const u16 name[] = { 'm', 'o', 'c', 'h', 'i', 'O', 'S' };
++	struct mboot_gpt_copy primary;
++	struct mboot_gpt_copy backup;
++	u32 logical_block_size;
++	u32 entry_count;
++	u32 entry_size;
++	u32 slot = U32_MAX;
++	u64 sectors_per_lba;
++	u64 first;
++	u64 count;
++	u64 last;
++	u8 guid[16];
++	u8 *entry;
++	u32 index;
++	int result;
++
++	if (!arguments[1] || (!arguments[2] && !arguments[3]))
++		return -EINVAL;
++	result = mboot_gpt_load_mutable(file, &primary, &backup,
++					 &logical_block_size);
++	if (result)
++		return result;
++	sectors_per_lba = logical_block_size / MBOOT_BLOCK_SECTOR_SIZE;
++	if (arguments[0] % sectors_per_lba || arguments[1] % sectors_per_lba) {
++		result = -EINVAL;
++		goto out;
++	}
++	first = div_u64(arguments[0], sectors_per_lba);
++	count = div_u64(arguments[1], sectors_per_lba);
++	if (!count || check_add_overflow(first, count - 1, &last) ||
++	    first < le64_to_cpu(primary.header.first_usable_lba) ||
++	    last > le64_to_cpu(primary.header.last_usable_lba)) {
++		result = -ERANGE;
++		goto out;
++	}
++	entry_count = le32_to_cpu(primary.header.partition_entry_count);
++	entry_size = le32_to_cpu(primary.header.partition_entry_size);
++	for (index = 0; index < entry_count; index++) {
++		const u8 *candidate = primary.entries + (size_t)index * entry_size;
++		u64 current_first;
++		u64 current_last;
++
++		if (mboot_gpt_guid_zero(candidate)) {
++			if (slot == U32_MAX)
++				slot = index;
++			continue;
++		}
++		current_first = get_unaligned_le64(candidate + 32);
++		current_last = get_unaligned_le64(candidate + 40);
++		if (first <= current_last && current_first <= last) {
++			result = -EEXIST;
++			goto out;
++		}
++	}
++	if (slot == U32_MAX) {
++		result = -ENOSPC;
++		goto out;
++	}
++	do {
++		get_random_bytes(guid, sizeof(guid));
++	} while (!mboot_gpt_unique_guid(&primary, guid));
++	entry = primary.entries + (size_t)slot * entry_size;
++	memset(entry, 0, entry_size);
++	put_unaligned_le64(arguments[2], entry);
++	put_unaligned_le64(arguments[3], entry + 8);
++	memcpy(entry + 16, guid, sizeof(guid));
++	put_unaligned_le64(first, entry + 32);
++	put_unaligned_le64(last, entry + 40);
++	for (index = 0; index < ARRAY_SIZE(name) && 56 + index * 2 + 1 < entry_size;
++	     index++)
++		put_unaligned_le16(name[index], entry + 56 + index * 2);
++	memcpy(backup.entries, primary.entries, primary.entries_size);
++	result = mboot_gpt_persist(file, &primary, &backup, logical_block_size);
++	if (!result) {
++		values[0] = get_unaligned_le64(guid);
++		values[1] = get_unaligned_le64(guid + 8);
++		values[2] = slot;
++		values[3] = arguments[0];
++	}
++out:
++	mboot_gpt_copy_free(&backup);
++	mboot_gpt_copy_free(&primary);
++	return result;
++}
++
++static int mboot_storage_delete_partition(struct file *file,
++					  const u64 arguments[4],
++					  u64 values[4])
++{
++	struct mboot_gpt_copy primary;
++	struct mboot_gpt_copy backup;
++	const u8 *selected;
++	u32 logical_block_size;
++	u32 entry_size;
++	u32 slot;
++	int result;
++
++	if (arguments[0] > U32_MAX || arguments[3] ||
++	    (!arguments[1] && !arguments[2]))
++		return -EINVAL;
++	result = mboot_gpt_load_mutable(file, &primary, &backup,
++					 &logical_block_size);
++	if (result)
++		return result;
++	result = mboot_gpt_partition_at(&primary, arguments[0], &selected, &slot);
++	if (result)
++		goto out;
++	if (get_unaligned_le64(selected + 16) != arguments[1] ||
++	    get_unaligned_le64(selected + 24) != arguments[2]) {
++		result = -ESTALE;
++		goto out;
++	}
++	entry_size = le32_to_cpu(primary.header.partition_entry_size);
++	memset(primary.entries + (size_t)slot * entry_size, 0, entry_size);
++	memcpy(backup.entries, primary.entries, primary.entries_size);
++	result = mboot_gpt_persist(file, &primary, &backup, logical_block_size);
++	if (!result)
++		values[0] = slot;
++out:
++	mboot_gpt_copy_free(&backup);
++	mboot_gpt_copy_free(&primary);
++	return result;
++}
++
++static void mboot_control_mutate_storage(const struct mboot_control_request *request,
++					 struct mboot_control_response *response)
++{
++	const struct mboot_pci_frontend *device;
++	struct file *file;
++	int result;
++
++	if (!request->device_id || request->device_id > mboot_pci_device_count)
++		return;
++	device = &mboot_pci_devices[request->device_id - 1];
++	if (mboot_control_device_kind(&device->info) != MBOOT_DEVICE_KIND_BLOCK ||
++	    device->info.flags & (MBOOT_PCI_FLAG_READ_ONLY |
++				  MBOOT_PCI_FLAG_PARTITIONED)) {
++		response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
++		return;
++	}
++	if (mboot_block_file || mboot_block_ring) {
++		response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
++		return;
++	}
++	file = mboot_block_open(&device->info);
++	if (IS_ERR(file)) {
++		response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
++		return;
++	}
++	if (request->operation == MBOOT_CONTROL_CREATE_PARTITION)
++		result = mboot_storage_create_partition(file, request->arguments,
++							response->values);
++	else
++		result = mboot_storage_delete_partition(file, request->arguments,
++							response->values);
++	fput(file);
++	mboot_block_first_sector = 0;
++	mboot_block_sector_count = 0;
++	if (!result)
++		response->status = MBOOT_CONTROL_STATUS_OK;
++	else if (result == -ENOENT)
++		response->status = MBOOT_CONTROL_STATUS_NOT_FOUND;
++	else if (result == -ERANGE)
++		response->status = MBOOT_CONTROL_STATUS_OUT_OF_RANGE;
++	else if (result == -EINVAL || result == -EEXIST || result == -ENOSPC ||
++		 result == -ESTALE)
++		response->status = MBOOT_CONTROL_STATUS_INVALID_REQUEST;
++	else
++		response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
++}
++
+ static void mboot_control_inspect_storage(const struct mboot_control_request *request,
+ 					  struct mboot_control_response *response)
+ {
+@@ -1658,7 +1966,7 @@
+ 		return;
+ 	device = &mboot_pci_devices[request->device_id - 1];
+ 	if (mboot_control_device_kind(&device->info) != MBOOT_DEVICE_KIND_BLOCK ||
+-	    !(device->info.flags & MBOOT_PCI_FLAG_READ_ONLY)) {
++	    device->info.flags & MBOOT_PCI_FLAG_PARTITIONED) {
+ 		response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
+ 		return;
+ 	}
+@@ -1723,6 +2031,10 @@
+ 		return;
+ 	}
+ 	switch (request->operation) {
++	case MBOOT_CONTROL_CREATE_PARTITION:
++	case MBOOT_CONTROL_DELETE_PARTITION:
++		mboot_control_mutate_storage(request, response);
++		return;
+ 	case MBOOT_CONTROL_INSPECT_STORAGE:
+ 		mboot_control_inspect_storage(request, response);
+ 		return;
