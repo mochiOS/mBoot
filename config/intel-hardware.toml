@@ -22,7 +22,7 @@ max_restarts = 0
 [[devices]]
 segment = 0
 requester = "auto"
-kind = "nvme"
+kind = "vmd"
 domain = 2
 required = true
 read_only = true

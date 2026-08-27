@@ -112,7 +112,7 @@ for my $channel (@{$config->{channels}}) {
 
 my %device_kinds = (
     other => 0, display => 1, block => 2,
-    network => 3, usb => 4, audio => 5, nvme => 6,
+    network => 3, usb => 4, audio => 5, nvme => 6, vmd => 7,
 );
 my $device_entries = '';
 for my $device (@{$config->{devices}}) {

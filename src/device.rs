@@ -255,6 +255,7 @@ const fn kind_matches(info: PciDeviceInfo, kind: ManifestDeviceKind) -> bool {
         ManifestDeviceKind::Usb => info.class == 0x0c && info.subclass == 0x03,
         ManifestDeviceKind::Audio => info.class == 0x04,
         ManifestDeviceKind::Nvme => info.class == 0x01 && info.subclass == 0x08,
+        ManifestDeviceKind::Vmd => info.class == 0x01 && info.subclass == 0x04,
     }
 }
 
@@ -413,5 +414,33 @@ mod tests {
             DeviceTable::from_pci(&functions, None, &[nvme]).err(),
             Some(DeviceError::AmbiguousDevice(functions[0], functions[1]))
         );
+    }
+
+    #[test]
+    fn automatic_vmd_policy_does_not_select_a_sata_controller() {
+        let functions = [
+            PciFunction {
+                requester: 0x0070,
+                vendor: 0x8086,
+                device: 0x9a0b,
+                class: 0x01,
+                subclass: 0x04,
+            },
+            PciFunction {
+                requester: 0x0080,
+                vendor: 0x8086,
+                device: 0xa0d3,
+                class: 0x01,
+                subclass: 0x06,
+            },
+        ];
+        let mut vmd = policy(AUTO_REQUESTER, ManifestDeviceKind::Vmd);
+        vmd.flags |= DEVICE_FLAG_READ_ONLY;
+        let table = DeviceTable::from_pci(&functions, None, &[vmd]).unwrap();
+        assert_eq!(
+            table.query(2, 0).unwrap().flags,
+            PCI_DEVICE_FLAG_CLAIMABLE | PCI_DEVICE_FLAG_READ_ONLY
+        );
+        assert_eq!(table.query(2, 1).unwrap().flags, 0);
     }
 }

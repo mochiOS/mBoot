@@ -134,13 +134,13 @@ sub read_mboot_config {
         ($device->{requester} eq 'auto' ||
             ($device->{requester} > 0 && $device->{requester} < 0xffff))
             or die "$path: device requester must be a PCI BDF or auto\n";
-        $device->{kind} =~ /^(?:other|display|block|network|usb|audio|nvme)$/
+        $device->{kind} =~ /^(?:other|display|block|network|usb|audio|nvme|vmd)$/
             or die "$path: invalid device kind\n";
         if ($device->{requester} eq 'auto') {
-            $device->{segment} == 0 && $device->{kind} eq 'nvme'
-                or die "$path: automatic selection is limited to a segment 0 NVMe controller\n";
+            $device->{segment} == 0 && $device->{kind} =~ /^(?:nvme|vmd)$/
+                or die "$path: automatic selection is limited to a segment 0 NVMe or VMD controller\n";
         }
-        if ($device->{kind} =~ /^(?:block|nvme)$/) {
+        if ($device->{kind} =~ /^(?:block|nvme|vmd)$/) {
             $device->{ephemeral} != $device->{read_only}
                 or die "$path: block devices must be explicitly ephemeral or read_only\n";
         }

@@ -56,6 +56,7 @@ pub enum ManifestDeviceKind {
     Usb = 4,
     Audio = 5,
     Nvme = 6,
+    Vmd = 7,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -414,6 +415,7 @@ impl<'a> LaunchManifest<'a> {
             4 => ManifestDeviceKind::Usb,
             5 => ManifestDeviceKind::Audio,
             6 => ManifestDeviceKind::Nvme,
+            7 => ManifestDeviceKind::Vmd,
             _ => return Err(Error::InvalidManifest),
         };
         let device = ManifestDevice {
@@ -425,13 +427,17 @@ impl<'a> LaunchManifest<'a> {
         };
         let block_device = matches!(
             device.kind,
-            ManifestDeviceKind::Block | ManifestDeviceKind::Nvme
+            ManifestDeviceKind::Block | ManifestDeviceKind::Nvme | ManifestDeviceKind::Vmd
         );
         if device.requester == 0
             || device.flags & !DEVICE_FLAGS_KNOWN != 0
             || device.domain_id == 0
             || (device.requester == AUTO_REQUESTER
-                && (device.segment != 0 || device.kind != ManifestDeviceKind::Nvme))
+                && (device.segment != 0
+                    || !matches!(
+                        device.kind,
+                        ManifestDeviceKind::Nvme | ManifestDeviceKind::Vmd
+                    )))
             || (block_device && device.is_ephemeral() == device.is_read_only())
             || (!block_device && (device.is_ephemeral() || device.is_read_only()))
             || entry[12..].iter().any(|byte| *byte != 0)
