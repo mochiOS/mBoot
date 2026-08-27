@@ -1,4 +1,4 @@
-version = 5
+version = 6
 toolchain = "nightly-2026-05-14"
 disk_size_mib = 96
 esp_size_mib = 64

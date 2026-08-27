@@ -1,4 +1,4 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: map the control shared ring
 
 Discover the Hardware Domain Grant window through CPUID and find the
@@ -6,7 +6,7 @@ System Domain's control Grant through the target-scoped query hypercall.
 Map one page, exchange a checked request and response, then unmap it
 before reporting the Hardware Domain ready.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
 
 --- a/arch/x86/kernel/cpu/mboot.c
@@ -188,4 +188,3 @@ Signed-off-by: mochiOS Developers <developers@mochios.dev>
  	result = mboot_hypercall(MBOOT_HYPERCALL_READY, 0, 0, 0);
  
  	if (result)
-

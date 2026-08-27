@@ -1,11 +1,11 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/hypervisor: recognize the mBoot hypervisor
 
 mBoot exposes x2APIC to its guests and identifies itself through the
 standard hypervisor CPUID leaf. Teach Linux about that vendor so early
 APIC setup does not fall back to the physical xAPIC MMIO page.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
  arch/x86/include/asm/hypervisor.h |  2 ++
  arch/x86/kernel/cpu/Makefile      |  1 +

@@ -1,4 +1,4 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: enforce read-only block devices
 
 Carry the signed mBoot read-only policy into mDriver, open protected block
@@ -6,7 +6,7 @@ devices without write access, and reject both synchronous and asynchronous
 write or flush requests.  Writable scratch devices remain available only
 when the launch manifest marks them ephemeral.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
 --- a/arch/x86/kernel/cpu/mboot.c
 +++ b/arch/x86/kernel/cpu/mboot.c

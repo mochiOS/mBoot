@@ -1,4 +1,4 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: separate config and queue interrupts
 
 Give each assigned PCI device two Linux IRQs. The first IRQ carries virtio
@@ -9,7 +9,7 @@ route two physical MSI-X table entries without conflating the callbacks.
 Keep physical MSI-X ownership in mBoot. Linux only selects the table-entry
 indices exposed by the synthetic virtio PCI frontend.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
 
 --- a/arch/x86/kernel/cpu/mboot.c
@@ -221,4 +221,3 @@ Signed-off-by: mochiOS Developers <developers@mochios.dev>
  	cpumask_var_t *msix_affinity_masks;
  	/* Name strings for interrupts. This size should be enough,
  	 * and I'm too lazy to allocate each name separately. */
-

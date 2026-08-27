@@ -1,4 +1,4 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: connect the control Event Channel
 
 Exchange startup notifications with the mochiOS System Domain before the
@@ -6,7 +6,7 @@ Hardware Domain reports ready. Exercise both a waiting receiver and virtual
 Event Channel IRQ delivery so later shared-ring backends have a verified
 notification path.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
 
 --- a/arch/x86/kernel/cpu/mboot.c

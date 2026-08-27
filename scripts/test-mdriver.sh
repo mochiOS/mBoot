@@ -20,8 +20,14 @@ else
     TIMEOUT_SECONDS=${HV_TIMEOUT_SECONDS:-240}
 fi
 MDRIVER_VECTORS=${MDRIVER_VECTORS:-}
+STORAGE_CORRUPT=${MDRIVER_STORAGE_CORRUPT:-none}
 OVMF_CODE="$ROOT/firmware/OVMF_CODE_4M.fd"
 OVMF_VARS="$ROOT/firmware/OVMF_VARS_4M.fd"
+STORAGE_DISK_GUID=6d426f6f-7400-4b00-8a00-00000000d001
+STORAGE_TYPE_GUID=6d6f6368-694f-5300-8000-6d5061727401
+STORAGE_PARTITION_GUID=6d426f6f-7400-4b00-8a00-00000000d002
+STORAGE_FIRST_SECTOR=2048
+STORAGE_LAST_SECTOR=12287
 
 WORK=$(mktemp -d)
 QEMU_PID=
@@ -35,7 +41,23 @@ cleanup() {
 trap cleanup EXIT
 cp "$OVMF_VARS" "$WORK/OVMF_VARS.fd"
 cp --sparse=always "$IMAGE" "$WORK/mdriver.iso"
-truncate -s 1M "$WORK/device.img"
+truncate -s 8M "$WORK/device.img"
+sgdisk --clear --disk-guid="$STORAGE_DISK_GUID" \
+    --new="1:$STORAGE_FIRST_SECTOR:$STORAGE_LAST_SECTOR" \
+    --typecode="1:$STORAGE_TYPE_GUID" \
+    --partition-guid="1:$STORAGE_PARTITION_GUID" \
+    "$WORK/device.img" >/dev/null
+if [[ $STORAGE_CORRUPT == primary ]]; then
+    printf '\xff' | dd of="$WORK/device.img" bs=1 seek=600 conv=notrunc status=none
+elif [[ $STORAGE_CORRUPT != none ]]; then
+    echo "test-mdriver: unknown MDRIVER_STORAGE_CORRUPT mode: $STORAGE_CORRUPT" >&2
+    exit 1
+fi
+whole_before=$(sha256sum "$WORK/device.img")
+prefix_before=$(dd if="$WORK/device.img" bs=512 count="$STORAGE_FIRST_SECTOR" status=none | sha256sum)
+suffix_before=$(dd if="$WORK/device.img" bs=512 skip="$((STORAGE_LAST_SECTOR + 1))" status=none | sha256sum)
+partition_before=$(dd if="$WORK/device.img" bs=512 skip="$STORAGE_FIRST_SECTOR" \
+    count="$((STORAGE_LAST_SECTOR - STORAGE_FIRST_SECTOR + 1))" status=none | sha256sum)
 DEVICE_VECTOR_OPTION=
 if [[ -n $MDRIVER_VECTORS ]]; then
     DEVICE_VECTOR_OPTION=",vectors=$MDRIVER_VECTORS"
@@ -64,6 +86,23 @@ fi
 QEMU_PID=$!
 
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
+    if [[ $STORAGE_CORRUPT != none ]] \
+        && grep -Fq 'mDriver: storage policy rejected primary GPT' "$WORK/serial.log" 2>/dev/null; then
+        kill "$QEMU_PID" 2>/dev/null || true
+        wait "$QEMU_PID" 2>/dev/null || true
+        QEMU_PID=
+        whole_after=$(sha256sum "$WORK/device.img")
+        [[ $whole_before == "$whole_after" ]] || {
+            echo 'test-mdriver: rejected storage was modified' >&2
+            exit 1
+        }
+        ! grep -Fq 'mDriver: block data I/O completed' "$WORK/serial.log" || {
+            echo 'test-mdriver: I/O completed after GPT rejection' >&2
+            exit 1
+        }
+        echo 'test-mdriver: malformed GPT rejected without writes: PASS'
+        exit 0
+    fi
     if grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver: block data I/O completed' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver: mBoot control Event Channel ready' "$WORK/serial.log" 2>/dev/null \
@@ -94,6 +133,21 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
             fi
         fi
         if [[ $route_verified == 1 ]]; then
+            kill "$QEMU_PID" 2>/dev/null || true
+            wait "$QEMU_PID" 2>/dev/null || true
+            QEMU_PID=
+            prefix_after=$(dd if="$WORK/device.img" bs=512 count="$STORAGE_FIRST_SECTOR" status=none | sha256sum)
+            suffix_after=$(dd if="$WORK/device.img" bs=512 skip="$((STORAGE_LAST_SECTOR + 1))" status=none | sha256sum)
+            partition_after=$(dd if="$WORK/device.img" bs=512 skip="$STORAGE_FIRST_SECTOR" \
+                count="$((STORAGE_LAST_SECTOR - STORAGE_FIRST_SECTOR + 1))" status=none | sha256sum)
+            [[ $prefix_before == "$prefix_after" && $suffix_before == "$suffix_after" ]] || {
+                echo 'test-mdriver: data outside the enrolled partition changed' >&2
+                exit 1
+            }
+            [[ $partition_before != "$partition_after" ]] || {
+                echo 'test-mdriver: enrolled partition did not receive the test write' >&2
+                exit 1
+            }
             grep -E '\[mBoot\]|mDriver: mBoot (PCI|control)|mDriver (block IRQ )?OK|Linux version|PCI requester 0018|virtio_blk| vda' "$WORK/serial.log"
             echo 'test-mdriver: PASS'
             exit 0

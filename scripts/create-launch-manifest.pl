@@ -44,7 +44,7 @@ my $channel_entry_size = 32;
 my $domain_count = scalar @{$config->{domains}};
 my $channel_count = scalar @{$config->{channels}};
 my $device_count = scalar @{$config->{devices}};
-my $device_entry_size = 32;
+my $device_entry_size = 64;
 my $header = pack(
     'a8 v v v v V v v v v V',
     "MBLHV1\0\0", $config->{version}, $header_size, $entry_size, $domain_count,
@@ -117,12 +117,18 @@ my %device_kinds = (
 my $device_entries = '';
 for my $device (@{$config->{devices}}) {
     my $flags = ($device->{required} ? 1 : 0) |
-        ($device->{ephemeral} ? 2 : 0) | ($device->{read_only} ? 4 : 0);
+        ($device->{ephemeral} ? 2 : 0) | ($device->{read_only} ? 4 : 0) |
+        ($device->{partitioned} ? 8 : 0);
     my $requester = $device->{requester} eq 'auto' ? 0xffff : $device->{requester};
+    my $storage_guids = $device->{partitioned}
+        ? pack_gpt_guid($device->{storage_disk_guid})
+            . pack_gpt_guid($device->{storage_partition_type_guid})
+            . pack_gpt_guid($device->{storage_partition_guid})
+        : "\0" x 48;
     $device_entries .= pack(
-        'v v v v V a20',
+        'v v v v V a48 a4',
         $device->{segment}, $requester, $device_kinds{$device->{kind}},
-        $flags, $device->{domain}, '',
+        $flags, $device->{domain}, $storage_guids, '',
     );
 }
 
@@ -130,3 +136,10 @@ open my $output_fh, '>:raw', $output_file or die "cannot write $output_file: $!\
 print {$output_fh} $header, $entries, $channel_entries, $device_entries
     or die "cannot write $output_file: $!\n";
 close $output_fh or die "cannot close $output_file: $!\n";
+
+sub pack_gpt_guid {
+    my ($value) = @_;
+    $value =~ /^([0-9a-fA-F]{8})-([0-9a-fA-F]{4})-([0-9a-fA-F]{4})-([0-9a-fA-F]{4})-([0-9a-fA-F]{12})$/
+        or die "invalid GPT GUID: $value\n";
+    return pack('V v v H*', hex($1), hex($2), hex($3), $4 . $5);
+}

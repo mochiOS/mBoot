@@ -1,10 +1,10 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: report Hardware Domain readiness
 
 Expose the active backend through the mBoot CPUID leaf.
 Linux uses the matching hypercall instruction after initialization.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
  arch/x86/kernel/cpu/mboot.c | 47 ++++++++++++++++++++++++++++++++++++++
  1 file changed, 47 insertions(+)

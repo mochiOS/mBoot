@@ -4,11 +4,11 @@ use sha2::{Digest, Sha256};
 use crate::Error;
 
 pub const MANIFEST_MAGIC: &[u8; 8] = b"MBLHV1\0\0";
-pub const MANIFEST_VERSION: u16 = 5;
+pub const MANIFEST_VERSION: u16 = 6;
 pub const MANIFEST_HEADER_SIZE: usize = 32;
 pub const DOMAIN_ENTRY_SIZE: usize = 384;
 pub const EVENT_CHANNEL_ENTRY_SIZE: usize = 32;
-pub const DEVICE_ENTRY_SIZE: usize = 32;
+pub const DEVICE_ENTRY_SIZE: usize = 64;
 pub const MAX_DOMAIN_COUNT: usize = 8;
 pub const MAX_EVENT_CHANNEL_COUNT: usize = 64;
 pub const MAX_DEVICE_COUNT: usize = 64;
@@ -19,8 +19,9 @@ const DOMAIN_FLAGS_KNOWN: u16 = DOMAIN_FLAG_AUTO_START | DOMAIN_FLAG_REQUIRED;
 pub const DEVICE_FLAG_REQUIRED: u16 = 1 << 0;
 pub const DEVICE_FLAG_EPHEMERAL: u16 = 1 << 1;
 pub const DEVICE_FLAG_READ_ONLY: u16 = 1 << 2;
+pub const DEVICE_FLAG_PARTITIONED: u16 = 1 << 3;
 const DEVICE_FLAGS_KNOWN: u16 =
-    DEVICE_FLAG_REQUIRED | DEVICE_FLAG_EPHEMERAL | DEVICE_FLAG_READ_ONLY;
+    DEVICE_FLAG_REQUIRED | DEVICE_FLAG_EPHEMERAL | DEVICE_FLAG_READ_ONLY | DEVICE_FLAG_PARTITIONED;
 pub const AUTO_REQUESTER: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +93,9 @@ pub struct ManifestDevice {
     pub kind: ManifestDeviceKind,
     pub flags: u16,
     pub domain_id: u32,
+    pub storage_disk_guid: [u8; 16],
+    pub storage_partition_type_guid: [u8; 16],
+    pub storage_partition_guid: [u8; 16],
 }
 
 impl ManifestDevice {
@@ -105,6 +109,10 @@ impl ManifestDevice {
 
     pub const fn is_read_only(self) -> bool {
         self.flags & DEVICE_FLAG_READ_ONLY != 0
+    }
+
+    pub const fn is_partitioned(self) -> bool {
+        self.flags & DEVICE_FLAG_PARTITIONED != 0
     }
 }
 
@@ -424,6 +432,9 @@ impl<'a> LaunchManifest<'a> {
             kind,
             flags: read_u16(entry, 6)?,
             domain_id: read_u32(entry, 8)?,
+            storage_disk_guid: read_guid(entry, 12)?,
+            storage_partition_type_guid: read_guid(entry, 28)?,
+            storage_partition_guid: read_guid(entry, 44)?,
         };
         let block_device = matches!(
             device.kind,
@@ -438,9 +449,22 @@ impl<'a> LaunchManifest<'a> {
                         device.kind,
                         ManifestDeviceKind::Nvme | ManifestDeviceKind::Vmd
                     )))
-            || (block_device && device.is_ephemeral() == device.is_read_only())
-            || (!block_device && (device.is_ephemeral() || device.is_read_only()))
-            || entry[12..].iter().any(|byte| *byte != 0)
+            || (block_device
+                && usize::from(device.is_ephemeral())
+                    + usize::from(device.is_read_only())
+                    + usize::from(device.is_partitioned())
+                    != 1)
+            || (!block_device
+                && (device.is_ephemeral() || device.is_read_only() || device.is_partitioned()))
+            || (device.is_partitioned()
+                && (device.storage_disk_guid == [0; 16]
+                    || device.storage_partition_type_guid == [0; 16]
+                    || device.storage_partition_guid == [0; 16]))
+            || (!device.is_partitioned()
+                && (device.storage_disk_guid != [0; 16]
+                    || device.storage_partition_type_guid != [0; 16]
+                    || device.storage_partition_guid != [0; 16]))
+            || entry[60..].iter().any(|byte| *byte != 0)
         {
             return Err(Error::InvalidManifest);
         }
@@ -469,6 +493,13 @@ fn valid_uefi_path(path: &str) -> bool {
         && !path.contains('/')
         && !path.chars().any(char::is_control)
         && !path.split('\\').any(|component| component == "..")
+}
+
+fn read_guid(bytes: &[u8], offset: usize) -> Result<[u8; 16], Error> {
+    bytes
+        .get(offset..offset + 16)
+        .and_then(|value| value.try_into().ok())
+        .ok_or(Error::InvalidManifest)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
@@ -633,6 +664,9 @@ mod tests {
                 kind: ManifestDeviceKind::Block,
                 flags: DEVICE_FLAG_REQUIRED | DEVICE_FLAG_EPHEMERAL,
                 domain_id: 2,
+                storage_disk_guid: [0; 16],
+                storage_partition_type_guid: [0; 16],
+                storage_partition_guid: [0; 16],
             }
         );
         assert!(manifest.device(0).unwrap().is_ephemeral());
@@ -655,6 +689,27 @@ mod tests {
         assert_eq!(device.kind, ManifestDeviceKind::Nvme);
         assert!(device.is_read_only());
         assert!(!device.is_ephemeral());
+    }
+
+    #[test]
+    fn parses_an_enrolled_partition_policy() {
+        let mut bytes = manifest_with_device();
+        let offset = MANIFEST_HEADER_SIZE + 2 * DOMAIN_ENTRY_SIZE;
+        bytes[offset + 6..offset + 8]
+            .copy_from_slice(&(DEVICE_FLAG_REQUIRED | DEVICE_FLAG_PARTITIONED).to_le_bytes());
+        bytes[offset + 12..offset + 28].copy_from_slice(&[1; 16]);
+        bytes[offset + 28..offset + 44].copy_from_slice(&[2; 16]);
+        bytes[offset + 44..offset + 60].copy_from_slice(&[3; 16]);
+
+        let digest = Sha256::digest(&bytes).into();
+        let device = LaunchManifest::parse(&bytes, digest)
+            .unwrap()
+            .device(0)
+            .unwrap();
+        assert!(device.is_partitioned());
+        assert_eq!(device.storage_disk_guid, [1; 16]);
+        assert_eq!(device.storage_partition_type_guid, [2; 16]);
+        assert_eq!(device.storage_partition_guid, [3; 16]);
     }
 
     #[test]

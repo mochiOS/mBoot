@@ -1,4 +1,4 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: provide block data I/O
 
 Connect block devices owned by the Hardware Domain to the System Domain's
@@ -7,7 +7,7 @@ bounded reads, writes, flushes, and device lifetime management. Find each
 Linux block device through its assigned PCI ancestor instead of relying on
 a device name.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
 
 --- a/arch/x86/kernel/cpu/mboot.c

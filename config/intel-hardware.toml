@@ -1,4 +1,4 @@
-version = 5
+version = 6
 toolchain = "nightly-2026-05-14"
 disk_size_mib = 128
 esp_size_mib = 96
@@ -59,3 +59,7 @@ autostart = true
 required = true
 restart = "never"
 max_restarts = 0
+
+# Physical storage is deliberately not assigned by the default image. Add a
+# partitioned vmd or nvme device only after recording the three GUIDs from the
+# target disk's existing GPT. mBoot never creates or repairs that partition.

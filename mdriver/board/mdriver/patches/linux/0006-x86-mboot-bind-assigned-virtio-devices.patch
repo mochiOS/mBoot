@@ -1,4 +1,4 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: bind assigned virtio PCI devices
 
 Claim the fixed BAR resources supplied by mBoot before publishing
@@ -12,7 +12,7 @@ Until mBoot supports a separate physical configuration entry, dispatch both
 configuration and queue callbacks from the shared MSI-X interrupt without
 using the legacy ISR byte.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
  arch/x86/kernel/cpu/mboot.c         |  6 +++
  drivers/virtio/virtio_pci_common.c | 78 ++++++++++++++++++++++++++++++++++++++

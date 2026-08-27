@@ -1,4 +1,4 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: support shared MSI device interrupts
 
 Allocate a single Linux IRQ when an assigned device only exposes MSI or one
@@ -10,7 +10,7 @@ Linux does not program the physical interrupt capability. It selects a
 virtio MSI-X table index only when available. mBoot owns the physical
 MSI or MSI-X message.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
 
 --- a/arch/x86/kernel/cpu/mboot.c

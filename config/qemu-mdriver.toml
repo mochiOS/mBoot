@@ -1,4 +1,4 @@
-version = 5
+version = 6
 toolchain = "nightly-2026-05-14"
 disk_size_mib = 128
 esp_size_mib = 96
@@ -49,7 +49,10 @@ requester = 0x18
 kind = "block"
 domain = 2
 required = true
-ephemeral = true
+partitioned = true
+storage_disk_guid = "6d426f6f-7400-4b00-8a00-00000000d001"
+storage_partition_type_guid = "6d6f6368-694f-5300-8000-6d5061727401"
+storage_partition_guid = "6d426f6f-7400-4b00-8a00-00000000d002"
 
 [[domains]]
 id = 2

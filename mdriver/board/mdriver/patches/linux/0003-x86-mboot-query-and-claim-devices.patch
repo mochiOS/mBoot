@@ -1,10 +1,10 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: query and claim assigned PCI devices
 
 Discover the PCI inventory through mBoot instead of accessing physical
 configuration space. Claim only devices marked by the signed launch policy.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
  arch/x86/kernel/cpu/mboot.c | 116 +++++++++++++++++++++++++++++++++++--
  1 file changed, 112 insertions(+), 4 deletions(-)

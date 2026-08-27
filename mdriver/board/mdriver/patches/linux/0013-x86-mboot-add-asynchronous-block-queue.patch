@@ -1,4 +1,4 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: add asynchronous block queue
 
 Keep block data traffic off the control ring by adding a dedicated shared
@@ -9,7 +9,7 @@ one Event Channel notification after the backend publishes completions.
 The synchronous operations remain available for compatibility and early
 diagnostics.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
 --- a/arch/x86/kernel/cpu/mboot.c
 +++ b/arch/x86/kernel/cpu/mboot.c

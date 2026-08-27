@@ -1,4 +1,4 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: provide the device control protocol
 
 Replace the one-shot shared-ring probe with a versioned device control
@@ -6,7 +6,7 @@ service. Negotiate capabilities, enumerate and describe assigned devices,
 start a session, answer health checks, and return stable status codes.
 Keep servicing requests after boot from a poll-based kernel worker.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
 
 --- a/arch/x86/kernel/cpu/mboot.c
@@ -418,4 +418,3 @@ Signed-off-by: mochiOS Developers <developers@mochios.dev>
  		return -EIO;
  	result = mboot_hypercall(MBOOT_HYPERCALL_READY, 0, 0, 0);
  
-

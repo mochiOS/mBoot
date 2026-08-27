@@ -1,4 +1,4 @@
-From: mochiOS Developers <developers@mochios.dev>
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
 Subject: [PATCH] x86/mboot: publish assigned PCI resources
 
 Build a synthetic PCI configuration view from mBoot hypercalls. Expose only
@@ -8,7 +8,7 @@ activate each device after Linux has accepted the resource layout.
 Keep the frontend devices unpublished until mBoot interrupt delivery is
 connected to the Linux IRQ subsystem.
 
-Signed-off-by: mochiOS Developers <developers@mochios.dev>
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
  arch/x86/kernel/cpu/mboot.c | 303 +++++++++++++++++++++++++++++++++++++
  1 file changed, 303 insertions(+)
@@ -377,4 +377,3 @@ Signed-off-by: mochiOS Developers <developers@mochios.dev>
  	result = mboot_hypercall(MBOOT_HYPERCALL_READY, 0, 0, 0);
  
  	if (result)
-

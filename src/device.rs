@@ -1,6 +1,7 @@
 use mnu_abi::hypervisor::{
-    PciDeviceInfo, PCI_DEVICE_FLAG_CLAIMABLE, PCI_DEVICE_FLAG_EPHEMERAL, PCI_DEVICE_FLAG_READ_ONLY,
-    PCI_DEVICE_STATE_ACTIVE, PCI_DEVICE_STATE_CLAIMED_DISABLED, PCI_DEVICE_STATE_FIRMWARE_DEFERRED,
+    PciDeviceInfo, PCI_DEVICE_FLAG_CLAIMABLE, PCI_DEVICE_FLAG_EPHEMERAL,
+    PCI_DEVICE_FLAG_PARTITIONED, PCI_DEVICE_FLAG_READ_ONLY, PCI_DEVICE_STATE_ACTIVE,
+    PCI_DEVICE_STATE_CLAIMED_DISABLED, PCI_DEVICE_STATE_FIRMWARE_DEFERRED,
     PCI_DEVICE_STATE_QUARANTINED,
 };
 
@@ -17,6 +18,9 @@ const EMPTY_INFO: PciDeviceInfo = PciDeviceInfo {
     _reserved0: [0; 3],
     owner_domain: 0,
     flags: 0,
+    storage_disk_guid: [0; 16],
+    storage_partition_type_guid: [0; 16],
+    storage_partition_guid: [0; 16],
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +71,9 @@ impl DeviceTable {
                 _reserved0: [0; 3],
                 owner_domain: 0,
                 flags: 0,
+                storage_disk_guid: [0; 16],
+                storage_partition_type_guid: [0; 16],
+                storage_partition_guid: [0; 16],
             };
             table.count += 1;
         }
@@ -115,6 +122,12 @@ impl DeviceTable {
             }
             if policy.is_read_only() {
                 record.info.flags |= PCI_DEVICE_FLAG_READ_ONLY;
+            }
+            if policy.is_partitioned() {
+                record.info.flags |= PCI_DEVICE_FLAG_PARTITIONED;
+                record.info.storage_disk_guid = policy.storage_disk_guid;
+                record.info.storage_partition_type_guid = policy.storage_partition_type_guid;
+                record.info.storage_partition_guid = policy.storage_partition_guid;
             }
         }
         Ok(table)
@@ -262,7 +275,9 @@ const fn kind_matches(info: PciDeviceInfo, kind: ManifestDeviceKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{DEVICE_FLAG_EPHEMERAL, DEVICE_FLAG_READ_ONLY, DEVICE_FLAG_REQUIRED};
+    use crate::manifest::{
+        DEVICE_FLAG_EPHEMERAL, DEVICE_FLAG_PARTITIONED, DEVICE_FLAG_READ_ONLY, DEVICE_FLAG_REQUIRED,
+    };
 
     fn policy(requester: u16, kind: ManifestDeviceKind) -> ManifestDevice {
         ManifestDevice {
@@ -271,6 +286,9 @@ mod tests {
             kind,
             flags: DEVICE_FLAG_REQUIRED,
             domain_id: 2,
+            storage_disk_guid: [0; 16],
+            storage_partition_type_guid: [0; 16],
+            storage_partition_guid: [0; 16],
         }
     }
 
@@ -442,5 +460,26 @@ mod tests {
             PCI_DEVICE_FLAG_CLAIMABLE | PCI_DEVICE_FLAG_READ_ONLY
         );
         assert_eq!(table.query(2, 1).unwrap().flags, 0);
+    }
+
+    #[test]
+    fn partition_policy_is_copied_into_the_guest_device_record() {
+        let functions = [PciFunction {
+            requester: 0x0070,
+            class: 0x01,
+            subclass: 0x04,
+            ..PciFunction::default()
+        }];
+        let mut vmd = policy(0x0070, ManifestDeviceKind::Vmd);
+        vmd.flags |= DEVICE_FLAG_PARTITIONED;
+        vmd.storage_disk_guid = [1; 16];
+        vmd.storage_partition_type_guid = [2; 16];
+        vmd.storage_partition_guid = [3; 16];
+        let table = DeviceTable::from_pci(&functions, None, &[vmd]).unwrap();
+        let info = table.query(2, 0).unwrap();
+        assert_ne!(info.flags & PCI_DEVICE_FLAG_PARTITIONED, 0);
+        assert_eq!(info.storage_disk_guid, [1; 16]);
+        assert_eq!(info.storage_partition_type_guid, [2; 16]);
+        assert_eq!(info.storage_partition_guid, [3; 16]);
     }
 }

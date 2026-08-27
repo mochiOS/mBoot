@@ -58,6 +58,8 @@ mdriver-test:
 		MDRIVER_KERNEL="$(MDRIVER_KERNEL)" \
 		MDRIVER_INITRAMFS="$(MDRIVER_INITRAMFS)"
 	HV_DISK_IMAGE="$(OUTPUT_DIR)/mdriver.iso" scripts/test-mdriver.sh
+	MDRIVER_STORAGE_CORRUPT=primary \
+		HV_DISK_IMAGE="$(OUTPUT_DIR)/mdriver.iso" scripts/test-mdriver.sh
 
 qemu-test:
 	$(MAKE) image CONFIG="$(CURDIR)/config/qemu.toml" IMAGE="$(OUTPUT_DIR)/qemu.iso"

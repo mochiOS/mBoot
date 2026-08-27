@@ -35,7 +35,7 @@ mochiOSワークスペースからは、ルートで`make mboot`を実行しま�
 
 ## mDriver
 
-mDriverはmBootの外でビルドします。mBootは署名やハッシュを確認できる完成済みのkernelとinitramfsだけを受け取ります。この分離により、mBootのクリーンビルドにBuildrootやLinuxのソースツリーは要りません。
+mDriverはmBootの外でビルドします。mBootは完成済みのkernelとinitramfsを受け取ります。
 
 mDriverを含む設定でイメージを作る場合は、2つの成果物を渡します。
 
@@ -47,6 +47,8 @@ make image \
 ```
 
 指定したファイルがない場合、mBootは代わりのLinuxを自動生成せず、その場でエラーにします。古いBuildrootの出力を黙って使うこともありません。
+
+詳しい説明は、mochiOSリポジトリの[mBootについて](https://github.com/mochiOS/mochiOS/blob/master/docs/mboot/about.md)、[mDriver](https://github.com/mochiOS/mochiOS/blob/master/docs/mboot/mdriver.md)、[物理ストレージ](https://github.com/mochiOS/mochiOS/blob/master/docs/mboot/storage.md)、[OVMF](https://github.com/mochiOS/mochiOS/blob/master/docs/mboot/ovmf.md)にまとめています。
 
 ## 確認
 
