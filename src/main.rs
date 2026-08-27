@@ -13,7 +13,7 @@ use core::arch::asm;
 use core::mem::size_of;
 use core::ptr::{copy_nonoverlapping, write_bytes};
 use mboot::arch::x86_64::{cpu, descriptor, timer};
-use mboot::device::DeviceTable;
+use mboot::device::{DeviceError, DeviceTable};
 use mboot::domain::{Domain, DomainId, DomainRole, DomainState};
 use mboot::event::EventChannelTable;
 use mboot::grant::{GrantRef, GrantTable};
@@ -537,6 +537,16 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     let mut devices =
         match DeviceTable::from_pci(quarantine.inventory(), deferred_display, &device_policies) {
             Ok(devices) => devices,
+            Err(DeviceError::DeviceUnavailable) => {
+                log!("PCI ownership policy failed: required device unavailable");
+                display::failure(24);
+                halt()
+            }
+            Err(DeviceError::AmbiguousDevice) => {
+                log!("PCI ownership policy failed: automatic device selection is ambiguous");
+                display::failure(25);
+                halt()
+            }
             Err(error) => {
                 log!("PCI ownership policy failed: {:?}", error);
                 halt_with_error("PCI ownership policy", mboot::Error::InvalidManifest)

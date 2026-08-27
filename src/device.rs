@@ -34,6 +34,7 @@ const EMPTY_RECORD: DeviceRecord = DeviceRecord {
 pub enum DeviceError {
     InvalidPolicy,
     DeviceUnavailable,
+    AmbiguousDevice,
     PermissionDenied,
     InvalidState,
 }
@@ -80,7 +81,7 @@ impl DeviceTable {
                         continue;
                     }
                     if candidate.replace(index).is_some() {
-                        return Err(DeviceError::InvalidPolicy);
+                        return Err(DeviceError::AmbiguousDevice);
                     }
                 }
                 let Some(index) = candidate else {
@@ -397,7 +398,7 @@ mod tests {
         nvme.flags |= DEVICE_FLAG_READ_ONLY;
         assert_eq!(
             DeviceTable::from_pci(&functions, None, &[nvme]).err(),
-            Some(DeviceError::InvalidPolicy)
+            Some(DeviceError::AmbiguousDevice)
         );
     }
 }
