@@ -539,7 +539,15 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             Ok(devices) => devices,
             Err(DeviceError::DeviceUnavailable) => {
                 log!("PCI ownership policy failed: required device unavailable");
-                display::failure(24);
+                let mut storage = quarantine
+                    .inventory()
+                    .iter()
+                    .copied()
+                    .filter(|function| function.class == 0x01);
+                display::storage_candidates(
+                    storage.next().map(pci_identity),
+                    storage.next().map(pci_identity),
+                );
                 halt()
             }
             Err(DeviceError::AmbiguousDevice(first, second)) => {
@@ -1681,6 +1689,15 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     let _keep_prepared_storage = prepared_domains;
     let _keep_manifest_alive = manifest_bytes;
     halt()
+}
+
+fn pci_identity(function: pci::PciFunction) -> (u16, u16, u16, u8) {
+    (
+        function.requester,
+        function.vendor,
+        function.device,
+        function.subclass,
+    )
 }
 
 fn isolate_crashed_domain(

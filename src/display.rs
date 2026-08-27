@@ -82,6 +82,25 @@ pub fn nvme_candidates(first: (u16, u16, u16), second: (u16, u16, u16)) {
     draw_pci_identity(second, line_y(2));
 }
 
+pub fn storage_candidates(
+    first: Option<(u16, u16, u16, u8)>,
+    second: Option<(u16, u16, u16, u8)>,
+) {
+    show(0x006B_2028, b"STORAGE", b"");
+    let Some((requester, vendor, device, subclass)) = first else {
+        draw_centered(b"NONE", line_y(1));
+        return;
+    };
+    draw_pci_identity((requester, vendor, device), line_y(1));
+    if let Some((requester, vendor, device, _)) = second {
+        draw_pci_identity((requester, vendor, device), line_y(2));
+    } else {
+        let mut text = *b"CLASS 0100";
+        write_hex_u8(&mut text[8..10], subclass);
+        draw_centered(&text, line_y(2));
+    }
+}
+
 fn draw_pci_identity((requester, vendor, device): (u16, u16, u16), y: usize) {
     let mut text = [b' '; 14];
     write_hex_u16(&mut text[0..4], requester);
@@ -93,6 +112,17 @@ fn draw_pci_identity((requester, vendor, device): (u16, u16, u16), y: usize) {
 fn write_hex_u16(output: &mut [u8], value: u16) {
     for (index, digit) in output.iter_mut().enumerate() {
         let nibble = ((value >> ((3 - index) * 4)) & 0xf) as u8;
+        *digit = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'A' + nibble - 10
+        };
+    }
+}
+
+fn write_hex_u8(output: &mut [u8], value: u8) {
+    for (index, digit) in output.iter_mut().enumerate() {
+        let nibble = (value >> ((1 - index) * 4)) & 0xf;
         *digit = if nibble < 10 {
             b'0' + nibble
         } else {
