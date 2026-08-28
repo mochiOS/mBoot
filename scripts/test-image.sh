@@ -40,7 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT
 cp "$OVMF_VARS" "$WORK/OVMF_VARS.fd"
-cp --sparse=always "$IMAGE" "$WORK/mochiOS.iso"
+cp --sparse=always "$IMAGE" "$WORK/mochiOS.img"
 
 "$QEMU" \
     -accel "$ACCEL" \
@@ -51,7 +51,7 @@ cp --sparse=always "$IMAGE" "$WORK/mochiOS.iso"
     -m 512 \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd" \
-    -drive "if=none,id=disk,format=raw,file=$WORK/mochiOS.iso" \
+    -drive "if=none,id=disk,format=raw,file=$WORK/mochiOS.img" \
     -device virtio-blk-pci,drive=disk,bootindex=1 \
     -display none \
     -monitor none \

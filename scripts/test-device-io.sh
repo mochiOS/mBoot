@@ -30,7 +30,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-BOOT_IMAGE="$WORK/mochiOS.iso"
+BOOT_IMAGE="$WORK/mochiOS.img"
 TEST_DISK="$WORK/virtio-test.img"
 SERIAL="$WORK/serial.log"
 TRACE="$WORK/qemu.trace"

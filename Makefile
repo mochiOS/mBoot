@@ -1,7 +1,8 @@
 OUTPUT_DIR ?= $(CURDIR)/output
 CONFIG ?= $(CURDIR)/config/qemu.toml
 MNU_DIR ?= $(abspath $(CURDIR)/../mnu)
-IMAGE ?= $(OUTPUT_DIR)/mochiOS.iso
+IMAGE ?= $(OUTPUT_DIR)/mochiOS.img
+PXE_DIR ?= $(OUTPUT_DIR)/pxe
 MDRIVER_KERNEL ?=
 MDRIVER_INITRAMFS ?=
 
@@ -40,7 +41,8 @@ image: $(SETUP_STAMP)
 		scripts/build-image.pl \
 		--config "$(CONFIG)" \
 		--mnu-dir "$(MNU_DIR)" \
-		--output "$(IMAGE)"
+		--output "$(IMAGE)" \
+		--pxe-output "$(PXE_DIR)"
 
 image-test: image
 	HV_CONFIG="$(CONFIG)" HV_DISK_IMAGE="$(IMAGE)" scripts/test-image.sh
@@ -54,22 +56,22 @@ mdriver-test:
 	@test -n "$(MDRIVER_INITRAMFS)" || { echo 'set MDRIVER_INITRAMFS=/path/to/initramfs.cpio' >&2; exit 1; }
 	$(MAKE) image \
 		CONFIG="$(CURDIR)/config/qemu-mdriver.toml" \
-		IMAGE="$(OUTPUT_DIR)/mdriver.iso" \
+		IMAGE="$(OUTPUT_DIR)/mdriver.img" \
 		MDRIVER_KERNEL="$(MDRIVER_KERNEL)" \
 		MDRIVER_INITRAMFS="$(MDRIVER_INITRAMFS)"
-	HV_DISK_IMAGE="$(OUTPUT_DIR)/mdriver.iso" scripts/test-mdriver.sh
+	HV_DISK_IMAGE="$(OUTPUT_DIR)/mdriver.img" scripts/test-mdriver.sh
 	MDRIVER_STORAGE_CORRUPT=primary \
-		HV_DISK_IMAGE="$(OUTPUT_DIR)/mdriver.iso" scripts/test-mdriver.sh
+		HV_DISK_IMAGE="$(OUTPUT_DIR)/mdriver.img" scripts/test-mdriver.sh
 	$(MAKE) image \
 		CONFIG="$(CURDIR)/config/qemu-mdriver-inspection.toml" \
-		IMAGE="$(OUTPUT_DIR)/mdriver-inspection.iso" \
+		IMAGE="$(OUTPUT_DIR)/mdriver-inspection.img" \
 		MDRIVER_KERNEL="$(MDRIVER_KERNEL)" \
 		MDRIVER_INITRAMFS="$(MDRIVER_INITRAMFS)"
 	MDRIVER_STORAGE_INSPECT=1 \
-		HV_DISK_IMAGE="$(OUTPUT_DIR)/mdriver-inspection.iso" scripts/test-mdriver.sh
+		HV_DISK_IMAGE="$(OUTPUT_DIR)/mdriver-inspection.img" scripts/test-mdriver.sh
 
 qemu-test:
-	$(MAKE) image CONFIG="$(CURDIR)/config/qemu.toml" IMAGE="$(OUTPUT_DIR)/qemu.iso"
+	$(MAKE) image CONFIG="$(CURDIR)/config/qemu.toml" IMAGE="$(OUTPUT_DIR)/qemu.img"
 	RING_BOOTSTRAP_DOMAIN_ELF="$(MNU_DIR)/target/x86_64-unknown-none/release/ring-bootstrap" \
 	MBOOT_LAUNCH_MANIFEST="$(OUTPUT_DIR)/launch.manifest" scripts/test-qemu.sh
 

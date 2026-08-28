@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-IMAGE=${HV_DISK_IMAGE:-$ROOT/output/mdriver.iso}
+IMAGE=${HV_DISK_IMAGE:-$ROOT/output/mdriver.img}
 QEMU=${QEMU:-qemu-system-x86_64}
 ACCEL=${HV_ACCEL:-auto}
 if [[ $ACCEL == auto ]]; then
@@ -41,7 +41,7 @@ cleanup() {
 }
 trap cleanup EXIT
 cp "$OVMF_VARS" "$WORK/OVMF_VARS.fd"
-cp --sparse=always "$IMAGE" "$WORK/mdriver.iso"
+cp --sparse=always "$IMAGE" "$WORK/mdriver.img"
 truncate -s 8M "$WORK/device.img"
 sgdisk --clear --disk-guid="$STORAGE_DISK_GUID" \
     --new="1:$STORAGE_FIRST_SECTOR:$STORAGE_LAST_SECTOR" \
@@ -73,7 +73,7 @@ fi
     -m 512 \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd" \
-    -drive "if=none,id=disk,format=raw,file=$WORK/mdriver.iso" \
+    -drive "if=none,id=disk,format=raw,file=$WORK/mdriver.img" \
     -device virtio-blk-pci,drive=disk,addr=0x2,bootindex=1 \
     -drive "if=none,id=device,format=raw,file=$WORK/device.img" \
     -device "virtio-blk-pci,drive=device,addr=0x3,disable-legacy=on,iommu_platform=on$DEVICE_VECTOR_OPTION" \

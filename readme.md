@@ -17,7 +17,7 @@ Intel CPUではVMXとEPT、AMD CPUではSVMとNPTを使います。mBootが管�
 
 ## ビルド
 
-mBoot単体リポジトリの隣にmnuを置いた場合は、次のコマンドで`output/mochiOS.iso`を作れます。
+mBoot単体リポジトリの隣にmnuを置いた場合は、次のコマンドで`output/mochiOS.img`を作れます。
 
 ```sh
 make image
@@ -29,9 +29,9 @@ mnuが別の場所にある場合は明示します。
 make image MNU_DIR=/path/to/mnu CONFIG=config/intel-hardware.toml
 ```
 
-`mochiOS.iso`はISO9660ではありません。USBメモリへそのまま書き込めるraw GPTディスクイメージです。EFI System PartitionにはmBoot、Launch Manifest、設定で選んだDomainイメージが入ります。
+`mochiOS.img`は、USBメモリへそのまま書き込めるraw GPTディスクイメージです。EFI System PartitionにはmBoot、Launch Manifest、設定で選んだDomainイメージが入ります。
 
-mochiOSワークスペースからは、ルートで`make mboot`を実行します。通常の出力先は`out/mochiOS.iso`です。
+mochiOSワークスペースからは、ルートで`make mboot`を実行します。通常の出力先は`out/mochiOS.img`です。
 
 ## mDriver
 

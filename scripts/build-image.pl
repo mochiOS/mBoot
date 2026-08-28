@@ -5,12 +5,13 @@ use warnings;
 use Cwd qw(abs_path);
 use File::Basename qw(dirname);
 use File::Copy qw(copy move);
-use File::Path qw(make_path);
+use File::Path qw(make_path remove_tree);
+use File::Spec;
 use FindBin;
 use lib $FindBin::Bin;
 use MbootConfig qw(read_mboot_config);
 
-my ($config_file, $mnu_dir, $output_file);
+my ($config_file, $mnu_dir, $output_file, $pxe_output);
 while (@ARGV) {
     my $argument = shift @ARGV;
     if ($argument eq '--config') {
@@ -22,17 +23,23 @@ while (@ARGV) {
     elsif ($argument eq '--output') {
         $output_file = shift @ARGV;
     }
+    elsif ($argument eq '--pxe-output') {
+        $pxe_output = shift @ARGV;
+    }
     else {
         die "unknown argument: $argument\n";
     }
 }
 defined $config_file && defined $mnu_dir && defined $output_file
-    or die "usage: $0 --config FILE --mnu-dir DIR --output FILE\n";
+    or die "usage: $0 --config FILE --mnu-dir DIR --output FILE [--pxe-output DIR]\n";
 
 $config_file = absolute_existing($config_file);
 $mnu_dir = absolute_existing($mnu_dir);
 my $mboot_dir = abs_path("$FindBin::Bin/..");
 $output_file = absolute_output($output_file);
+$pxe_output = absolute_output($pxe_output) if defined $pxe_output;
+defined $pxe_output && $pxe_output eq '/'
+    and die "PXE output directory must not be the filesystem root\n";
 my $config = read_mboot_config($config_file);
 my $cargo = $ENV{MBOOT_HOST_CARGO} // 'cargo';
 for my $command ($cargo, qw(truncate mkfs.vfat mmd mcopy sgdisk dd)) {
@@ -41,11 +48,22 @@ for my $command ($cargo, qw(truncate mkfs.vfat mmd mcopy sgdisk dd)) {
 
 my $output_dir = $ENV{MBOOT_OUTPUT_DIR} // "$mboot_dir/output";
 $output_dir = absolute_output($output_dir);
+if (defined $pxe_output
+    && (path_contains($pxe_output, $output_file)
+        || path_contains($pxe_output, $output_dir))) {
+    die "PXE output directory must not contain the disk image or mBoot build directory\n";
+}
 my $work = "$output_dir/image-work";
 my $target = "$output_dir/target";
 my $esp = "$work/esp.img";
 my $manifest = "$output_dir/launch.manifest";
 make_path($work, dirname($output_file));
+my $pxe_stage;
+if (defined $pxe_output) {
+    $pxe_stage = "$pxe_output.new.$$";
+    remove_tree($pxe_stage) if -e $pxe_stage;
+    make_path($pxe_stage);
+}
 
 my $toolchain = "+$config->{toolchain}";
 my $mnu_manifest = "$mnu_dir/Cargo.toml";
@@ -150,6 +168,8 @@ run('mmd', '-i', $esp, '::/EFI/BOOT');
 run('mmd', '-i', $esp, '::/EFI/MBOOT');
 run('mcopy', '-i', $esp, $efi, '::/EFI/BOOT/BOOTX64.EFI');
 run('mcopy', '-i', $esp, $manifest, '::/EFI/MBOOT/LAUNCH.MF');
+publish_pxe_file($pxe_stage, $efi, '/EFI/BOOT/BOOTX64.EFI') if defined $pxe_stage;
+publish_pxe_file($pxe_stage, $manifest, '/EFI/MBOOT/LAUNCH.MF') if defined $pxe_stage;
 
 my %copied_paths;
 for my $domain (@{$config->{domains}}) {
@@ -157,10 +177,13 @@ for my $domain (@{$config->{domains}}) {
     next if $copied_paths{$domain->{path}}++;
     (my $destination = $domain->{path}) =~ s{\\}{/}g;
     run('mcopy', '-i', $esp, $source, "::$destination");
+    publish_pxe_file($pxe_stage, $source, $destination) if defined $pxe_stage;
     if ($domain->{format} eq 'linux-pvh') {
         my $initramfs_source = $initramfs_images{$domain->{initramfs}};
         (my $initramfs_destination = $domain->{initramfs_path}) =~ s{\\}{/}g;
         run('mcopy', '-o', '-i', $esp, $initramfs_source, "::$initramfs_destination");
+        publish_pxe_file($pxe_stage, $initramfs_source, $initramfs_destination)
+            if defined $pxe_stage;
     }
 }
 
@@ -179,6 +202,42 @@ run('sgdisk', '--verify', $temporary);
 move($temporary, $output_file) or die "cannot publish $output_file: $!\n";
 chmod 0644, $output_file or die "cannot chmod $output_file: $!\n";
 print "[done] bootable image: $output_file\n";
+if (defined $pxe_stage) {
+    publish_ipxe_boot($pxe_stage, $output_file);
+    remove_tree($pxe_output) if -e $pxe_output;
+    move($pxe_stage, $pxe_output) or die "cannot publish PXE directory $pxe_output: $!\n";
+    print "[done] PXE directory: $pxe_output\n";
+}
+
+sub publish_ipxe_boot {
+    my ($root, $disk_image) = @_;
+    my $pxe_image = "$root/mochiOS.img";
+    link($disk_image, $pxe_image)
+        || copy($disk_image, $pxe_image)
+        or die "cannot publish PXE disk image $pxe_image: $!\n";
+    chmod 0644, $pxe_image or die "cannot chmod $pxe_image: $!\n";
+
+    my $script = "$root/boot.ipxe";
+    open my $handle, '>', $script or die "cannot create $script: $!\n";
+    print {$handle} <<'IPXE';
+#!ipxe
+sanboot --filename \EFI\BOOT\BOOTX64.EFI ${cwduri}/mochiOS.img
+IPXE
+    close $handle or die "cannot close $script: $!\n";
+    chmod 0644, $script or die "cannot chmod $script: $!\n";
+}
+
+sub publish_pxe_file {
+    my ($root, $source, $uefi_path) = @_;
+    (my $relative = $uefi_path) =~ s{\\}{/}g;
+    $relative =~ s{^/+}{};
+    $relative ne '' && $relative !~ m{(?:^|/)\.\.(?:/|$)}
+        or die "unsafe PXE path: $uefi_path\n";
+    my $destination = "$root/$relative";
+    make_path(dirname($destination));
+    copy($source, $destination) or die "cannot copy $source to $destination: $!\n";
+    chmod 0644, $destination or die "cannot chmod $destination: $!\n";
+}
 
 sub absolute_existing {
     my ($path) = @_;
@@ -189,8 +248,12 @@ sub absolute_existing {
 
 sub absolute_output {
     my ($path) = @_;
-    return $path if $path =~ m{^/};
-    return abs_path('.') . "/$path";
+    return File::Spec->canonpath(File::Spec->rel2abs($path));
+}
+
+sub path_contains {
+    my ($directory, $path) = @_;
+    return $path eq $directory || index($path, "$directory/") == 0;
 }
 
 sub command_path {
