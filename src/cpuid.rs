@@ -46,6 +46,12 @@ pub fn query(
             ecx: LEAF1_ECX_X2APIC | LEAF1_ECX_HYPERVISOR,
             edx: LEAF1_EDX_BASELINE,
         },
+        // FSGSBASE lets a guest manage its thread-local FS/GS values without
+        // granting access to arbitrary host MSRs.
+        7 if subleaf == 0 => CpuidResult {
+            ebx: 1,
+            ..CpuidResult::default()
+        },
         0x0b => topology_leaf(subleaf, apic_id, vcpu_count),
         0x4000_0000 => vendor_leaf(MAX_HYPERVISOR_LEAF, HYPERVISOR_VENDOR, true),
         // mBoot interface leaf: ABI version, virtual TSC kHz, backend ID.
@@ -197,7 +203,7 @@ mod tests {
             test_query(0x1234_5678, 0, 0, 1, 2_400_000, 1),
             CpuidResult::default()
         );
-        assert_eq!(test_query(7, 0, 0, 1, 2_400_000, 1), CpuidResult::default());
+        assert_eq!(test_query(7, 1, 0, 1, 2_400_000, 1), CpuidResult::default());
     }
 
     #[test]

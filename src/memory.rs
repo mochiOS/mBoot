@@ -12,7 +12,10 @@ const EPT_WALK_LENGTH_4: u64 = 3 << 3;
 const NPT_PRESENT_WRITE_USER: u64 = 0b111;
 const NPT_PRESENT_USER_NO_EXECUTE: u64 = 0b101 | (1 << 63);
 const NPT_DEVICE_READ_WRITE: u64 = NPT_PRESENT_WRITE_USER | (1 << 3) | (1 << 4) | (1 << 63);
-const GUEST_PAGE_TABLE_FLAGS: u64 = 0b111;
+// Native Domains start in ring 0. Their initial identity map must remain
+// supervisor-only; the guest kernel creates user-accessible mappings explicitly
+// when it constructs a process address space.
+const GUEST_PAGE_TABLE_FLAGS: u64 = 0b011;
 const GUEST_LARGE_PAGE_FLAGS: u64 = GUEST_PAGE_TABLE_FLAGS | (1 << 7);
 const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 const NESTED_LARGE_PAGE: u64 = 1 << 7;
@@ -407,9 +410,7 @@ impl NestedPageTable {
         } else if current != expected {
             return Err(Error::InvalidPage);
         }
-        Ok(unsafe {
-            (expected as *mut u64).add(((guest >> 21) & 0x1ff) as usize)
-        })
+        Ok(unsafe { (expected as *mut u64).add(((guest >> 21) & 0x1ff) as usize) })
     }
 
     fn level3_table(&self) -> u64 {
@@ -645,8 +646,8 @@ mod tests {
             &mut device_state,
             &mut guest,
         );
-        let table = unsafe { NestedPageTable::initialize(BackendKind::IntelVmx, resources) }
-            .unwrap();
+        let table =
+            unsafe { NestedPageTable::initialize(BackendKind::IntelVmx, resources) }.unwrap();
 
         unsafe { table.map_device_range(0x20_0000, 0x40_0000, 0x20_1000) }.unwrap();
         assert_eq!(

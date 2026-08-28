@@ -564,9 +564,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
     let deferred_display = quarantine.display_requester.filter(|requester| {
         !quarantine.active_requesters().contains(requester)
-        && iommu_topology.is_some_and(|topology| {
-            topology.covers_requester(0, *requester)
-        })
+            && iommu_topology.is_some_and(|topology| topology.covers_requester(0, *requester))
     });
     if let Some(requester) = deferred_display {
         log!(
@@ -680,6 +678,25 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             Ok(image) => image,
             Err(error) => halt_with_error("Domain image", error),
         };
+        let (boot_module_start, boot_module_size) =
+            if prepared.image_format == ManifestImageFormat::NativeElf {
+                match prepared.initramfs.as_deref() {
+                    Some(module) => match unsafe {
+                        image::load_boot_module(
+                            module,
+                            guest_image.loaded_end(),
+                            grant_window_start(&nested),
+                            &nested,
+                        )
+                    } {
+                        Ok(module) => module,
+                        Err(error) => halt_with_error("Domain boot module", error),
+                    },
+                    None => (0, 0),
+                }
+            } else {
+                (0, 0)
+            };
         // SAFETY: Control pages are exclusive, execution is pinned to the BSP,
         // interrupts are disabled, and this code runs at CPL0.
         let virtualization = if index == 0 {
@@ -725,6 +742,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             backend_id,
             abi_domain_role(domain.role()),
             domain.nested_pages().guest_memory_size(),
+            boot_module_start,
+            boot_module_size,
             grant_window_start(domain.nested_pages()),
             GRANT_WINDOW_PAGES as u64 * 4096,
             DEVICE_WINDOW_START,
@@ -1915,6 +1934,25 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
         Ok(image) => image,
         Err(error) => halt_with_error("Domain image restart", error),
     };
+    let (boot_module_start, boot_module_size) =
+        if runtime.image_format == ManifestImageFormat::NativeElf {
+            match runtime.initramfs.as_deref() {
+                Some(module) => match unsafe {
+                    image::load_boot_module(
+                        module,
+                        guest_image.loaded_end(),
+                        grant_window_start(runtime.domain.nested_pages()),
+                        runtime.domain.nested_pages(),
+                    )
+                } {
+                    Ok(module) => module,
+                    Err(error) => halt_with_error("Domain boot module restart", error),
+                },
+                None => (0, 0),
+            }
+        } else {
+            (0, 0)
+        };
     runtime.restart_count = runtime.restart_count.saturating_add(1);
     let backend = match runtime.domain.backend() {
         BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
@@ -1926,6 +1964,8 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
         backend,
         abi_domain_role(runtime.domain.role()),
         runtime.domain.nested_pages().guest_memory_size(),
+        boot_module_start,
+        boot_module_size,
         grant_window_start(runtime.domain.nested_pages()),
         GRANT_WINDOW_PAGES as u64 * 4096,
         DEVICE_WINDOW_START,
@@ -2126,18 +2166,17 @@ fn claim_pci_device(
     let nested_root = runtime_domains[index].domain.nested_pages().hardware_root();
     for bar in bars.iter().filter(|bar| bar.length != 0) {
         if unsafe {
-            runtime_domains[index].domain.nested_pages().map_device_range(
-                bar.guest_address,
-                bar.physical_address,
-                bar.length,
-            )
+            runtime_domains[index]
+                .domain
+                .nested_pages()
+                .map_device_range(bar.guest_address, bar.physical_address, bar.length)
         }
         .is_err()
         {
-                if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
-                    halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
-                }
-                return false;
+            if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
+                halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
+            }
+            return false;
         }
     }
     if unsafe {
@@ -2167,7 +2206,10 @@ fn claim_pci_device(
             }
             return false;
         }
-        log!("firmware display {:04x} handed off to the Hardware Domain", requester);
+        log!(
+            "firmware display {:04x} handed off to the Hardware Domain",
+            requester
+        );
     }
     let guest_base = runtime_domains[index].domain.nested_pages().guest_base();
     let guest_size = runtime_domains[index]
@@ -2363,7 +2405,10 @@ fn allocate_msr_permission_map(
     // AMD's MSRPM occupies two contiguous pages. Setting every bit intercepts
     // every covered RDMSR and WRMSR until mBoot explicitly emulates it.
     unsafe { write_bytes(address as *mut u8, 0xff, 8192) };
-    if image_format == ManifestImageFormat::LinuxPvh {
+    if matches!(
+        image_format,
+        ManifestImageFormat::LinuxPvh | ManifestImageFormat::NativeElf
+    ) {
         for msr in [
             0x174,
             0x175,

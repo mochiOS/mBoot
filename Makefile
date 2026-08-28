@@ -6,6 +6,7 @@ PXE_DIR ?= $(OUTPUT_DIR)/pxe
 UEFI_NET_DIR ?= $(OUTPUT_DIR)/uefi-net
 MDRIVER_KERNEL ?=
 MDRIVER_INITRAMFS ?=
+MOCHIOS_INITFS ?=
 
 CARGO ?= $(shell command -v cargo 2>/dev/null)
 RUSTC ?= $(shell command -v rustc 2>/dev/null)
@@ -39,6 +40,7 @@ image: $(SETUP_STAMP)
 	MBOOT_OUTPUT_DIR="$(OUTPUT_DIR)" \
 	MBOOT_MDRIVER_KERNEL="$(MDRIVER_KERNEL)" \
 	MBOOT_MDRIVER_INITRAMFS="$(MDRIVER_INITRAMFS)" \
+	MBOOT_MOCHIOS_INITFS="$(MOCHIOS_INITFS)" \
 		scripts/build-image.pl \
 		--config "$(CONFIG)" \
 		--mnu-dir "$(MNU_DIR)" \

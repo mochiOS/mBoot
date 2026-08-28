@@ -356,7 +356,8 @@ impl<'a> LaunchManifest<'a> {
             || initramfs_path.is_some_and(|path| !valid_uefi_path(path))
             || !command_line.is_ascii()
             || image_format == ManifestImageFormat::NativeElf
-                && (initramfs_path.is_some() || !command_line.is_empty())
+                && (role != ManifestDomainRole::System && initramfs_path.is_some()
+                    || !command_line.is_empty())
             || image_format == ManifestImageFormat::LinuxPvh && role != ManifestDomainRole::Hardware
             || initramfs_path.is_none() && initramfs_sha256 != [0; 32]
         {
@@ -700,8 +701,7 @@ mod tests {
         bytes[device + 2..device + 4].copy_from_slice(&AUTO_REQUESTER.to_le_bytes());
         bytes[device + 4..device + 6]
             .copy_from_slice(&(ManifestDeviceKind::Display as u16).to_le_bytes());
-        bytes[device + 6..device + 8]
-            .copy_from_slice(&DEVICE_FLAG_REQUIRED.to_le_bytes());
+        bytes[device + 6..device + 8].copy_from_slice(&DEVICE_FLAG_REQUIRED.to_le_bytes());
 
         let digest = Sha256::digest(&bytes).into();
         let manifest = LaunchManifest::parse(&bytes, digest).unwrap();

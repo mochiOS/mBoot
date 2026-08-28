@@ -26,6 +26,7 @@ const XEN_HVM_MEMMAP_TYPE_RESERVED: u32 = 2;
 pub struct GuestImage {
     entry: u64,
     boot_info: u64,
+    loaded_end: u64,
 }
 
 impl GuestImage {
@@ -35,6 +36,10 @@ impl GuestImage {
 
     pub const fn boot_info(self) -> u64 {
         self.boot_info
+    }
+
+    pub const fn loaded_end(self) -> u64 {
+        self.loaded_end
     }
 }
 
@@ -124,6 +129,7 @@ pub unsafe fn load_elf(image: &[u8], memory: &NestedPageTable) -> Result<GuestIm
     }
 
     let mut loaded = false;
+    let mut loaded_end = 0;
     for index in 0..usize::from(header.program_header_count) {
         let offset = (header.program_header_offset as usize)
             .checked_add(
@@ -159,6 +165,12 @@ pub unsafe fn load_elf(image: &[u8], memory: &NestedPageTable) -> Result<GuestIm
             write_bytes(destination as *mut u8, 0, segment.memory_size as usize);
             copy_nonoverlapping(source.as_ptr(), destination as *mut u8, source.len());
         }
+        loaded_end = loaded_end.max(
+            segment
+                .physical_address
+                .checked_add(segment.memory_size)
+                .ok_or(Error::InvalidImage)?,
+        );
         loaded = true;
     }
     if !loaded {
@@ -167,7 +179,41 @@ pub unsafe fn load_elf(image: &[u8], memory: &NestedPageTable) -> Result<GuestIm
     Ok(GuestImage {
         entry: header.entry,
         boot_info: 0,
+        loaded_end,
     })
+}
+
+/// Places an authenticated boot module below `limit` in stopped Domain RAM.
+///
+/// The returned address is page aligned. `image_end` must be the first byte
+/// after the native ELF image so the module cannot overwrite its loadable
+/// segments.
+///
+/// # Safety
+/// The Domain must be stopped and `memory` must be exclusively writable.
+pub unsafe fn load_boot_module(
+    module: &[u8],
+    image_end: u64,
+    limit: u64,
+    memory: &NestedPageTable,
+) -> Result<(u64, u64), Error> {
+    if module.is_empty() || limit > memory.guest_memory_size() {
+        return Err(Error::InvalidImage);
+    }
+    let size = u64::try_from(module.len()).map_err(|_| Error::ImageTooLarge)?;
+    let start = limit
+        .checked_sub(size)
+        .map(|address| address & !0xfff)
+        .ok_or(Error::ImageTooLarge)?;
+    if start < image_end || start < MINIMUM_LOAD_GPA {
+        return Err(Error::ImageTooLarge);
+    }
+    let destination = memory
+        .guest_host_address(start, size)
+        .ok_or(Error::ImageTooLarge)?;
+    // SAFETY: The bounds and stopped-Domain ownership were checked above.
+    unsafe { copy_nonoverlapping(module.as_ptr(), destination as *mut u8, module.len()) };
+    Ok((start, size))
 }
 
 /// Loads an x86 Linux PVH ELF and constructs the version 1 start-info block.
@@ -302,6 +348,7 @@ pub unsafe fn load_linux_pvh(
     Ok(GuestImage {
         entry,
         boot_info: PVH_START_INFO_GPA,
+        loaded_end: usable_memory_size,
     })
 }
 
@@ -441,6 +488,45 @@ mod tests {
         assert_eq!(
             unsafe { load_elf(&ELF_MAGIC, &memory) },
             Err(Error::InvalidImage)
+        );
+    }
+
+    #[test]
+    fn boot_module_is_page_aligned_below_the_reserved_limit() {
+        let mut ram = GuestMemory([0; 128 * 1024]);
+        let memory = NestedPageTable::test_new(
+            crate::BackendKind::IntelVmx,
+            0x1000,
+            ram.0.as_mut_ptr() as u64,
+            32,
+        );
+        let module = [0x5a; 5000];
+        // SAFETY: The synthetic RAM is exclusively owned by this stopped test Domain.
+        let (start, size) =
+            unsafe { load_boot_module(&module, 0x10_000, 0x20_000, &memory).unwrap() };
+        assert_eq!(start & 0xfff, 0);
+        assert_eq!(size, module.len() as u64);
+        assert!(start >= 0x10_000);
+        assert!(start + size <= 0x20_000);
+        assert_eq!(
+            &ram.0[start as usize..start as usize + module.len()],
+            &module
+        );
+    }
+
+    #[test]
+    fn boot_module_cannot_overlap_the_native_image() {
+        let mut ram = GuestMemory([0; 128 * 1024]);
+        let memory = NestedPageTable::test_new(
+            crate::BackendKind::IntelVmx,
+            0x1000,
+            ram.0.as_mut_ptr() as u64,
+            32,
+        );
+        // SAFETY: Rejection happens without exposing this RAM to a running vCPU.
+        assert_eq!(
+            unsafe { load_boot_module(&[0; 0x3000], 0x1e_000, 0x20_000, &memory) },
+            Err(Error::ImageTooLarge)
         );
     }
 

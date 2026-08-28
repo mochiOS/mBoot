@@ -922,18 +922,9 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
         (PAGE_FAULT_ERROR_MASK, 0),
         (PAGE_FAULT_ERROR_MATCH, 0),
         (CR3_TARGET_COUNT, 0),
-        (
-            EXIT_MSR_STORE_COUNT,
-            if pvh { GUEST_MSR_LIST.len() as u64 } else { 0 },
-        ),
-        (
-            EXIT_MSR_LOAD_COUNT,
-            if pvh { GUEST_MSR_LIST.len() as u64 } else { 0 },
-        ),
-        (
-            ENTRY_MSR_LOAD_COUNT,
-            if pvh { GUEST_MSR_LIST.len() as u64 } else { 0 },
-        ),
+        (EXIT_MSR_STORE_COUNT, GUEST_MSR_LIST.len() as u64),
+        (EXIT_MSR_LOAD_COUNT, GUEST_MSR_LIST.len() as u64),
+        (ENTRY_MSR_LOAD_COUNT, GUEST_MSR_LIST.len() as u64),
         (ENTRY_INTERRUPTION_INFO, 0),
     ] {
         // SAFETY: Each field is a writable control field of the current VMCS.
@@ -943,15 +934,13 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
         validate_page(config.msr_permission_map)?;
         unsafe { vmwrite(MSR_BITMAP, config.msr_permission_map)? };
     }
-    if pvh {
-        unsafe { initialize_guest_msr_lists(config.msr_state_page)? };
-        let host_list = config.msr_state_page
-            + (GUEST_MSR_LIST.len() * core::mem::size_of::<VmEntryMsr>()) as u64;
-        unsafe {
-            vmwrite(EXIT_MSR_STORE_ADDRESS, config.msr_state_page)?;
-            vmwrite(ENTRY_MSR_LOAD_ADDRESS, config.msr_state_page)?;
-            vmwrite(EXIT_MSR_LOAD_ADDRESS, host_list)?;
-        }
+    unsafe { initialize_guest_msr_lists(config.msr_state_page)? };
+    let host_list =
+        config.msr_state_page + (GUEST_MSR_LIST.len() * core::mem::size_of::<VmEntryMsr>()) as u64;
+    unsafe {
+        vmwrite(EXIT_MSR_STORE_ADDRESS, config.msr_state_page)?;
+        vmwrite(ENTRY_MSR_LOAD_ADDRESS, config.msr_state_page)?;
+        vmwrite(EXIT_MSR_LOAD_ADDRESS, host_list)?;
     }
     // SAFETY: `ept_pointer` was constructed from validated EPT capabilities.
     unsafe {

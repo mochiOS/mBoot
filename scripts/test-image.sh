@@ -62,7 +62,9 @@ cp --sparse=always "$IMAGE" "$WORK/mochiOS.img"
     -no-shutdown &
 QEMU_PID=$!
 
-if [[ $SYSTEM_IMAGE == mochios ]]; then
+if [[ $SYSTEM_IMAGE == mochios-system ]]; then
+    expected='[Domain 1] [INFO]  Kernel initialization complete. Entering idle loop...'
+elif [[ $SYSTEM_IMAGE == mochios ]]; then
     expected='[mBoot] mochiOS System Domain 1 ready'
 else
     expected="[mBoot] bootstrap complete; $DOMAIN_COUNT Domain"

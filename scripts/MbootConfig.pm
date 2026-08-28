@@ -82,8 +82,20 @@ sub read_mboot_config {
             length($domain->{command_line}) <= 96 && $domain->{command_line} !~ /[^\x20-\x7e]/
                 or die "$path: Linux PVH command_line must be at most 96 ASCII characters\n";
         }
+        elsif ($domain->{role} eq 'system') {
+            my $has_image = exists $domain->{initramfs};
+            my $has_path = exists $domain->{initramfs_path};
+            $has_image == $has_path
+                or die "$path: System Domain boot module requires both initramfs and initramfs_path\n";
+            if ($has_path) {
+                $domain->{initramfs_path} =~ m{^\\EFI\\MBOOT\\[A-Za-z0-9._-]+$}
+                    or die "$path: System Domain boot module path must stay below \\EFI\\MBOOT\n";
+            }
+            exists $domain->{command_line}
+                and die "$path: native ELF Domain cannot define command_line\n";
+        }
         elsif (grep { exists $domain->{$_} } qw(initramfs initramfs_path command_line)) {
-            die "$path: native ELF Domain cannot define Linux PVH boot fields\n";
+            die "$path: only the System Domain may define a native boot module\n";
         }
         $domain->{autostart}
             or die "$path: current bootstrap requires autostart Domains\n";

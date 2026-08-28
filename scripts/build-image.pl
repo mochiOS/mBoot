@@ -107,6 +107,10 @@ my %domain_images = (
         bin => 'mochios-domain',
         path => "$mnu_dir/target/x86_64-unknown-none/release/mochios-domain",
     },
+    'mochios-system' => {
+        bin => 'mochios-system',
+        path => "$mnu_dir/target/x86_64-unknown-none/release/mochios-system",
+    },
     'hardware-bootstrap' => {
         bin => 'hardware-bootstrap',
         path => "$mnu_dir/target/x86_64-unknown-none/release/hardware-bootstrap",
@@ -115,6 +119,7 @@ my %domain_images = (
 );
 my %initramfs_images = (
     'mdriver' => $ENV{MBOOT_MDRIVER_INITRAMFS},
+    'mochios' => $ENV{MBOOT_MOCHIOS_INITFS},
 );
 my %required_images;
 my %required_initramfs;
@@ -122,7 +127,7 @@ for my $domain (@{$config->{domains}}) {
     exists $domain_images{$domain->{image}}
         or die "no builder is available for Domain image '$domain->{image}'\n";
     $required_images{$domain->{image}} = 1;
-    if ($domain->{format} eq 'linux-pvh') {
+    if (exists $domain->{initramfs}) {
         exists $initramfs_images{$domain->{initramfs}}
             or die "no builder is available for initramfs '$domain->{initramfs}'\n";
         $required_initramfs{$domain->{initramfs}} = 1;
@@ -140,7 +145,14 @@ if ($required_images{'mdriver'}) {
     $initramfs_images{'mdriver'}
         = absolute_existing($initramfs_images{'mdriver'});
 }
-my @native_images = grep { defined $domain_images{$_}->{bin} } sort keys %required_images;
+for my $name (keys %required_initramfs) {
+    defined $initramfs_images{$name} && length $initramfs_images{$name}
+        or die "boot module '$name' is required but no image path was supplied\n";
+    $initramfs_images{$name} = absolute_existing($initramfs_images{$name});
+}
+my @native_images = grep {
+    defined $domain_images{$_}->{bin} && $_ ne 'mochios-system'
+} sort keys %required_images;
 if (@native_images) {
     my @bins = map { ('--bin', $domain_images{$_}->{bin}) } @native_images;
     run_env(
@@ -148,6 +160,14 @@ if (@native_images) {
         $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc', '--release',
         '--target', 'x86_64-unknown-none', '--manifest-path', $mnu_manifest,
         '--no-default-features', '--features', 'domain-guest', @bins,
+    );
+}
+if ($required_images{'mochios-system'}) {
+    run_env(
+        { RUSTFLAGS => '-C relocation-model=static -C link-arg=-no-pie --cfg curve25519_dalek_backend="serial"' },
+        $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc', '--release',
+        '--target', 'x86_64-unknown-none', '--manifest-path', $mnu_manifest,
+        '--no-default-features', '--features', 'system-domain', '--bin', 'mochios-system',
     );
 }
 for my $name (keys %required_images) {
@@ -173,7 +193,7 @@ for my $domain (@{$config->{domains}}) {
             source => $domain_images{$domain->{image}}->{path},
         };
     }
-    if ($domain->{format} eq 'linux-pvh' && !$network_paths{$domain->{initramfs_path}}++) {
+    if (exists $domain->{initramfs} && !$network_paths{$domain->{initramfs_path}}++) {
         push @network_files, {
             path => $domain->{initramfs_path},
             source => $initramfs_images{$domain->{initramfs}},
@@ -238,7 +258,7 @@ for my $domain (@{$config->{domains}}) {
     (my $destination = $domain->{path}) =~ s{\\}{/}g;
     run('mcopy', '-i', $esp, $source, "::$destination");
     publish_pxe_file($pxe_stage, $source, $destination) if defined $pxe_stage;
-    if ($domain->{format} eq 'linux-pvh') {
+    if (exists $domain->{initramfs}) {
         my $initramfs_source = $initramfs_images{$domain->{initramfs}};
         (my $initramfs_destination = $domain->{initramfs_path}) =~ s{\\}{/}g;
         run('mcopy', '-o', '-i', $esp, $initramfs_source, "::$initramfs_destination");

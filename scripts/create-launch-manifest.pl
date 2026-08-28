@@ -73,7 +73,7 @@ for my $domain (@{$config->{domains}}) {
     length($path) <= 80 or die "$config_file: Domain image path is too long\n";
     my $format = $domain->{format} eq 'linux-pvh' ? 1 : 0;
     my ($initramfs_path, $command_line, $initramfs_digest) = ('', '', "\0" x 32);
-    if ($format) {
+    if ($format || exists $domain->{initramfs}) {
         my $initramfs_name = $domain->{initramfs};
         exists $initramfs_images{$initramfs_name}
             or die "$config_file: no file was supplied for initramfs '$initramfs_name'\n";
@@ -85,7 +85,7 @@ for my $domain (@{$config->{domains}}) {
             close $initramfs_fh or die "cannot close $initramfs_images{$initramfs_name}: $!\n";
         }
         $initramfs_path = $domain->{initramfs_path};
-        $command_line = $domain->{command_line};
+        $command_line = $domain->{command_line} // '';
         length($initramfs_path) <= 80 or die "$config_file: initramfs path is too long\n";
         length($command_line) <= 96 or die "$config_file: command line is too long\n";
         $initramfs_digest = sha256($initramfs_bytes{$initramfs_name});
