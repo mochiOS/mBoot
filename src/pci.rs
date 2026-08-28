@@ -1014,9 +1014,11 @@ unsafe fn quarantine_function(
     if class == 0x03 && report.display_requester.is_none() {
         report.display_requester = Some(requester_id(bus, device, function));
     }
-    // Host bridges are the boundary between the CPU/memory fabric and PCI, not
-    // PCI requester endpoints. Some Intel host bridges return a hardwired one
-    // for Command.BusMaster and ignore attempts to clear it.
+    // PCI bridge-class functions forward transactions for downstream requester
+    // IDs; they do not originate payload DMA under the bridge function's own
+    // requester ID. Intel host, ISA/LPC, and PCIe root bridges may also expose a
+    // hardwired Command.BusMaster bit. Keep the forwarding path intact and
+    // quarantine every discovered endpoint behind it instead.
     if !function_has_bus_master_control(class, subclass) {
         return next_bus.filter(|bus| *bus != 0);
     }
@@ -1044,8 +1046,8 @@ unsafe fn quarantine_function(
     next_bus.filter(|bus| *bus != 0)
 }
 
-const fn function_has_bus_master_control(class: u8, subclass: u8) -> bool {
-    !(class == 0x06 && subclass == 0x00)
+const fn function_has_bus_master_control(class: u8, _subclass: u8) -> bool {
+    class != 0x06
 }
 
 const fn requester_id(bus: u8, device: u8, function: u8) -> u16 {
@@ -1141,9 +1143,10 @@ mod tests {
     }
 
     #[test]
-    fn host_bridges_are_not_dma_requester_endpoints() {
+    fn bridge_functions_are_not_dma_requester_endpoints() {
         assert!(!function_has_bus_master_control(0x06, 0x00));
-        assert!(function_has_bus_master_control(0x06, 0x04));
+        assert!(!function_has_bus_master_control(0x06, 0x01));
+        assert!(!function_has_bus_master_control(0x06, 0x04));
         assert!(function_has_bus_master_control(0x03, 0x00));
     }
 
