@@ -11,9 +11,9 @@ const MAX_ACPI_TABLE_SIZE: usize = 1024 * 1024;
 const MAX_IOMMU_UNITS: usize = 16;
 const MAX_UNIT_SCOPES: usize = 8;
 const MAX_RESERVED_MAPPINGS: usize = 32;
-const INTEL_TABLE_PAGES: usize = 64;
+const INTEL_TABLE_PAGES: usize = 96;
 const AMD_DEVICE_TABLE_PAGES: usize = 512;
-const DOMAIN_TABLE_PAGES: usize = 64;
+const DOMAIN_TABLE_PAGES: usize = 96;
 const AMD_COMMAND_BUFFER_PAGES: usize = 2;
 const MAX_DOMAIN_MAPPINGS: usize = 8;
 const INTEL_VERSION: u64 = 0x00;
@@ -390,6 +390,57 @@ impl DmaRemapper {
         }
         if matched {
             Ok(())
+        } else {
+            Err(Error::DeviceNotCovered)
+        }
+    }
+
+    /// Replaces the firmware VT-d state kept for the boot display with mBoot's
+    /// deny-by-default table. The display function must have memory decoding and
+    /// bus mastering disabled before this transition.
+    ///
+    /// # Safety
+    /// PCI configuration and IOMMU MMIO must be exclusively owned by mBoot. No
+    /// code may access the firmware framebuffer after this call begins.
+    pub unsafe fn take_over_deferred_display(
+        &mut self,
+        segment: u16,
+        requester: u16,
+    ) -> Result<bool, Error> {
+        if self.topology.kind != IommuKind::IntelVtd || requester == 0 {
+            return Ok(false);
+        }
+        let mut matched = false;
+        let mut changed = false;
+        for index in 0..self.topology.unit_count {
+            let unit = self.topology.units[index];
+            if unit.segment != segment || !unit.covers_requester(requester) {
+                continue;
+            }
+            matched = true;
+            if self.units[index].enabled {
+                continue;
+            }
+            let resources = self.units[index].resources;
+            let next_domain_page = unsafe {
+                enable_intel_protection(
+                    &unit,
+                    resources.remapping_table,
+                    self.topology.reserved_mappings(),
+                )?
+            };
+            self.units[index] = UnitRuntime {
+                resources,
+                enabled: true,
+                next_domain_page,
+                command_tail: 0,
+                completion_value: 0,
+                domains: [EMPTY_DOMAIN_MAPPING; MAX_DOMAIN_MAPPINGS],
+            };
+            changed = true;
+        }
+        if matched {
+            Ok(changed)
         } else {
             Err(Error::DeviceNotCovered)
         }
@@ -1518,16 +1569,16 @@ mod tests {
 
     #[test]
     fn deny_all_tables_cover_each_architectures_requester_space() {
-        assert_eq!(deny_all_table_pages(IommuKind::IntelVtd), 64);
+        assert_eq!(deny_all_table_pages(IommuKind::IntelVtd), INTEL_TABLE_PAGES);
         assert_eq!(deny_all_table_pages(IommuKind::AmdVi), 512);
         assert_eq!(AMD_DEVICE_TABLE_SIZE, 0x1ff);
         assert_eq!(
             IommuResources::required_pages(IommuKind::IntelVtd),
-            (64, 0, 0, 0)
+            (INTEL_TABLE_PAGES, 0, 0, 0)
         );
         assert_eq!(
             IommuResources::required_pages(IommuKind::AmdVi),
-            (512, 64, 2, 1)
+            (512, DOMAIN_TABLE_PAGES, 2, 1)
         );
     }
 

@@ -1,0 +1,184 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: add the display tile backend
+
+Let the System Domain render into one granted page and submit bounded pixel
+tiles to the DRM fbdev selected by Linux. Device discovery remains entirely
+inside mDriver; the System Domain never needs a PCI address or GPU model.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -10,2 +10,3 @@
+ #include <linux/errno.h>
++#include <linux/fb.h>
+ #include <linux/fs.h>
+@@ -95,2 +96,6 @@
+ #define MBOOT_CONTROL_CREATE_PARTITION 16
+ #define MBOOT_CONTROL_DELETE_PARTITION 17
++#define MBOOT_CONTROL_OPEN_DISPLAY 18
++#define MBOOT_CONTROL_DISPLAY_INFO 19
++#define MBOOT_CONTROL_PRESENT_DISPLAY 20
++#define MBOOT_CONTROL_CLOSE_DISPLAY 21
+@@ -107,1 +112,1 @@
+-#define MBOOT_CONTROL_CAPABILITIES GENMASK_ULL(6, 0)
++#define MBOOT_CONTROL_CAPABILITIES GENMASK_ULL(7, 0)
+@@ -128,2 +133,6 @@
+ #define MBOOT_DEVICE_FEATURE_BLOCK_ASYNC_QUEUE BIT_ULL(11)
++#define MBOOT_DEVICE_FEATURE_DISPLAY_TILE BIT_ULL(12)
+ #define MBOOT_DEVICE_FEATURES_BASE GENMASK_ULL(2, 0)
++#define MBOOT_DISPLAY_BUFFER_PAGE 7
++#define MBOOT_DISPLAY_MAX_TRANSFER PAGE_SIZE
++#define MBOOT_DISPLAY_PIXEL_BYTES 4
+@@ -883,1 +892,7 @@
+ static bool mboot_block_queue_verified;
++extern struct fb_info *registered_fb[FB_MAX];
++extern int num_registered_fb;
++static void *mboot_display_buffer;
++static unsigned long mboot_display_grant_ref;
++static u32 mboot_display_device_id;
++static struct fb_info *mboot_display_info;
+@@ -921,1 +934,3 @@
++	if (mboot_control_device_kind(info) == MBOOT_DEVICE_KIND_DISPLAY)
++		features |= MBOOT_DEVICE_FEATURE_DISPLAY_TILE;
+ 	return features;
+@@ -922,3 +939,85 @@
+ }
++
++static void mboot_display_close(void)
++{
++	if (mboot_display_buffer) {
++		memunmap(mboot_display_buffer);
++		mboot_display_buffer = NULL;
++	}
++	if (mboot_display_grant_ref) {
++		mboot_hypercall(MBOOT_HYPERCALL_GRANT_UNMAP,
++				mboot_display_grant_ref, 0, 0);
++		mboot_display_grant_ref = 0;
++	}
++	mboot_display_device_id = 0;
++	mboot_display_info = NULL;
++}
++
++static int mboot_display_open(u32 device_id, unsigned long grant_ref)
++{
++	const struct mboot_pci_frontend *device;
++	unsigned long result;
++	u64 address;
++
++	if (!device_id || device_id > mboot_pci_device_count || !grant_ref ||
++	    mboot_display_buffer || mboot_display_grant_ref)
++		return -EINVAL;
++	device = &mboot_pci_devices[device_id - 1];
++	if (mboot_control_device_kind(&device->info) != MBOOT_DEVICE_KIND_DISPLAY)
++		return -ENODEV;
++	if (!num_registered_fb || !registered_fb[0] ||
++	    registered_fb[0]->var.bits_per_pixel != 32 ||
++	    !registered_fb[0]->fbops || !registered_fb[0]->fbops->fb_imageblit)
++		return -EAGAIN;
++	address = mboot_grant_window_start + MBOOT_DISPLAY_BUFFER_PAGE * PAGE_SIZE;
++	result = mboot_hypercall(MBOOT_HYPERCALL_GRANT_MAP, grant_ref, address, 0);
++	if (result)
++		return -EINVAL;
++	mboot_display_grant_ref = grant_ref;
++	mboot_display_buffer = memremap(address, PAGE_SIZE, MEMREMAP_WB);
++	if (!mboot_display_buffer) {
++		mboot_display_close();
++		return -EIO;
++	}
++	mboot_display_device_id = device_id;
++	mboot_display_info = registered_fb[0];
++	return 0;
++}
++
++static int mboot_display_present(const struct mboot_control_request *request)
++{
++	struct fb_info *info = mboot_display_info;
++	struct fb_image image = { };
++	u64 pixels;
++	u64 bytes;
++
++	if (!info || !mboot_display_buffer ||
++	    request->device_id != mboot_display_device_id ||
++	    !request->arguments[2] || !request->arguments[3] ||
++	    request->arguments[0] > U32_MAX || request->arguments[1] > U32_MAX ||
++	    request->arguments[2] > U32_MAX || request->arguments[3] > U32_MAX ||
++	    check_mul_overflow(request->arguments[2], request->arguments[3], &pixels) ||
++	    check_mul_overflow(pixels, (u64)MBOOT_DISPLAY_PIXEL_BYTES, &bytes) ||
++	    bytes > MBOOT_DISPLAY_MAX_TRANSFER ||
++	    request->arguments[0] + request->arguments[2] > info->var.xres ||
++	    request->arguments[1] + request->arguments[3] > info->var.yres)
++		return -EINVAL;
++	image.dx = request->arguments[0];
++	image.dy = request->arguments[1];
++	image.width = request->arguments[2];
++	image.height = request->arguments[3];
++	image.depth = info->var.bits_per_pixel;
++	image.data = mboot_display_buffer;
++	lock_fb_info(info);
++	if (info->state != FBINFO_STATE_RUNNING || !info->fbops->fb_imageblit) {
++		unlock_fb_info(info);
++		return -EIO;
++	}
++	info->fbops->fb_imageblit(info, &image);
++	if (info->fbops->fb_sync)
++		info->fbops->fb_sync(info);
++	unlock_fb_info(info);
++	return 0;
++}
+ 
+ static bool mboot_device_descends_from(struct device *device,
+@@ -2249,3 +2347,47 @@
+ 		response->status = MBOOT_CONTROL_STATUS_OK;
+ 		return;
++	case MBOOT_CONTROL_OPEN_DISPLAY:
++		if (!mboot_control_active || !request->device_id ||
++		    !request->arguments[0] || request->arguments[0] > U32_MAX ||
++		    request->arguments[1] || request->arguments[2] ||
++		    request->arguments[3])
++			return;
++		if (mboot_display_open(request->device_id, request->arguments[0])) {
++			response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
++			return;
++		}
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = MBOOT_DISPLAY_MAX_TRANSFER;
++		response->values[1] = MBOOT_DISPLAY_PIXEL_BYTES;
++		return;
++	case MBOOT_CONTROL_DISPLAY_INFO:
++		if (!mboot_control_active ||
++		    request->device_id != mboot_display_device_id ||
++		    !mboot_control_zero_arguments(request->arguments) ||
++		    !mboot_display_info)
++			return;
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = mboot_display_info->var.xres;
++		response->values[1] = mboot_display_info->var.yres;
++		response->values[2] = mboot_display_info->fix.line_length;
++		response->values[3] = mboot_display_info->var.bits_per_pixel |
++			(u64)mboot_display_info->var.red.offset << 8 |
++			(u64)mboot_display_info->var.green.offset << 16 |
++			(u64)mboot_display_info->var.blue.offset << 24 |
++			(u64)mboot_display_info->var.transp.offset << 32;
++		return;
++	case MBOOT_CONTROL_PRESENT_DISPLAY:
++		if (!mboot_control_active)
++			return;
++		response->status = mboot_display_present(request) ?
++			MBOOT_CONTROL_STATUS_IO_ERROR : MBOOT_CONTROL_STATUS_OK;
++		return;
++	case MBOOT_CONTROL_CLOSE_DISPLAY:
++		if (!mboot_control_active ||
++		    request->device_id != mboot_display_device_id ||
++		    !mboot_control_zero_arguments(request->arguments))
++			return;
++		mboot_display_close();
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		return;
+ 	default:
+@@ -2493,3 +2635,4 @@
+ 	mboot_block_queue_close();
+ 	mboot_block_close();
++	mboot_display_close();
+ 	pr_err("mDriver: device control worker stopped\n");

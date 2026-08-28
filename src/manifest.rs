@@ -447,7 +447,9 @@ impl<'a> LaunchManifest<'a> {
                 && (device.segment != 0
                     || !matches!(
                         device.kind,
-                        ManifestDeviceKind::Nvme | ManifestDeviceKind::Vmd
+                        ManifestDeviceKind::Display
+                            | ManifestDeviceKind::Nvme
+                            | ManifestDeviceKind::Vmd
                     )))
             || (block_device
                 && usize::from(device.is_ephemeral())
@@ -689,6 +691,24 @@ mod tests {
         assert_eq!(device.kind, ManifestDeviceKind::Nvme);
         assert!(device.is_read_only());
         assert!(!device.is_ephemeral());
+    }
+
+    #[test]
+    fn parses_an_automatic_display_policy() {
+        let mut bytes = manifest_with_device();
+        let device = MANIFEST_HEADER_SIZE + 2 * DOMAIN_ENTRY_SIZE;
+        bytes[device + 2..device + 4].copy_from_slice(&AUTO_REQUESTER.to_le_bytes());
+        bytes[device + 4..device + 6]
+            .copy_from_slice(&(ManifestDeviceKind::Display as u16).to_le_bytes());
+        bytes[device + 6..device + 8]
+            .copy_from_slice(&DEVICE_FLAG_REQUIRED.to_le_bytes());
+
+        let digest = Sha256::digest(&bytes).into();
+        let manifest = LaunchManifest::parse(&bytes, digest).unwrap();
+        let device = manifest.device(0).unwrap();
+        assert_eq!(device.requester, AUTO_REQUESTER);
+        assert_eq!(device.kind, ManifestDeviceKind::Display);
+        assert!(device.is_required());
     }
 
     #[test]

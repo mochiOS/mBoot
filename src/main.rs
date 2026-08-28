@@ -47,6 +47,10 @@ const MAX_MEMORY_REGIONS: usize = 256;
 const MAX_GUEST_MEMORY_PAGES: usize = 65_536;
 const GRANT_WINDOW_PAGES: usize = 16;
 const DEVICE_WINDOW_PAGES: usize = 64;
+const DEVICE_WINDOW_START: u64 = 0x1000_0000;
+const DEVICE_WINDOW_LIMIT: u64 = 0x80_0000_0000;
+const SPARSE_LEVEL2_PAGES: usize = 512;
+const SPARSE_LEVEL1_PAGES: usize = 256;
 const DOMAIN_BOOT_INFO_GPA: u64 = 0x3000;
 const MAX_CONSOLE_WRITE: u64 = 4096;
 const LAUNCH_MANIFEST_PATH: &str = "\\EFI\\MBOOT\\LAUNCH.MF";
@@ -685,8 +689,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             domain.nested_pages().guest_memory_size(),
             grant_window_start(domain.nested_pages()),
             GRANT_WINDOW_PAGES as u64 * 4096,
-            device_window_start(domain.nested_pages()),
-            DEVICE_WINDOW_PAGES as u64 * 4096,
+            DEVICE_WINDOW_START,
+            DEVICE_WINDOW_LIMIT - DEVICE_WINDOW_START,
             0,
             domain.capabilities(),
         );
@@ -1885,8 +1889,8 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
         runtime.domain.nested_pages().guest_memory_size(),
         grant_window_start(runtime.domain.nested_pages()),
         GRANT_WINDOW_PAGES as u64 * 4096,
-        device_window_start(runtime.domain.nested_pages()),
-        DEVICE_WINDOW_PAGES as u64 * 4096,
+        DEVICE_WINDOW_START,
+        DEVICE_WINDOW_LIMIT - DEVICE_WINDOW_START,
         runtime.restart_count,
         runtime.domain.capabilities(),
     );
@@ -2059,12 +2063,12 @@ fn claim_pci_device(
         log!("PCI requester {:04x} exposed an unsafe MMIO BAR", requester);
         return false;
     }
-    let window_start = device_window_start(runtime_domains[index].domain.nested_pages());
+    let window_start = DEVICE_WINDOW_START;
     let bars = match assignments.insert(
         domain_id,
         descriptor,
         window_start,
-        DEVICE_WINDOW_PAGES as u64 * 4096,
+        DEVICE_WINDOW_LIMIT - DEVICE_WINDOW_START,
     ) {
         Ok(bars) => {
             let mut copied = [pci::PciBar::default(); pci::MAX_DEVICE_BARS];
@@ -2082,22 +2086,19 @@ fn claim_pci_device(
     };
     let nested_root = runtime_domains[index].domain.nested_pages().hardware_root();
     for bar in bars.iter().filter(|bar| bar.length != 0) {
-        let mut offset = 0;
-        while offset < bar.length {
-            if unsafe {
-                runtime_domains[index]
-                    .domain
-                    .nested_pages()
-                    .map_device_page(bar.guest_address + offset, bar.physical_address + offset)
-            }
-            .is_err()
-            {
+        if unsafe {
+            runtime_domains[index].domain.nested_pages().map_device_range(
+                bar.guest_address,
+                bar.physical_address,
+                bar.length,
+            )
+        }
+        .is_err()
+        {
                 if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
                     halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
                 }
                 return false;
-            }
-            offset += 4096;
         }
     }
     if unsafe {
@@ -2118,6 +2119,16 @@ fn claim_pci_device(
         }
         return false;
     };
+    if devices.is_firmware_deferred(requester) {
+        display::handoff();
+        if unsafe { remapper.take_over_deferred_display(0, requester) }.is_err() {
+            if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
+                halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
+            }
+            return false;
+        }
+        log!("firmware display {:04x} handed off to the Hardware Domain", requester);
+    }
     let guest_base = runtime_domains[index].domain.nested_pages().guest_base();
     let guest_size = runtime_domains[index]
         .domain
@@ -2203,19 +2214,15 @@ fn restore_pci_mapping(
 ) -> bool {
     let nested_root = runtime_domains[index].domain.nested_pages().hardware_root();
     for bar in bars.iter().filter(|bar| bar.length != 0) {
-        let mut offset = 0;
-        while offset < bar.length {
-            if unsafe {
-                runtime_domains[index]
-                    .domain
-                    .nested_pages()
-                    .restore_owned_page(bar.guest_address + offset)
-            }
-            .is_err()
-            {
-                return false;
-            }
-            offset += 4096;
+        if unsafe {
+            runtime_domains[index]
+                .domain
+                .nested_pages()
+                .unmap_device_range(bar.guest_address, bar.length)
+        }
+        .is_err()
+        {
+            return false;
         }
     }
     unsafe {
@@ -2382,7 +2389,14 @@ fn allocate_nested_pages(
     Ok(NestedPageResources {
         root: allocate_page(boot_services)?,
         level3: allocate_page(boot_services)?,
-        level2: allocate_page(boot_services)?,
+        level2: boot_services
+            .allocate_pages(
+                AllocateType::AnyPages,
+                MemoryType::LOADER_DATA,
+                SPARSE_LEVEL2_PAGES,
+            )
+            .map_err(|error| error.status())?,
+        level2_pages: SPARSE_LEVEL2_PAGES,
         level1: boot_services
             .allocate_pages(
                 AllocateType::AnyPages,
@@ -2391,6 +2405,15 @@ fn allocate_nested_pages(
             )
             .map_err(|error| error.status())?,
         level1_pages,
+        device_level1: boot_services
+            .allocate_pages(
+                AllocateType::AnyPages,
+                MemoryType::LOADER_DATA,
+                SPARSE_LEVEL1_PAGES,
+            )
+            .map_err(|error| error.status())?,
+        device_level1_pages: SPARSE_LEVEL1_PAGES,
+        device_state: allocate_page(boot_services)?,
         guest_base: boot_services
             .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, guest_pages)
             .map_err(|error| error.status())?,

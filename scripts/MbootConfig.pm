@@ -138,8 +138,8 @@ sub read_mboot_config {
         $device->{kind} =~ /^(?:other|display|block|network|usb|audio|nvme|vmd)$/
             or die "$path: invalid device kind\n";
         if ($device->{requester} eq 'auto') {
-            $device->{segment} == 0 && $device->{kind} =~ /^(?:nvme|vmd)$/
-                or die "$path: automatic selection is limited to a segment 0 NVMe or VMD controller\n";
+            $device->{segment} == 0 && $device->{kind} =~ /^(?:display|nvme|vmd)$/
+                or die "$path: automatic selection is limited to a segment 0 display, NVMe, or VMD controller\n";
         }
         if ($device->{kind} =~ /^(?:block|nvme|vmd)$/) {
             $device->{ephemeral} + $device->{read_only} + $device->{partitioned} == 1

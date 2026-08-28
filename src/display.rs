@@ -41,6 +41,16 @@ pub fn starting() {
     show(0x0017_2033, b"MBOOT", b"STARTING");
 }
 
+/// Ends mBoot framebuffer output before the firmware display controller is
+/// transferred to mDriver. Serial logging remains available after handoff.
+pub fn handoff() {
+    ADDRESS.store(0, Ordering::Release);
+    WIDTH.store(0, Ordering::Relaxed);
+    HEIGHT.store(0, Ordering::Relaxed);
+    STRIDE.store(0, Ordering::Relaxed);
+    ORDER.store(0, Ordering::Relaxed);
+}
+
 pub fn backend(intel: bool) {
     show(
         0x0017_2033,

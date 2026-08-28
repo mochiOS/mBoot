@@ -160,7 +160,7 @@ impl AssignmentTable {
             || window_start & 0xfff != 0
             || window_size == 0
             || window_size & 0xfff != 0
-            || window_size / 4096 > 64
+            || window_start.checked_add(window_size).is_none()
             || self.assignments.iter().any(|assignment| {
                 assignment.valid && assignment.descriptor.requester == descriptor.requester
             })
@@ -172,36 +172,22 @@ impl AssignmentTable {
             .iter()
             .position(|assignment| !assignment.valid)
             .ok_or(PciError::DeviceWindowExhausted)?;
-        let page_count =
-            usize::try_from(window_size / 4096).map_err(|_| PciError::DeviceWindowExhausted)?;
-        let mut occupied = 0_u64;
-        for assignment in self
-            .assignments
-            .iter()
-            .filter(|assignment| assignment.valid && assignment.domain_id == domain_id)
-        {
-            for bar in &assignment.descriptor.bars[..assignment.descriptor.bar_count] {
-                let first = bar
-                    .guest_address
-                    .checked_sub(window_start)
-                    .ok_or(PciError::InvalidState)?
-                    / 4096;
-                let pages = bar.length / 4096;
-                occupied |= page_mask(first as usize, pages as usize)?;
-            }
-        }
+        let window_end = window_start
+            .checked_add(window_size)
+            .ok_or(PciError::DeviceWindowExhausted)?;
         for bar in &mut descriptor.bars[..descriptor.bar_count] {
-            let pages =
-                usize::try_from(bar.length / 4096).map_err(|_| PciError::DeviceWindowExhausted)?;
-            if pages > page_count {
+            let end = bar
+                .physical_address
+                .checked_add(bar.length)
+                .ok_or(PciError::DeviceWindowExhausted)?;
+            if bar.physical_address < window_start || end > window_end {
                 return Err(PciError::DeviceWindowExhausted);
             }
-            let first = (0..=page_count.saturating_sub(pages))
-                .find(|first| page_mask(*first, pages).is_ok_and(|mask| occupied & mask == 0))
-                .ok_or(PciError::DeviceWindowExhausted)?;
-            let mask = page_mask(first, pages)?;
-            occupied |= mask;
-            bar.guest_address = window_start + first as u64 * 4096;
+            // The guest sees the firmware-assigned BAR address, but nested page
+            // tables still expose only this exact range. Keeping the address
+            // avoids truncating 32-bit BARs and naturally preserves the
+            // alignment required by large GPU apertures.
+            bar.guest_address = bar.physical_address;
         }
         self.assignments[slot] = Assignment {
             valid: true,
@@ -370,18 +356,6 @@ impl AssignmentTable {
                 && assignment.descriptor.requester == requester
         })
     }
-}
-
-fn page_mask(first: usize, pages: usize) -> Result<u64, PciError> {
-    if pages == 0 || first.checked_add(pages).is_none_or(|end| end > 64) {
-        return Err(PciError::DeviceWindowExhausted);
-    }
-    let low = if pages == 64 {
-        u64::MAX
-    } else {
-        (1_u64 << pages) - 1
-    };
-    Ok(low << first)
 }
 
 fn physical_vector(slot: usize, index: usize) -> u8 {
@@ -1191,35 +1165,35 @@ mod tests {
     }
 
     #[test]
-    fn device_windows_are_isolated_per_domain_and_reused_after_remove() {
+    fn device_windows_preserve_firmware_bar_addresses() {
         let mut assignments = AssignmentTable::new();
         let first = assignments
-            .insert(2, descriptor(0x10, &[0x2000]), 0x1b_0000, 0x4_0000)
+            .insert(2, descriptor(0x10, &[0x2000]), 0x1000_0000, 0x8_0000_0000)
             .unwrap()[0];
-        assert_eq!(first.guest_address, 0x1b_0000);
+        assert_eq!(first.guest_address, 0x8000_0000);
         let second = assignments
-            .insert(2, descriptor(0x18, &[0x1000]), 0x1b_0000, 0x4_0000)
+            .insert(2, descriptor(0x18, &[0x1000]), 0x1000_0000, 0x8_0000_0000)
             .unwrap()[0];
-        assert_eq!(second.guest_address, 0x1b_2000);
+        assert_eq!(second.guest_address, 0x8000_0000);
         let other_domain = assignments
-            .insert(4, descriptor(0x20, &[0x1000]), 0x1b_0000, 0x4_0000)
+            .insert(4, descriptor(0x20, &[0x1000]), 0x1000_0000, 0x8_0000_0000)
             .unwrap()[0];
-        assert_eq!(other_domain.guest_address, 0x1b_0000);
+        assert_eq!(other_domain.guest_address, 0x8000_0000);
         assignments.remove(2, 0x10).unwrap();
         let reused = assignments
-            .insert(2, descriptor(0x28, &[0x2000]), 0x1b_0000, 0x4_0000)
+            .insert(2, descriptor(0x28, &[0x2000]), 0x1000_0000, 0x8_0000_0000)
             .unwrap()[0];
-        assert_eq!(reused.guest_address, 0x1b_0000);
+        assert_eq!(reused.guest_address, 0x8000_0000);
     }
 
     #[test]
-    fn resource_query_hides_physical_bar_addresses() {
+    fn resource_query_exposes_only_the_assigned_bar_range() {
         let mut assignments = AssignmentTable::new();
         assignments
-            .insert(2, descriptor(0x10, &[0x4000]), 0x1b_0000, 0x4_0000)
+            .insert(2, descriptor(0x10, &[0x4000]), 0x1000_0000, 0x8_0000_0000)
             .unwrap();
         let resource = assignments.resource(2, 0x10, 0).unwrap();
-        assert_eq!(resource.guest_address, 0x1b_0000);
+        assert_eq!(resource.guest_address, 0x8000_0000);
         assert_eq!(resource.length, 0x4000);
         assert_eq!(assignments.resource(3, 0x10, 0), None);
     }
@@ -1237,7 +1211,7 @@ mod tests {
     fn pending_vectors_route_only_to_active_assignments() {
         let mut assignments = AssignmentTable::new();
         assignments
-            .insert(2, descriptor(0x10, &[0x1000]), 0x1b_0000, 0x4_0000)
+            .insert(2, descriptor(0x10, &[0x1000]), 0x1000_0000, 0x8_0000_0000)
             .unwrap();
         assert!(!assignments.has_active_for_domain(2));
         assignments.assignments[0].active = true;
@@ -1256,7 +1230,7 @@ mod tests {
     fn shared_interrupt_routes_only_the_registered_guest_vector() {
         let mut assignments = AssignmentTable::new();
         assignments
-            .insert(2, descriptor(0x10, &[0x1000]), 0x1b_0000, 0x4_0000)
+            .insert(2, descriptor(0x10, &[0x1000]), 0x1000_0000, 0x8_0000_0000)
             .unwrap();
         assignments.assignments[0].active = true;
         assignments.assignments[0].guest_vectors = [0x42, 0];

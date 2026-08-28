@@ -13,6 +13,16 @@ OVMF_VARS="$ROOT/firmware/OVMF_VARS_4M.fd"
 DOMAIN_COUNT=$($ROOT/scripts/config-value.pl "$CONFIG" domain_count)
 SYSTEM_IMAGE=$($ROOT/scripts/config-value.pl "$CONFIG" system_image)
 HARDWARE_BOOTSTRAP_ID=$($ROOT/scripts/config-value.pl "$CONFIG" hardware_bootstrap_id)
+GPU_TEST=${HV_GPU_TEST:-0}
+
+QEMU_GPU_ARGS=()
+if [[ $GPU_TEST == 1 ]]; then
+    QEMU_GPU_ARGS+=(
+        -device intel-iommu,intremap=on
+        -vga none
+        -device virtio-vga
+    )
+fi
 
 test -s "$IMAGE" || { echo "missing image: $IMAGE" >&2; exit 1; }
 for file in "$OVMF_CODE" "$OVMF_VARS"; do
@@ -47,6 +57,7 @@ cp --sparse=always "$IMAGE" "$WORK/mochiOS.iso"
     -monitor none \
     -serial "file:$WORK/serial.log" \
     -net none \
+    "${QEMU_GPU_ARGS[@]}" \
     -no-reboot \
     -no-shutdown &
 QEMU_PID=$!
@@ -74,6 +85,13 @@ if [[ $HARDWARE_BOOTSTRAP_ID != 0 ]]; then
     grep -Fq "[mBoot] Hardware Domain $HARDWARE_BOOTSTRAP_ID ready" "$WORK/serial.log" || {
         sed -n '1,200p' "$WORK/serial.log" >&2
         echo 'Hardware Domain did not query devices and become ready' >&2
+        exit 1
+    }
+fi
+if [[ $GPU_TEST == 1 ]]; then
+    grep -Eq '\[mBoot\].*(display|Display).*(Hardware Domain|Domain 2|handed off)|mboot-pci.*display' "$WORK/serial.log" || {
+        sed -n '1,240p' "$WORK/serial.log" >&2
+        echo 'mDriver did not claim an automatically discovered display controller' >&2
         exit 1
     }
 fi

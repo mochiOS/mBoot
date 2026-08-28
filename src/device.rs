@@ -81,6 +81,25 @@ impl DeviceTable {
             if policy.segment != 0 {
                 return Err(DeviceError::InvalidPolicy);
             }
+            if policy.requester == AUTO_REQUESTER
+                && policy.kind == ManifestDeviceKind::Display
+            {
+                let mut matched = 0;
+                for record in &mut table.devices[..table.count] {
+                    if !kind_matches(record.info, ManifestDeviceKind::Display) {
+                        continue;
+                    }
+                    if record.allowed_domain != 0 {
+                        return Err(DeviceError::InvalidPolicy);
+                    }
+                    record.allowed_domain = policy.domain_id;
+                    matched += 1;
+                }
+                if matched == 0 && policy.is_required() {
+                    return Err(DeviceError::DeviceUnavailable);
+                }
+                continue;
+            }
             let record = if policy.requester == AUTO_REQUESTER {
                 let mut candidate = None;
                 let mut first_candidate = None;
@@ -136,7 +155,12 @@ impl DeviceTable {
     pub fn query(&self, domain_id: u32, index: usize) -> Option<PciDeviceInfo> {
         let record = self.devices.get(index).filter(|_| index < self.count)?;
         let mut info = record.info;
-        if record.allowed_domain == domain_id && info.state == PCI_DEVICE_STATE_QUARANTINED {
+        if record.allowed_domain == domain_id
+            && matches!(
+                info.state,
+                PCI_DEVICE_STATE_QUARANTINED | PCI_DEVICE_STATE_FIRMWARE_DEFERRED
+            )
+        {
             info.flags |= PCI_DEVICE_FLAG_CLAIMABLE;
         }
         Some(info).filter(PciDeviceInfo::validate)
@@ -197,10 +221,20 @@ impl DeviceTable {
         if record.allowed_domain != domain_id {
             return Err(DeviceError::PermissionDenied);
         }
-        if record.info.state != PCI_DEVICE_STATE_QUARANTINED || record.info.owner_domain != 0 {
+        if !matches!(
+            record.info.state,
+            PCI_DEVICE_STATE_QUARANTINED | PCI_DEVICE_STATE_FIRMWARE_DEFERRED
+        ) || record.info.owner_domain != 0
+        {
             return Err(DeviceError::InvalidState);
         }
         Ok(())
+    }
+
+    pub fn is_firmware_deferred(&self, requester: u16) -> bool {
+        self.record(requester).is_ok_and(|record| {
+            record.info.state == PCI_DEVICE_STATE_FIRMWARE_DEFERRED
+        })
     }
 
     pub fn can_release(&self, domain_id: u32, requester: u16) -> Result<(), DeviceError> {
@@ -323,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn firmware_display_cannot_be_claimed() {
+    fn firmware_display_is_claimable_only_by_its_policy_domain() {
         let functions = [PciFunction {
             requester: 0x0010,
             class: 0x03,
@@ -336,7 +370,12 @@ mod tests {
             &[policy(0x0010, ManifestDeviceKind::Display)],
         )
         .unwrap();
-        assert_eq!(table.claim(2, 0x0010), Err(DeviceError::InvalidState));
+        assert_ne!(
+            table.query(2, 0).unwrap().flags & PCI_DEVICE_FLAG_CLAIMABLE,
+            0
+        );
+        assert_eq!(table.claim(3, 0x0010), Err(DeviceError::PermissionDenied));
+        table.claim(2, 0x0010).unwrap();
     }
 
     #[test]
@@ -432,6 +471,45 @@ mod tests {
             DeviceTable::from_pci(&functions, None, &[nvme]).err(),
             Some(DeviceError::AmbiguousDevice(functions[0], functions[1]))
         );
+    }
+
+    #[test]
+    fn automatic_display_policy_assigns_every_gpu_to_the_hardware_domain() {
+        let functions = [
+            PciFunction {
+                requester: 0x0010,
+                class: 0x03,
+                subclass: 0,
+                ..PciFunction::default()
+            },
+            PciFunction {
+                requester: 0x0100,
+                class: 0x03,
+                subclass: 2,
+                ..PciFunction::default()
+            },
+            PciFunction {
+                requester: 0x001f,
+                class: 0x04,
+                subclass: 3,
+                ..PciFunction::default()
+            },
+        ];
+        let table = DeviceTable::from_pci(
+            &functions,
+            None,
+            &[policy(AUTO_REQUESTER, ManifestDeviceKind::Display)],
+        )
+        .unwrap();
+        assert_ne!(
+            table.query(2, 0).unwrap().flags & PCI_DEVICE_FLAG_CLAIMABLE,
+            0
+        );
+        assert_ne!(
+            table.query(2, 1).unwrap().flags & PCI_DEVICE_FLAG_CLAIMABLE,
+            0
+        );
+        assert_eq!(table.query(2, 2).unwrap().flags, 0);
     }
 
     #[test]

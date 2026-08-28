@@ -1,4 +1,4 @@
-use core::ptr::write_bytes;
+use core::ptr::{read_volatile, write_bytes, write_volatile};
 
 use crate::{BackendKind, Error};
 
@@ -14,14 +14,20 @@ const NPT_PRESENT_USER_NO_EXECUTE: u64 = 0b101 | (1 << 63);
 const NPT_DEVICE_READ_WRITE: u64 = NPT_PRESENT_WRITE_USER | (1 << 3) | (1 << 4) | (1 << 63);
 const GUEST_PAGE_TABLE_FLAGS: u64 = 0b111;
 const GUEST_LARGE_PAGE_FLAGS: u64 = GUEST_PAGE_TABLE_FLAGS | (1 << 7);
+const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
+const NESTED_LARGE_PAGE: u64 = 1 << 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NestedPageResources {
     pub root: u64,
     pub level3: u64,
     pub level2: u64,
+    pub level2_pages: usize,
     pub level1: u64,
     pub level1_pages: usize,
+    pub device_level1: u64,
+    pub device_level1_pages: usize,
+    pub device_state: u64,
     pub guest_base: u64,
     pub guest_pages: usize,
 }
@@ -33,6 +39,8 @@ impl NestedPageResources {
             self.level3,
             self.level2,
             self.level1,
+            self.device_level1,
+            self.device_state,
             self.guest_base,
         ] {
             if page == 0 || page & (PAGE_SIZE - 1) != 0 {
@@ -42,7 +50,10 @@ impl NestedPageResources {
         let required_level1_pages = self.guest_pages.div_ceil(ENTRY_COUNT);
         if self.guest_pages == 0
             || required_level1_pages > ENTRY_COUNT
+            || self.level2_pages == 0
+            || self.level2_pages > ENTRY_COUNT
             || self.level1_pages != required_level1_pages
+            || self.device_level1_pages == 0
         {
             return Err(Error::InvalidPage);
         }
@@ -56,6 +67,11 @@ pub struct NestedPageTable {
     root: u64,
     level1: u64,
     level1_pages: usize,
+    level2: u64,
+    level2_pages: usize,
+    device_level1: u64,
+    device_level1_pages: usize,
+    device_state: u64,
     guest_base: u64,
     guest_pages: usize,
 }
@@ -72,9 +88,22 @@ impl NestedPageTable {
         resources: NestedPageResources,
     ) -> Result<Self, Error> {
         resources.validate()?;
-        for page in [resources.root, resources.level3, resources.level2] {
+        for page in [resources.root, resources.level3] {
             // SAFETY: The function contract gives mBoot exclusive writable ownership.
             unsafe { write_bytes(page as *mut u8, 0, PAGE_SIZE as usize) };
+        }
+        unsafe {
+            write_bytes(
+                resources.level2 as *mut u8,
+                0,
+                resources.level2_pages * PAGE_SIZE as usize,
+            );
+            write_bytes(
+                resources.device_level1 as *mut u8,
+                0,
+                resources.device_level1_pages * PAGE_SIZE as usize,
+            );
+            write_bytes(resources.device_state as *mut u8, 0, PAGE_SIZE as usize);
         }
         // SAFETY: The complete contiguous leaf-table allocation is exclusively owned.
         unsafe {
@@ -124,6 +153,11 @@ impl NestedPageTable {
             root: resources.root,
             level1: resources.level1,
             level1_pages: resources.level1_pages,
+            level2: resources.level2,
+            level2_pages: resources.level2_pages,
+            device_level1: resources.device_level1,
+            device_level1_pages: resources.device_level1_pages,
+            device_state: resources.device_state,
             guest_base: resources.guest_base,
             guest_pages: resources.guest_pages,
         })
@@ -218,6 +252,172 @@ impl NestedPageTable {
         Ok(())
     }
 
+    /// Maps a PCI BAR into sparse guest-physical MMIO space. Aligned portions
+    /// use 2 MiB nested leaves so a large GPU aperture does not consume one
+    /// page-table entry per 4 KiB page.
+    ///
+    /// # Safety
+    /// The complete host range must be validated device MMIO. The vCPU must be
+    /// stopped until the nested translation cache has been invalidated.
+    pub unsafe fn map_device_range(
+        &self,
+        guest_start: u64,
+        host_start: u64,
+        len: u64,
+    ) -> Result<(), Error> {
+        let end = guest_start.checked_add(len).ok_or(Error::InvalidPage)?;
+        if guest_start < self.guest_memory_size()
+            || guest_start & (PAGE_SIZE - 1) != 0
+            || host_start == 0
+            || host_start & (PAGE_SIZE - 1) != 0
+            || len == 0
+            || len & (PAGE_SIZE - 1) != 0
+            || end > self.level2_pages as u64 * 1024 * 1024 * 1024
+        {
+            return Err(Error::InvalidPage);
+        }
+        let mut offset = 0;
+        while offset < len {
+            let guest = guest_start + offset;
+            let host = host_start + offset;
+            let result = if guest & (LARGE_PAGE_SIZE - 1) == 0
+                && host & (LARGE_PAGE_SIZE - 1) == 0
+                && len - offset >= LARGE_PAGE_SIZE
+            {
+                unsafe { self.map_device_large_page(guest, host) }
+            } else {
+                unsafe { self.map_sparse_device_page(guest, host) }
+            };
+            if let Err(error) = result {
+                if offset != 0 {
+                    // Keep the operation transactional. Callers may safely
+                    // retry the assignment or release the other BARs without
+                    // leaving a partially exposed device aperture behind.
+                    unsafe { self.unmap_device_range(guest_start, offset)? };
+                }
+                return Err(error);
+            }
+            offset += if guest & (LARGE_PAGE_SIZE - 1) == 0
+                && host & (LARGE_PAGE_SIZE - 1) == 0
+                && len - offset >= LARGE_PAGE_SIZE
+            {
+                LARGE_PAGE_SIZE
+            } else {
+                PAGE_SIZE
+            };
+        }
+        Ok(())
+    }
+
+    /// Removes a sparse PCI BAR mapping. Page-table pages stay reserved for the
+    /// Domain and may be reused only after a Domain restart.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped until the nested translation cache is flushed.
+    pub unsafe fn unmap_device_range(&self, guest_start: u64, len: u64) -> Result<(), Error> {
+        if guest_start < self.guest_memory_size()
+            || guest_start & (PAGE_SIZE - 1) != 0
+            || len == 0
+            || len & (PAGE_SIZE - 1) != 0
+        {
+            return Err(Error::InvalidPage);
+        }
+        let mut offset = 0;
+        while offset < len {
+            let guest = guest_start + offset;
+            let level2_entry = self.sparse_level2_entry(guest)?;
+            let value = unsafe { read_volatile(level2_entry) };
+            if value & NESTED_LARGE_PAGE != 0 {
+                unsafe { write_volatile(level2_entry, 0) };
+                offset += LARGE_PAGE_SIZE;
+                continue;
+            }
+            let level1 = value & 0x000f_ffff_ffff_f000;
+            if level1 == 0 {
+                return Err(Error::InvalidPage);
+            }
+            let entry = unsafe { (level1 as *mut u64).add(((guest >> 12) & 0x1ff) as usize) };
+            if unsafe { read_volatile(entry) } == 0 {
+                return Err(Error::InvalidPage);
+            }
+            unsafe { write_volatile(entry, 0) };
+            offset += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    unsafe fn map_device_large_page(&self, guest: u64, host: u64) -> Result<(), Error> {
+        let entry = self.sparse_level2_entry(guest)?;
+        if unsafe { read_volatile(entry) } != 0 {
+            return Err(Error::InvalidPage);
+        }
+        let flags = match self.backend {
+            BackendKind::IntelVmx => EPT_DEVICE_READ_WRITE | NESTED_LARGE_PAGE,
+            BackendKind::AmdSvm => NPT_DEVICE_READ_WRITE | NESTED_LARGE_PAGE,
+        };
+        unsafe { write_volatile(entry, host | flags) };
+        Ok(())
+    }
+
+    unsafe fn map_sparse_device_page(&self, guest: u64, host: u64) -> Result<(), Error> {
+        let level2_entry = self.sparse_level2_entry(guest)?;
+        let mut level1 = unsafe { read_volatile(level2_entry) } & 0x000f_ffff_ffff_f000;
+        if level1 == 0 {
+            let state = self.device_state as *mut usize;
+            let index = unsafe { read_volatile(state) };
+            if index >= self.device_level1_pages {
+                return Err(Error::InvalidPage);
+            }
+            level1 = self.device_level1 + index as u64 * PAGE_SIZE;
+            unsafe { write_volatile(state, index + 1) };
+            let link_flags = match self.backend {
+                BackendKind::IntelVmx => EPT_READ_WRITE_EXECUTE,
+                BackendKind::AmdSvm => NPT_PRESENT_WRITE_USER,
+            };
+            unsafe { write_volatile(level2_entry, level1 | link_flags) };
+        } else if unsafe { read_volatile(level2_entry) } & NESTED_LARGE_PAGE != 0 {
+            return Err(Error::InvalidPage);
+        }
+        let entry = unsafe { (level1 as *mut u64).add(((guest >> 12) & 0x1ff) as usize) };
+        if unsafe { read_volatile(entry) } != 0 {
+            return Err(Error::InvalidPage);
+        }
+        let flags = match self.backend {
+            BackendKind::IntelVmx => EPT_DEVICE_READ_WRITE,
+            BackendKind::AmdSvm => NPT_DEVICE_READ_WRITE,
+        };
+        unsafe { write_volatile(entry, host | flags) };
+        Ok(())
+    }
+
+    fn sparse_level2_entry(&self, guest: u64) -> Result<*mut u64, Error> {
+        let level3_index = usize::try_from(guest >> 30).map_err(|_| Error::InvalidPage)?;
+        if level3_index >= self.level2_pages {
+            return Err(Error::InvalidPage);
+        }
+        let level3_entry = unsafe { (self.level3_table() as *mut u64).add(level3_index) };
+        let expected = self.level2 + level3_index as u64 * PAGE_SIZE;
+        let current = unsafe { read_volatile(level3_entry) } & 0x000f_ffff_ffff_f000;
+        if current == 0 {
+            let link_flags = match self.backend {
+                BackendKind::IntelVmx => EPT_READ_WRITE_EXECUTE,
+                BackendKind::AmdSvm => NPT_PRESENT_WRITE_USER,
+            };
+            unsafe { write_volatile(level3_entry, expected | link_flags) };
+        } else if current != expected {
+            return Err(Error::InvalidPage);
+        }
+        Ok(unsafe {
+            (expected as *mut u64).add(((guest >> 21) & 0x1ff) as usize)
+        })
+    }
+
+    fn level3_table(&self) -> u64 {
+        // The root's first entry is installed by initialize and points here.
+        // Keeping the address avoids reading architecture-specific flag bits.
+        (unsafe { read_volatile(self.root as *const u64) }) & 0x000f_ffff_ffff_f000
+    }
+
     fn page_entry(&self, guest_page: u64) -> Result<(u64, usize), Error> {
         self.owned_page_host_address(guest_page)
             .ok_or(Error::InvalidPage)?;
@@ -293,6 +493,11 @@ impl NestedPageTable {
             root,
             level1: root,
             level1_pages: guest_pages.div_ceil(ENTRY_COUNT),
+            level2: root,
+            level2_pages: 1,
+            device_level1: root,
+            device_level1_pages: 1,
+            device_state: root,
             guest_base,
             guest_pages,
         }
@@ -321,8 +526,18 @@ mod tests {
         let mut level3 = Page([0; ENTRY_COUNT]);
         let mut level2 = Page([0; ENTRY_COUNT]);
         let mut level1 = Page([0; ENTRY_COUNT]);
+        let mut device_level1 = Page([0; ENTRY_COUNT]);
+        let mut device_state = Page([0; ENTRY_COUNT]);
         let mut guest = Page([u64::MAX; ENTRY_COUNT]);
-        let resources = resources(&mut root, &mut level3, &mut level2, &mut level1, &mut guest);
+        let resources = resources(
+            &mut root,
+            &mut level3,
+            &mut level2,
+            &mut level1,
+            &mut device_level1,
+            &mut device_state,
+            &mut guest,
+        );
 
         // SAFETY: Test pages are aligned, live, writable, and uniquely borrowed.
         let table =
@@ -361,8 +576,18 @@ mod tests {
         let mut level3 = Page([0; ENTRY_COUNT]);
         let mut level2 = Page([0; ENTRY_COUNT]);
         let mut level1 = Page([0; ENTRY_COUNT]);
+        let mut device_level1 = Page([0; ENTRY_COUNT]);
+        let mut device_state = Page([0; ENTRY_COUNT]);
         let mut guest = Page([0; ENTRY_COUNT]);
-        let resources = resources(&mut root, &mut level3, &mut level2, &mut level1, &mut guest);
+        let resources = resources(
+            &mut root,
+            &mut level3,
+            &mut level2,
+            &mut level1,
+            &mut device_level1,
+            &mut device_state,
+            &mut guest,
+        );
 
         // SAFETY: Test pages are aligned, live, writable, and uniquely borrowed.
         let table = unsafe { NestedPageTable::initialize(BackendKind::AmdSvm, resources) }.unwrap();
@@ -402,19 +627,59 @@ mod tests {
         assert_eq!(leaves.0[ENTRY_COUNT], 0x40_0000 | EPT_DEVICE_READ_WRITE);
     }
 
+    #[test]
+    fn sparse_gpu_ranges_use_large_and_small_device_leaves() {
+        let mut root = Page([0; ENTRY_COUNT]);
+        let mut level3 = Page([0; ENTRY_COUNT]);
+        let mut level2 = Page([0; ENTRY_COUNT]);
+        let mut level1 = Page([0; ENTRY_COUNT]);
+        let mut device_level1 = Page([0; ENTRY_COUNT]);
+        let mut device_state = Page([0; ENTRY_COUNT]);
+        let mut guest = Page([0; ENTRY_COUNT]);
+        let resources = resources(
+            &mut root,
+            &mut level3,
+            &mut level2,
+            &mut level1,
+            &mut device_level1,
+            &mut device_state,
+            &mut guest,
+        );
+        let table = unsafe { NestedPageTable::initialize(BackendKind::IntelVmx, resources) }
+            .unwrap();
+
+        unsafe { table.map_device_range(0x20_0000, 0x40_0000, 0x20_1000) }.unwrap();
+        assert_eq!(
+            level2.0[1],
+            0x40_0000 | EPT_DEVICE_READ_WRITE | NESTED_LARGE_PAGE
+        );
+        assert_ne!(level2.0[2] & 0x000f_ffff_ffff_f000, 0);
+        assert_eq!(device_level1.0[0], 0x60_0000 | EPT_DEVICE_READ_WRITE);
+
+        unsafe { table.unmap_device_range(0x20_0000, 0x20_1000) }.unwrap();
+        assert_eq!(level2.0[1], 0);
+        assert_eq!(device_level1.0[0], 0);
+    }
+
     fn resources(
         root: &mut Page,
         level3: &mut Page,
         level2: &mut Page,
         level1: &mut Page,
+        device_level1: &mut Page,
+        device_state: &mut Page,
         guest: &mut Page,
     ) -> NestedPageResources {
         NestedPageResources {
             root: root.0.as_mut_ptr() as u64,
             level3: level3.0.as_mut_ptr() as u64,
             level2: level2.0.as_mut_ptr() as u64,
+            level2_pages: 1,
             level1: level1.0.as_mut_ptr() as u64,
             level1_pages: 1,
+            device_level1: device_level1.0.as_mut_ptr() as u64,
+            device_level1_pages: 1,
+            device_state: device_state.0.as_mut_ptr() as u64,
             guest_base: guest.0.as_mut_ptr() as u64,
             guest_pages: 1,
         }

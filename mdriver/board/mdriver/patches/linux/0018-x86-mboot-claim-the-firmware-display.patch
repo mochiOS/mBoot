@@ -1,0 +1,28 @@
+From 2c8e853874162eacdcf29a9ad0aca2df29c227d7 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 00:00:00 +0900
+Subject: [PATCH] x86/mboot: claim the firmware display
+
+mBoot keeps the boot display in firmware-deferred state until mDriver asks for
+it. Accept the claimable flag in that state so the normal device discovery pass
+can perform the controlled handoff.
+---
+ arch/x86/kernel/cpu/mboot.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 37456e93f8b0..9c41ad69e3b5 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -457,7 +457,8 @@ static bool __init mboot_pci_info_valid(const struct mboot_pci_device_info *info
+ 	case MBOOT_PCI_STATE_QUARANTINED:
+ 		return !info->owner_domain;
+ 	case MBOOT_PCI_STATE_FIRMWARE_DEFERRED:
+-		return !info->owner_domain && !info->flags;
++		return !info->owner_domain &&
++		       !(info->flags & ~MBOOT_PCI_FLAG_CLAIMABLE);
+ 	case MBOOT_PCI_STATE_CLAIMED_DISABLED:
+ 	case MBOOT_PCI_STATE_ACTIVE:
+ 		return info->owner_domain &&
+-- 
+2.51.0
