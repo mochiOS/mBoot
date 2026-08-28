@@ -51,6 +51,19 @@ pub fn handoff() {
     ORDER.store(0, Ordering::Relaxed);
 }
 
+pub fn gpu_handoff(requester: u16) {
+    show(0x0017_2033, b"MBOOT", b"GPU HANDOFF");
+    draw_hex(u64::from(requester), line_y(2));
+}
+
+pub fn domain_crash(domain_id: u32, raw_reason: u64) {
+    show(0x006B_2028, b"DOMAIN", b"CRASH");
+    let mut detail = *b"00 0000";
+    write_hex_u8(&mut detail[0..2], domain_id as u8);
+    write_hex_u16(&mut detail[3..7], raw_reason as u16);
+    draw_centered(&detail, line_y(2));
+}
+
 pub fn backend(intel: bool) {
     show(
         0x0017_2033,

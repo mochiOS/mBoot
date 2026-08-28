@@ -523,12 +523,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
     let deferred_display = quarantine.display_requester.filter(|requester| {
         !quarantine.active_requesters().contains(requester)
-            && iommu_topology.is_some_and(|topology| {
-                topology
-                    .units()
-                    .iter()
-                    .any(|unit| unit.covers_requester(*requester))
-            })
+        && iommu_topology.is_some_and(|topology| {
+            topology.covers_requester(0, *requester)
+        })
     });
     if let Some(requester) = deferred_display {
         log!(
@@ -1734,6 +1731,7 @@ fn isolate_crashed_domain(
         next_restart_count,
         DOMAIN_CRASH_STATUS_CRASHED,
     ));
+    display::domain_crash(domain_id.get(), raw_reason);
     cleanup_domain_resources(
         index,
         runtime_domains,
@@ -2120,6 +2118,7 @@ fn claim_pci_device(
         return false;
     };
     if devices.is_firmware_deferred(requester) {
+        display::gpu_handoff(requester);
         display::handoff();
         if unsafe { remapper.take_over_deferred_display(0, requester) }.is_err() {
             if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {

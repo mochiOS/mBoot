@@ -132,6 +132,31 @@ impl IommuTopology {
         &self.reserved_mappings[..self.reserved_mapping_count]
     }
 
+    /// Returns whether one remapping unit is authoritative for a requester.
+    /// Explicit VT-d scopes take precedence over an include-all unit.
+    fn unit_handles_requester(&self, index: usize, segment: u16, requester: u16) -> bool {
+        let unit = self.units[index];
+        if unit.segment != segment {
+            return false;
+        }
+        if self.kind == IommuKind::AmdVi {
+            return true;
+        }
+        let has_explicit = self.units().iter().any(|candidate| {
+            candidate.segment == segment && candidate.covers_requester(requester)
+        });
+        if has_explicit {
+            unit.covers_requester(requester)
+        } else {
+            unit.include_all
+        }
+    }
+
+    pub fn covers_requester(&self, segment: u16, requester: u16) -> bool {
+        (0..self.unit_count)
+            .any(|index| self.unit_handles_requester(index, segment, requester))
+    }
+
     fn push(&mut self, unit: IommuUnit) -> Result<(), Error> {
         if self.units[..self.unit_count]
             .iter()
@@ -279,7 +304,9 @@ impl DmaRemapper {
         {
             validate_resources(topology.kind, resource)?;
             let deferred = topology.kind == IommuKind::IntelVtd
-                && deferred_requester.is_some_and(|requester| unit.covers_requester(requester));
+                && deferred_requester.is_some_and(|requester| {
+                    topology.unit_handles_requester(index, 0, requester)
+                });
             if deferred {
                 remapper.units[index].resources = resource;
                 continue;
@@ -414,7 +441,10 @@ impl DmaRemapper {
         let mut changed = false;
         for index in 0..self.topology.unit_count {
             let unit = self.topology.units[index];
-            if unit.segment != segment || !unit.covers_requester(requester) {
+            if !self
+                .topology
+                .unit_handles_requester(index, segment, requester)
+            {
                 continue;
             }
             matched = true;
@@ -491,22 +521,11 @@ impl DmaRemapper {
     }
 
     fn unit_handles(&self, index: usize, segment: u16, requester: u16) -> bool {
-        let unit = self.topology.units[index];
-        if !self.units[index].enabled || unit.segment != segment {
+        if !self.units[index].enabled {
             return false;
         }
-        if self.topology.kind == IommuKind::AmdVi {
-            return true;
-        }
-        let has_explicit =
-            self.topology.units().iter().any(|candidate| {
-                candidate.segment == segment && candidate.covers_requester(requester)
-            });
-        if has_explicit {
-            unit.covers_requester(requester)
-        } else {
-            unit.include_all
-        }
+        self.topology
+            .unit_handles_requester(index, segment, requester)
     }
 }
 
@@ -549,9 +568,15 @@ pub unsafe fn enable_deny_all(
     if table_addresses.len() != topology.unit_count {
         return Err(Error::InvalidResources);
     }
-    for (unit, table_address) in topology.units().iter().zip(table_addresses) {
+    for (index, (unit, table_address)) in topology
+        .units()
+        .iter()
+        .zip(table_addresses)
+        .enumerate()
+    {
         if topology.kind == IommuKind::IntelVtd
-            && deferred_requester.is_some_and(|requester| unit.covers_requester(requester))
+            && deferred_requester
+                .is_some_and(|requester| topology.unit_handles_requester(index, 0, requester))
         {
             continue;
         }
@@ -1491,6 +1516,8 @@ mod tests {
         assert_eq!(topology.kind(), IommuKind::IntelVtd);
         assert_eq!(topology.units()[0].segment, 2);
         assert!(topology.units()[0].include_all);
+        assert!(topology.covers_requester(2, 0x00f8));
+        assert!(!topology.covers_requester(0, 0x00f8));
     }
 
     #[test]
@@ -1508,6 +1535,35 @@ mod tests {
         let topology = parse_dmar(&table).unwrap();
         assert!(topology.units()[0].covers_requester(0x0010));
         assert!(!topology.units()[0].covers_requester(0x0018));
+    }
+
+    #[test]
+    fn explicit_intel_scope_precedes_the_include_all_unit() {
+        let mut topology = IommuTopology::new(IommuKind::IntelVtd);
+        topology
+            .push(IommuUnit {
+                segment: 0,
+                register_base: 0xfed9_0000,
+                include_all: true,
+                scope_requesters: [0; MAX_UNIT_SCOPES],
+                scope_count: 0,
+            })
+            .unwrap();
+        let mut scoped = [0; MAX_UNIT_SCOPES];
+        scoped[0] = 0x0010;
+        topology
+            .push(IommuUnit {
+                segment: 0,
+                register_base: 0xfed9_1000,
+                include_all: false,
+                scope_requesters: scoped,
+                scope_count: 1,
+            })
+            .unwrap();
+        assert!(!topology.unit_handles_requester(0, 0, 0x0010));
+        assert!(topology.unit_handles_requester(1, 0, 0x0010));
+        assert!(topology.unit_handles_requester(0, 0, 0x0018));
+        assert!(topology.covers_requester(0, 0x0018));
     }
 
     #[test]
