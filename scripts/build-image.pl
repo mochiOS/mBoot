@@ -11,7 +11,7 @@ use FindBin;
 use lib $FindBin::Bin;
 use MbootConfig qw(read_mboot_config);
 
-my ($config_file, $mnu_dir, $output_file, $pxe_output);
+my ($config_file, $mnu_dir, $output_file, $pxe_output, $uefi_net_output);
 while (@ARGV) {
     my $argument = shift @ARGV;
     if ($argument eq '--config') {
@@ -26,20 +26,26 @@ while (@ARGV) {
     elsif ($argument eq '--pxe-output') {
         $pxe_output = shift @ARGV;
     }
+    elsif ($argument eq '--uefi-net-output') {
+        $uefi_net_output = shift @ARGV;
+    }
     else {
         die "unknown argument: $argument\n";
     }
 }
 defined $config_file && defined $mnu_dir && defined $output_file
-    or die "usage: $0 --config FILE --mnu-dir DIR --output FILE [--pxe-output DIR]\n";
+    or die "usage: $0 --config FILE --mnu-dir DIR --output FILE [--pxe-output DIR] [--uefi-net-output DIR]\n";
 
 $config_file = absolute_existing($config_file);
 $mnu_dir = absolute_existing($mnu_dir);
 my $mboot_dir = abs_path("$FindBin::Bin/..");
 $output_file = absolute_output($output_file);
 $pxe_output = absolute_output($pxe_output) if defined $pxe_output;
+$uefi_net_output = absolute_output($uefi_net_output) if defined $uefi_net_output;
 defined $pxe_output && $pxe_output eq '/'
     and die "PXE output directory must not be the filesystem root\n";
+defined $uefi_net_output && $uefi_net_output eq '/'
+    and die "UEFI network output directory must not be the filesystem root\n";
 my $config = read_mboot_config($config_file);
 my $cargo = $ENV{MBOOT_HOST_CARGO} // 'cargo';
 for my $command ($cargo, qw(truncate mkfs.vfat mmd mcopy sgdisk dd)) {
@@ -53,8 +59,14 @@ if (defined $pxe_output
         || path_contains($pxe_output, $output_dir))) {
     die "PXE output directory must not contain the disk image or mBoot build directory\n";
 }
+if (defined $uefi_net_output
+    && (path_contains($uefi_net_output, $output_file)
+        || path_contains($uefi_net_output, $output_dir))) {
+    die "UEFI network output directory must not contain the disk image or mBoot build directory\n";
+}
 my $work = "$output_dir/image-work";
 my $target = "$output_dir/target";
+my $network_target = "$output_dir/target-network";
 my $esp = "$work/esp.img";
 my $manifest = "$output_dir/launch.manifest";
 make_path($work, dirname($output_file));
@@ -63,6 +75,12 @@ if (defined $pxe_output) {
     $pxe_stage = "$pxe_output.new.$$";
     remove_tree($pxe_stage) if -e $pxe_stage;
     make_path($pxe_stage);
+}
+my $uefi_net_stage;
+if (defined $uefi_net_output) {
+    $uefi_net_stage = "$uefi_net_output.new.$$";
+    remove_tree($uefi_net_stage) if -e $uefi_net_stage;
+    make_path($uefi_net_stage);
 }
 
 my $toolchain = "+$config->{toolchain}";
@@ -145,6 +163,26 @@ run(
     '--output', $manifest,
 );
 
+my $launch_manifest_path = '\\EFI\\MBOOT\\LAUNCH.MF';
+my @network_files = ({ path => $launch_manifest_path, source => $manifest });
+my %network_paths = ($launch_manifest_path => 1);
+for my $domain (@{$config->{domains}}) {
+    if (!$network_paths{$domain->{path}}++) {
+        push @network_files, {
+            path => $domain->{path},
+            source => $domain_images{$domain->{image}}->{path},
+        };
+    }
+    if ($domain->{format} eq 'linux-pvh' && !$network_paths{$domain->{initramfs_path}}++) {
+        push @network_files, {
+            path => $domain->{initramfs_path},
+            source => $initramfs_images{$domain->{initramfs}},
+        };
+    }
+}
+my $network_bundle = "$output_dir/mboot.bundle";
+write_network_bundle($network_bundle, \@network_files);
+
 run_env(
     {
         MBOOT_LAUNCH_MANIFEST => $manifest,
@@ -158,6 +196,28 @@ run_env(
 );
 my $efi = "$target/x86_64-unknown-uefi/release/mboot.efi";
 -s $efi or die "mBoot UEFI binary was not produced: $efi\n";
+
+if (defined $uefi_net_stage) {
+    run_env(
+        {
+            MBOOT_LAUNCH_MANIFEST => $manifest,
+            RUSTFLAGS => '-C panic=abort',
+        },
+        $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc,compiler_builtins',
+        '--release', '--target', 'x86_64-unknown-uefi', '--target-dir', $network_target,
+        '--package', 'mboot', '--features', 'uefi-app,uefi-net',
+        '--manifest-path', "$mboot_dir/Cargo.toml",
+        '--config', qq{patch."https://github.com/mochiOS/mnu".mnu-abi.path="$mnu_abi"},
+    );
+    my $network_efi = "$network_target/x86_64-unknown-uefi/release/mboot.efi";
+    -s $network_efi or die "mBoot UEFI network binary was not produced: $network_efi\n";
+    copy($network_efi, "$uefi_net_stage/BOOTX64.EFI")
+        or die "cannot publish UEFI network binary: $!\n";
+    copy($network_bundle, "$uefi_net_stage/mboot.bundle")
+        or die "cannot publish UEFI network bundle: $!\n";
+    chmod 0644, "$uefi_net_stage/BOOTX64.EFI", "$uefi_net_stage/mboot.bundle"
+        or die "cannot chmod UEFI network output: $!\n";
+}
 
 unlink $esp if -e $esp;
 run('truncate', '-s', "$config->{esp_size_mib}M", $esp);
@@ -207,6 +267,43 @@ if (defined $pxe_stage) {
     remove_tree($pxe_output) if -e $pxe_output;
     move($pxe_stage, $pxe_output) or die "cannot publish PXE directory $pxe_output: $!\n";
     print "[done] PXE directory: $pxe_output\n";
+}
+if (defined $uefi_net_stage) {
+    remove_tree($uefi_net_output) if -e $uefi_net_output;
+    move($uefi_net_stage, $uefi_net_output)
+        or die "cannot publish UEFI network directory $uefi_net_output: $!\n";
+    print "[done] UEFI network directory: $uefi_net_output\n";
+}
+
+sub write_network_bundle {
+    my ($destination, $files) = @_;
+    @{$files} <= 32 or die "too many files in UEFI network bundle\n";
+    my $temporary = "$destination.new";
+    unlink $temporary if -e $temporary;
+    open my $output, '>', $temporary or die "cannot create $temporary: $!\n";
+    binmode $output;
+    print {$output} 'MBOOTNET', pack('v v v v V', 1, 32, scalar @{$files}, 0, 0), "\0" x 12;
+    for my $file (@{$files}) {
+        my $path = $file->{path};
+        length($path) > 0 && length($path) <= 255
+            or die "invalid UEFI network bundle path: $path\n";
+        open my $input, '<', $file->{source}
+            or die "cannot open $file->{source}: $!\n";
+        binmode $input;
+        local $/;
+        my $bytes = <$input>;
+        close $input or die "cannot close $file->{source}: $!\n";
+        defined $bytes or die "cannot read $file->{source}\n";
+        print {$output} pack('v v Q< V', length($path), 0, length($bytes), 0), $path, $bytes;
+    }
+    my $size = tell($output);
+    defined $size && $size <= 256 * 1024 * 1024 && $size <= 0xffff_ffff
+        or die "UEFI network bundle is too large\n";
+    seek($output, 16, 0) or die "cannot seek in $temporary: $!\n";
+    print {$output} pack('V', $size);
+    close $output or die "cannot close $temporary: $!\n";
+    move($temporary, $destination) or die "cannot publish $destination: $!\n";
+    chmod 0644, $destination or die "cannot chmod $destination: $!\n";
 }
 
 sub publish_ipxe_boot {

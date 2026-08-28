@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod arch;
+pub mod bundle;
 pub mod cpuid;
 pub mod device;
 pub mod domain;
@@ -31,6 +32,7 @@ pub enum Error {
     InvalidImage,
     ImageTooLarge,
     InvalidManifest,
+    InvalidBundle,
     ManifestDigestMismatch,
     ImageDigestMismatch,
     UnsupportedDomainConfig,

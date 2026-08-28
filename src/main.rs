@@ -13,6 +13,7 @@ use core::arch::asm;
 use core::mem::size_of;
 use core::ptr::{copy_nonoverlapping, write_bytes};
 use mboot::arch::x86_64::{cpu, descriptor, timer};
+use mboot::bundle::NetworkBundle;
 use mboot::device::{DeviceError, DeviceTable};
 use mboot::domain::{Domain, DomainId, DomainRole, DomainState};
 use mboot::event::EventChannelTable;
@@ -39,8 +40,18 @@ use mnu_abi::hypervisor::{
 };
 use uefi::fs::Error as FsError;
 use uefi::prelude::*;
+#[cfg(feature = "uefi-net")]
+use uefi::proto::loaded_image::LoadedImage;
+#[cfg(feature = "uefi-net")]
+use uefi::proto::network::pxe::{BaseCode, DhcpV4Packet, Mode};
+#[cfg(feature = "uefi-net")]
+use uefi::proto::network::IpAddress;
+#[cfg(feature = "uefi-net")]
+use uefi::table::boot::ScopedProtocol;
 use uefi::table::boot::{AllocateType, MemoryType};
 use uefi::table::cfg::ACPI2_GUID;
+#[cfg(feature = "uefi-net")]
+use uefi::CStr8;
 use uefi::CString16;
 
 const MAX_MEMORY_REGIONS: usize = 256;
@@ -54,6 +65,10 @@ const SPARSE_LEVEL1_PAGES: usize = 256;
 const DOMAIN_BOOT_INFO_GPA: u64 = 0x3000;
 const MAX_CONSOLE_WRITE: u64 = 4096;
 const LAUNCH_MANIFEST_PATH: &str = "\\EFI\\MBOOT\\LAUNCH.MF";
+#[cfg(feature = "uefi-net")]
+const NETWORK_BUNDLE_NAME: &[u8] = b"mboot.bundle";
+#[cfg(feature = "uefi-net")]
+const MAX_NETWORK_BUNDLE_SIZE: usize = 256 * 1024 * 1024;
 
 include!(concat!(env!("OUT_DIR"), "/launch_manifest_digest.rs"));
 
@@ -276,7 +291,27 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         },
         None => Vec::new(),
     };
-    let manifest_bytes = match load_file(boot_services, image_handle, LAUNCH_MANIFEST_PATH) {
+    #[cfg(feature = "uefi-net")]
+    let network_bundle = match load_network_bundle(boot_services, image_handle) {
+        Ok(bytes) => {
+            log!("downloaded network bundle: {} bytes", bytes.len());
+            Some(bytes)
+        }
+        Err(status) => {
+            log!("failed to download network bundle: {:?}", status);
+            display::failure(60);
+            return status;
+        }
+    };
+    #[cfg(not(feature = "uefi-net"))]
+    let network_bundle: Option<Vec<u8>> = None;
+
+    let manifest_bytes = match load_file(
+        boot_services,
+        image_handle,
+        network_bundle.as_deref(),
+        LAUNCH_MANIFEST_PATH,
+    ) {
         Ok(bytes) => bytes,
         Err(status) => {
             log!("failed to load Launch Manifest: {:?}", status);
@@ -341,7 +376,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             display::failure(6);
             return Status::UNSUPPORTED;
         }
-        let image = match load_file(boot_services, image_handle, config.image_path) {
+        let image = match load_file(
+            boot_services,
+            image_handle,
+            network_bundle.as_deref(),
+            config.image_path,
+        ) {
             Ok(image) => image,
             Err(status) => {
                 log!(
@@ -365,19 +405,20 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         }
         let initramfs = match config.initramfs_path {
             Some(path) => {
-                let image = match load_file(boot_services, image_handle, path) {
-                    Ok(image) => image,
-                    Err(status) => {
-                        log!(
-                            "failed to load Domain {} initramfs {}: {:?}",
-                            config.id,
-                            path,
-                            status
-                        );
-                        display::failure(7);
-                        return status;
-                    }
-                };
+                let image =
+                    match load_file(boot_services, image_handle, network_bundle.as_deref(), path) {
+                        Ok(image) => image,
+                        Err(status) => {
+                            log!(
+                                "failed to load Domain {} initramfs {}: {:?}",
+                                config.id,
+                                path,
+                                status
+                            );
+                            display::failure(7);
+                            return status;
+                        }
+                    };
                 if let Err(error) = config.verify_initramfs(&image) {
                     log!(
                         "Domain {} initramfs verification failed: {:?}",
@@ -2420,7 +2461,18 @@ fn allocate_nested_pages(
     })
 }
 
-fn load_file(boot_services: &BootServices, image: Handle, path: &str) -> Result<Vec<u8>, Status> {
+fn load_file(
+    boot_services: &BootServices,
+    image: Handle,
+    network_bundle: Option<&[u8]>,
+    path: &str,
+) -> Result<Vec<u8>, Status> {
+    if let Some(bytes) = network_bundle {
+        return NetworkBundle::parse(bytes)
+            .and_then(|bundle| bundle.file(path))
+            .map(Vec::from)
+            .map_err(|_| Status::LOAD_ERROR);
+    }
     let filesystem = boot_services
         .get_image_file_system(image)
         .map_err(|error| error.status())?;
@@ -2430,6 +2482,128 @@ fn load_file(boot_services: &BootServices, image: Handle, path: &str) -> Result<
         FsError::Io(io) => io.uefi_error.status(),
         FsError::Path(_) | FsError::Utf8Encoding(_) => Status::LOAD_ERROR,
     })
+}
+
+#[cfg(feature = "uefi-net")]
+fn load_network_bundle(
+    boot_services: &BootServices,
+    image_handle: Handle,
+) -> Result<Vec<u8>, Status> {
+    let device = {
+        let loaded_image = boot_services
+            .open_protocol_exclusive::<LoadedImage>(image_handle)
+            .map_err(|error| error.status())?;
+        loaded_image.device().ok_or(Status::UNSUPPORTED)?
+    };
+    let mut pxe = open_boot_pxe(boot_services, device)?;
+    if !pxe.mode().started {
+        pxe.start(false).map_err(|error| error.status())?;
+    }
+    if !pxe.mode().dhcp_ack_received {
+        pxe.dhcp(true).map_err(|error| error.status())?;
+    }
+    if pxe.mode().using_ipv6 {
+        return Err(Status::UNSUPPORTED);
+    }
+
+    let (server, boot_file) = pxe_boot_source(pxe.mode()).ok_or(Status::NOT_FOUND)?;
+    let filename_bytes = sibling_tftp_path(boot_file, NETWORK_BUNDLE_NAME)?;
+    let filename =
+        CStr8::from_bytes_with_nul(&filename_bytes).map_err(|_| Status::INVALID_PARAMETER)?;
+    let size = pxe
+        .tftp_get_file_size(&server, filename)
+        .map_err(|error| error.status())?;
+    let size = usize::try_from(size).map_err(|_| Status::BAD_BUFFER_SIZE)?;
+    if !(32..=MAX_NETWORK_BUNDLE_SIZE).contains(&size) {
+        return Err(Status::BAD_BUFFER_SIZE);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| Status::OUT_OF_RESOURCES)?;
+    bytes.resize(size, 0);
+    let received = pxe
+        .tftp_read_file(&server, filename, Some(&mut bytes))
+        .map_err(|error| error.status())?;
+    let received = usize::try_from(received).map_err(|_| Status::BAD_BUFFER_SIZE)?;
+    if received > bytes.len() {
+        return Err(Status::BAD_BUFFER_SIZE);
+    }
+    bytes.truncate(received);
+    NetworkBundle::parse(&bytes).map_err(|_| Status::COMPROMISED_DATA)?;
+    Ok(bytes)
+}
+
+#[cfg(feature = "uefi-net")]
+fn open_boot_pxe<'a>(
+    boot_services: &'a BootServices,
+    boot_device: Handle,
+) -> Result<ScopedProtocol<'a, BaseCode>, Status> {
+    if let Ok(protocol) = boot_services.open_protocol_exclusive::<BaseCode>(boot_device) {
+        return Ok(protocol);
+    }
+
+    let handles = boot_services
+        .find_handles::<BaseCode>()
+        .map_err(|error| error.status())?;
+    let mut fallback = None;
+    for handle in handles {
+        let Ok(protocol) = boot_services.open_protocol_exclusive::<BaseCode>(handle) else {
+            continue;
+        };
+        if protocol.mode().started {
+            return Ok(protocol);
+        }
+        if fallback.is_none() {
+            fallback = Some(protocol);
+        }
+    }
+    fallback.ok_or(Status::NOT_FOUND)
+}
+
+#[cfg(feature = "uefi-net")]
+fn pxe_boot_source(mode: &Mode) -> Option<(IpAddress, &[u8])> {
+    let packets = [
+        (mode.pxe_reply_received, &mode.pxe_reply),
+        (mode.proxy_offer_received, &mode.proxy_offer),
+        (mode.dhcp_ack_received, &mode.dhcp_ack),
+    ];
+    for (valid, packet) in packets {
+        if !valid {
+            continue;
+        }
+        let packet: &DhcpV4Packet = packet.as_ref();
+        if packet.bootp_si_addr != [0; 4] {
+            return Some((
+                IpAddress::new_v4(packet.bootp_si_addr),
+                &packet.bootp_boot_file,
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(feature = "uefi-net")]
+fn sibling_tftp_path(boot_file: &[u8], sibling: &[u8]) -> Result<Vec<u8>, Status> {
+    let end = boot_file
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(boot_file.len());
+    let boot_file = &boot_file[..end];
+    if boot_file.iter().any(|byte| !byte.is_ascii() || *byte == 0) {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    let directory_end = boot_file
+        .iter()
+        .rposition(|byte| *byte == b'/' || *byte == b'\\')
+        .map_or(0, |index| index + 1);
+    let mut path = Vec::new();
+    path.try_reserve_exact(directory_end + sibling.len() + 1)
+        .map_err(|_| Status::OUT_OF_RESOURCES)?;
+    path.extend_from_slice(&boot_file[..directory_end]);
+    path.extend_from_slice(sibling);
+    path.push(0);
+    Ok(path)
 }
 
 fn halt_with_error(stage: &str, error: mboot::Error) -> ! {

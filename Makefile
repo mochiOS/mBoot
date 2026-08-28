@@ -3,6 +3,7 @@ CONFIG ?= $(CURDIR)/config/qemu.toml
 MNU_DIR ?= $(abspath $(CURDIR)/../mnu)
 IMAGE ?= $(OUTPUT_DIR)/mochiOS.img
 PXE_DIR ?= $(OUTPUT_DIR)/pxe
+UEFI_NET_DIR ?= $(OUTPUT_DIR)/uefi-net
 MDRIVER_KERNEL ?=
 MDRIVER_INITRAMFS ?=
 
@@ -42,7 +43,8 @@ image: $(SETUP_STAMP)
 		--config "$(CONFIG)" \
 		--mnu-dir "$(MNU_DIR)" \
 		--output "$(IMAGE)" \
-		--pxe-output "$(PXE_DIR)"
+		--pxe-output "$(PXE_DIR)" \
+		--uefi-net-output "$(UEFI_NET_DIR)"
 
 image-test: image
 	HV_CONFIG="$(CONFIG)" HV_DISK_IMAGE="$(IMAGE)" scripts/test-image.sh
