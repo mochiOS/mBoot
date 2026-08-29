@@ -968,6 +968,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         let vm_exit = match vm_exit {
             Ok(exit) => exit,
             Err(mboot::Error::UnexpectedVmExit(raw_reason)) => {
+                let instruction_pointer = unsafe {
+                    runtime_domains[index]
+                        .virtualization
+                        .guest_instruction_pointer()
+                }
+                .unwrap_or(0);
                 isolate_crashed_domain(
                     index,
                     &mut runtime_domains,
@@ -979,7 +985,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     &mut dma_remapper,
                     manifest,
                     raw_reason,
-                    0,
+                    instruction_pointer,
                     0,
                 );
                 continue;
@@ -1074,6 +1080,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             continue;
         }
         if vm_exit.reason != VmExitReason::Hypercall {
+            let instruction_pointer = unsafe {
+                runtime_domains[index]
+                    .virtualization
+                    .guest_instruction_pointer()
+            }
+            .unwrap_or(0);
             isolate_crashed_domain(
                 index,
                 &mut runtime_domains,
@@ -1085,7 +1097,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 &mut dma_remapper,
                 manifest,
                 vm_exit.raw_reason,
-                0,
+                instruction_pointer,
                 0,
             );
             continue;
@@ -1769,7 +1781,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 .then_some(runtime.crash_info)
                 .flatten()
         }) {
-            display::domain_crash(crash.domain_id, crash.raw_reason);
+            display::domain_crash(crash.domain_id, crash.raw_reason, crash.fault_address);
         } else {
             display::failure(53);
         }
@@ -1825,7 +1837,7 @@ fn isolate_crashed_domain(
         next_restart_count,
         DOMAIN_CRASH_STATUS_CRASHED,
     ));
-    display::domain_crash(domain_id.get(), raw_reason);
+    display::domain_crash(domain_id.get(), raw_reason, fault_address);
     cleanup_domain_resources(
         index,
         runtime_domains,
@@ -1836,7 +1848,7 @@ fn isolate_crashed_domain(
         dma_remapper,
     );
     log!(
-        "Domain {} crashed and was isolated: exit={:#x} gpa={:#x} info={:#x}",
+        "Domain {} crashed and was isolated: exit={:#x} address={:#x} info={:#x}",
         domain_id.get(),
         raw_reason,
         fault_address,

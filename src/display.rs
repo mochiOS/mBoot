@@ -56,12 +56,15 @@ pub fn gpu_handoff(requester: u16) {
     draw_hex(u64::from(requester), line_y(2));
 }
 
-pub fn domain_crash(domain_id: u32, raw_reason: u64) {
+pub fn domain_crash(domain_id: u32, raw_reason: u64, address: u64) {
     show(0x006B_2028, b"DOMAIN", b"CRASH");
     let mut detail = *b"00 0000";
     write_hex_u8(&mut detail[0..2], domain_id as u8);
     write_hex_u16(&mut detail[3..7], raw_reason as u16);
     draw_centered(&detail, line_y(2));
+    let mut location = *b"ADDR 00000000";
+    write_hex_u32(&mut location[5..13], address as u32);
+    draw_centered(&location, line_y(3));
 }
 
 pub fn backend(intel: bool) {
@@ -192,6 +195,17 @@ fn write_hex_u16(output: &mut [u8], value: u16) {
 fn write_hex_u8(output: &mut [u8], value: u8) {
     for (index, digit) in output.iter_mut().enumerate() {
         let nibble = (value >> ((1 - index) * 4)) & 0xf;
+        *digit = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'A' + nibble - 10
+        };
+    }
+}
+
+fn write_hex_u32(output: &mut [u8], value: u32) {
+    for (index, digit) in output.iter_mut().enumerate() {
+        let nibble = ((value >> ((7 - index) * 4)) & 0xf) as u8;
         *digit = if nibble < 10 {
             b'0' + nibble
         } else {

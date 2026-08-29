@@ -661,6 +661,19 @@ impl Vmx {
         }
     }
 
+    /// Reads the instruction pointer from a stopped guest.
+    ///
+    /// # Safety
+    /// The vCPU must have entered at least once, be stopped, and remain owned
+    /// by the current VMX-enabled CPU.
+    pub unsafe fn guest_instruction_pointer(&self) -> Result<u64, Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
+        Ok(unsafe { vmread(GUEST_RIP) })
+    }
+
     unsafe fn decode_exit(&self) -> Result<VmExit, Error> {
         // SAFETY: A VM exit returned through the configured host trampoline.
         let reason = unsafe { vmread(EXIT_REASON) } & 0xffff;

@@ -436,6 +436,18 @@ impl Svm {
         Ok(())
     }
 
+    /// Reads the instruction pointer from a stopped guest.
+    ///
+    /// # Safety
+    /// The vCPU must have entered at least once, be stopped, and remain owned
+    /// by the current SVM-enabled CPU.
+    pub unsafe fn guest_instruction_pointer(&self) -> Result<u64, Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        Ok(unsafe { read_u64(self.vmcb_phys, VMCB_RIP) })
+    }
+
     unsafe fn enter(&mut self) -> Result<VmExit, Error> {
         // SAFETY: The stopped guest owns its VMCB RAX field.
         unsafe { write_u64(self.vmcb_phys, VMCB_RAX, self.run_context.rax) };
