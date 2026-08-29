@@ -82,17 +82,32 @@ impl DeviceTable {
                 return Err(DeviceError::InvalidPolicy);
             }
             if policy.requester == AUTO_REQUESTER
-                && policy.kind == ManifestDeviceKind::Display
+                && matches!(
+                    policy.kind,
+                    ManifestDeviceKind::Display
+                        | ManifestDeviceKind::Nvme
+                        | ManifestDeviceKind::Vmd
+                        | ManifestDeviceKind::Usb
+                )
             {
                 let mut matched = 0;
                 for record in &mut table.devices[..table.count] {
-                    if !kind_matches(record.info, ManifestDeviceKind::Display) {
+                    if !kind_matches(record.info, policy.kind) {
                         continue;
                     }
                     if record.allowed_domain != 0 {
                         return Err(DeviceError::InvalidPolicy);
                     }
                     record.allowed_domain = policy.domain_id;
+                    if policy.is_ephemeral() {
+                        record.info.flags |= PCI_DEVICE_FLAG_EPHEMERAL;
+                    }
+                    if policy.is_read_only() {
+                        record.info.flags |= PCI_DEVICE_FLAG_READ_ONLY;
+                    }
+                    if policy.is_partitioned() {
+                        return Err(DeviceError::InvalidPolicy);
+                    }
                     matched += 1;
                 }
                 if matched == 0 && policy.is_required() {
@@ -448,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_nvme_policy_rejects_an_ambiguous_machine() {
+    fn automatic_nvme_policy_assigns_every_matching_controller() {
         let functions = [
             PciFunction {
                 requester: 0x0100,
@@ -467,10 +482,17 @@ mod tests {
         ];
         let mut nvme = policy(AUTO_REQUESTER, ManifestDeviceKind::Nvme);
         nvme.flags |= DEVICE_FLAG_READ_ONLY;
-        assert_eq!(
-            DeviceTable::from_pci(&functions, None, &[nvme]).err(),
-            Some(DeviceError::AmbiguousDevice(functions[0], functions[1]))
-        );
+        let table = DeviceTable::from_pci(&functions, None, &[nvme]).unwrap();
+        for index in 0..2 {
+            assert_ne!(
+                table.query(2, index).unwrap().flags & PCI_DEVICE_FLAG_CLAIMABLE,
+                0
+            );
+            assert_ne!(
+                table.query(2, index).unwrap().flags & PCI_DEVICE_FLAG_READ_ONLY,
+                0
+            );
+        }
     }
 
     #[test]

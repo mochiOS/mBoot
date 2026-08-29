@@ -1,0 +1,99 @@
+From 262f4246046733167c347714be382b62953c6777 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Sat, 29 Aug 2026 00:00:01 +0900
+Subject: [PATCH] x86/mboot: open installed mochiOS partitions
+
+Allow the System Domain to reopen an installed root filesystem by its GPT
+type and unique GUID. The ordinary block frontend remains confined to that
+partition's sector range.
+---
+ arch/x86/kernel/cpu/mboot.c | 59 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 59 insertions(+)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 216e621d1ed2..0c815a44e943 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -100,6 +100,7 @@
+ #define MBOOT_CONTROL_PRESENT_DISPLAY 20
+ #define MBOOT_CONTROL_CLOSE_DISPLAY 21
+ #define MBOOT_CONTROL_INSTALL_PARTITION 22
++#define MBOOT_CONTROL_OPEN_PARTITION 23
+ #define MBOOT_CONTROL_STATUS_OK 0
+ #define MBOOT_CONTROL_STATUS_UNSUPPORTED_VERSION 1
+ #define MBOOT_CONTROL_STATUS_INVALID_REQUEST 2
+@@ -2317,6 +2318,43 @@ static void mboot_control_install_partition(const struct mboot_control_request *r
+ 		response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
+ }
+ 
++static int mboot_block_open_mochios_partition(u32 device_id,
++					       unsigned long grant_ref,
++					       u64 guid_low, u64 guid_high)
++{
++	u32 ordinal;
++	int result;
++
++	if ((!guid_low && !guid_high) ||
++	    mboot_block_open_grant(device_id, grant_ref))
++		return -EINVAL;
++	for (ordinal = 0; ordinal < 128; ordinal++) {
++		u64 guids[4] = { 0 };
++		u64 range[4] = { 0 };
++
++		result = mboot_storage_inspect(mboot_block_file,
++					MBOOT_STORAGE_QUERY_PARTITION_GUIDS,
++					ordinal, guids);
++		if (result)
++			break;
++		if (guids[0] != get_unaligned_le64(mboot_mochios_partition_type) ||
++		    guids[1] != get_unaligned_le64(mboot_mochios_partition_type + 8) ||
++		    guids[2] != guid_low || guids[3] != guid_high)
++			continue;
++		result = mboot_storage_inspect(mboot_block_file,
++					MBOOT_STORAGE_QUERY_PARTITION_RANGE,
++					ordinal, range);
++		if (!result && range[1]) {
++			mboot_block_first_sector = range[0];
++			mboot_block_sector_count = range[1];
++			return 0;
++		}
++		break;
++	}
++	mboot_block_close();
++	return result ?: -ENOENT;
++}
++
+ static void mboot_control_handle(const struct mboot_control_request *request,
+ 				 struct mboot_control_response *response)
+ {
+@@ -2442,6 +2480,27 @@ static void mboot_control_handle(const struct mboot_control_request *request,
+ 		response->values[2] = MBOOT_BLOCK_MAX_TRANSFER;
+ 		response->values[3] = mboot_control_device_features(&device->info);
+ 		return;
++	case MBOOT_CONTROL_OPEN_PARTITION:
++		if (!mboot_control_active || !request->device_id ||
++		    !request->arguments[0] || request->arguments[0] > U32_MAX ||
++		    request->arguments[1] != MBOOT_BLOCK_MAX_TRANSFER ||
++		    (!request->arguments[2] && !request->arguments[3]))
++			return;
++		if (mboot_block_open_mochios_partition(request->device_id,
++						 request->arguments[0],
++						 request->arguments[2],
++						 request->arguments[3])) {
++			response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
++			return;
++		}
++		device = &mboot_pci_devices[request->device_id - 1];
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = mboot_block_sector_count;
++		response->values[1] =
++			bdev_logical_block_size(file_bdev(mboot_block_file));
++		response->values[2] = MBOOT_BLOCK_MAX_TRANSFER;
++		response->values[3] = mboot_control_device_features(&device->info);
++		return;
+ 	case MBOOT_CONTROL_CLOSE_DEVICE:
+ 		if (!mboot_control_active ||
+ 		    !mboot_control_zero_arguments(request->arguments))
+-- 
+2.51.0
+

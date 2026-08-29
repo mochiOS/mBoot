@@ -1,9 +1,10 @@
 version = 6
 toolchain = "nightly-2026-05-14"
-disk_size_mib = 224
+disk_size_mib = 1056
 esp_size_mib = 192
 disk_guid = "6d426f6f-7400-4b00-8a00-000000000200"
 esp_guid = "6d426f6f-7400-4b00-8a00-000000000201"
+payload_guid = "6d426f6f-7400-4b00-8a00-000000000202"
 
 [[domains]]
 id = 1
@@ -72,6 +73,29 @@ kind = "display"
 domain = 2
 required = true
 
-# Physical storage is deliberately not assigned by the default image. Add a
-# partitioned vmd or nvme device only after recording the three GUIDs from the
-# target disk's existing GPT. mBoot never creates or repairs that partition.
+# mDriver is a trusted hardware Domain. It receives every matching controller
+# so Installer.app can show the machine's actual disks without a per-machine BDF.
+[[devices]]
+segment = 0
+requester = "auto"
+kind = "nvme"
+domain = 2
+required = false
+writable = true
+
+[[devices]]
+segment = 0
+requester = "auto"
+kind = "vmd"
+domain = 2
+required = false
+writable = true
+
+# The boot medium may be USB. mDriver needs its xHCI controller only to read the
+# immutable installer payload; the target remains an explicitly selected disk.
+[[devices]]
+segment = 0
+requester = "auto"
+kind = "usb"
+domain = 2
+required = false

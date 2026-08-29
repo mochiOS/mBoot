@@ -121,6 +121,12 @@ my %initramfs_images = (
     'mdriver' => $ENV{MBOOT_MDRIVER_INITRAMFS},
     'mochios' => $ENV{MBOOT_MOCHIOS_INITFS},
 );
+my $mochios_rootfs = $ENV{MBOOT_MOCHIOS_ROOTFS};
+if (exists $config->{payload_guid}) {
+    defined $mochios_rootfs && length $mochios_rootfs
+        or die "mochiOS installer rootfs is required; set MOCHIOS_ROOTFS=/path/to/rootfs.img\n";
+    $mochios_rootfs = absolute_existing($mochios_rootfs);
+}
 my %required_images;
 my %required_initramfs;
 for my $domain (@{$config->{domains}}) {
@@ -270,14 +276,33 @@ for my $domain (@{$config->{domains}}) {
 my $temporary = "$output_file.new";
 unlink $temporary if -e $temporary;
 run('truncate', '-s', "$config->{disk_size_mib}M", $temporary);
-run(
-    'sgdisk', '--clear', "--disk-guid=$config->{disk_guid}",
+my @partition_arguments = (
     '--new=1:2048:+' . $config->{esp_size_mib} . 'M', '--typecode=1:ef00',
     "--partition-guid=1:$config->{esp_guid}", '--change-name=1:mochiOS EFI',
     '--attributes=1:set:2',
+);
+my $payload_start;
+if (exists $config->{payload_guid}) {
+    my $rootfs_bytes = -s $mochios_rootfs;
+    defined $rootfs_bytes && $rootfs_bytes > 0
+        or die "mochiOS installer rootfs is empty: $mochios_rootfs\n";
+    my $rootfs_sectors = int(($rootfs_bytes + 511) / 512);
+    $payload_start = 2048 + $config->{esp_size_mib} * 2048;
+    my $payload_type = '6d6f6368-694f-5300-8000-6d5061727402';
+    push @partition_arguments,
+        "--new=2:$payload_start:+${rootfs_sectors}s", "--typecode=2:$payload_type",
+        "--partition-guid=2:$config->{payload_guid}",
+        '--change-name=2:mochiOS installer payload';
+}
+run(
+    'sgdisk', '--clear', "--disk-guid=$config->{disk_guid}",
+    @partition_arguments,
     $temporary,
 );
 run('dd', "if=$esp", "of=$temporary", 'bs=512', 'seek=2048', 'conv=notrunc', 'status=none');
+if (exists $config->{payload_guid}) {
+    run('dd', "if=$mochios_rootfs", "of=$temporary", 'bs=512', "seek=$payload_start", 'conv=notrunc,sparse', 'status=none');
+}
 run('sgdisk', '--verify', $temporary);
 move($temporary, $output_file) or die "cannot publish $output_file: $!\n";
 chmod 0644, $output_file or die "cannot chmod $output_file: $!\n";

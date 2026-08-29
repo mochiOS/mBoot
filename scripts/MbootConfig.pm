@@ -51,6 +51,12 @@ sub read_mboot_config {
     $root{version} == 6 or die "$path: unsupported version $root{version}\n";
     $root{disk_size_mib} > $root{esp_size_mib} + 2
         or die "$path: disk_size_mib must exceed esp_size_mib by at least 2 MiB\n";
+    if (exists $root{payload_guid}) {
+        $root{payload_guid} =~ /^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$/
+            or die "$path: invalid payload_guid\n";
+        $root{payload_guid} !~ /^0{8}-(?:0{4}-){3}0{12}$/
+            or die "$path: payload_guid must not be zero\n";
+    }
     @domains && @domains <= 8 or die "$path: domains must contain 1 to 8 entries\n";
 
     my %ids;
@@ -142,6 +148,7 @@ sub read_mboot_config {
         $device->{ephemeral} = 0 unless exists $device->{ephemeral};
         $device->{read_only} = 0 unless exists $device->{read_only};
         $device->{partitioned} = 0 unless exists $device->{partitioned};
+        $device->{writable} = 0 unless exists $device->{writable};
         $device->{segment} >= 0 && $device->{segment} <= 0xffff
             or die "$path: device segment is outside u16\n";
         ($device->{requester} eq 'auto' ||
@@ -150,11 +157,11 @@ sub read_mboot_config {
         $device->{kind} =~ /^(?:other|display|block|network|usb|audio|nvme|vmd)$/
             or die "$path: invalid device kind\n";
         if ($device->{requester} eq 'auto') {
-            $device->{segment} == 0 && $device->{kind} =~ /^(?:display|nvme|vmd)$/
-                or die "$path: automatic selection is limited to a segment 0 display, NVMe, or VMD controller\n";
+            $device->{segment} == 0 && $device->{kind} =~ /^(?:display|nvme|vmd|usb)$/
+                or die "$path: automatic selection is limited to a segment 0 display, NVMe, VMD, or USB controller\n";
         }
         if ($device->{kind} =~ /^(?:block|nvme|vmd)$/) {
-            $device->{ephemeral} + $device->{read_only} + $device->{partitioned} == 1
+            $device->{ephemeral} + $device->{read_only} + $device->{partitioned} + $device->{writable} == 1
                 or die "$path: block devices must select exactly one storage policy\n";
             if ($device->{partitioned}) {
                 for my $key (qw(storage_disk_guid storage_partition_type_guid storage_partition_guid)) {
@@ -170,7 +177,7 @@ sub read_mboot_config {
                 die "$path: storage GUIDs require partitioned = true\n";
             }
         }
-        elsif ($device->{ephemeral} || $device->{read_only} || $device->{partitioned}) {
+        elsif ($device->{ephemeral} || $device->{read_only} || $device->{partitioned} || $device->{writable}) {
             die "$path: storage policies apply only to block devices\n";
         }
         $ids{$device->{domain}}

@@ -20,8 +20,13 @@ pub const DEVICE_FLAG_REQUIRED: u16 = 1 << 0;
 pub const DEVICE_FLAG_EPHEMERAL: u16 = 1 << 1;
 pub const DEVICE_FLAG_READ_ONLY: u16 = 1 << 2;
 pub const DEVICE_FLAG_PARTITIONED: u16 = 1 << 3;
+pub const DEVICE_FLAG_WRITABLE: u16 = 1 << 4;
 const DEVICE_FLAGS_KNOWN: u16 =
-    DEVICE_FLAG_REQUIRED | DEVICE_FLAG_EPHEMERAL | DEVICE_FLAG_READ_ONLY | DEVICE_FLAG_PARTITIONED;
+    DEVICE_FLAG_REQUIRED
+        | DEVICE_FLAG_EPHEMERAL
+        | DEVICE_FLAG_READ_ONLY
+        | DEVICE_FLAG_PARTITIONED
+        | DEVICE_FLAG_WRITABLE;
 pub const AUTO_REQUESTER: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +118,10 @@ impl ManifestDevice {
 
     pub const fn is_partitioned(self) -> bool {
         self.flags & DEVICE_FLAG_PARTITIONED != 0
+    }
+
+    pub const fn is_writable(self) -> bool {
+        self.flags & DEVICE_FLAG_WRITABLE != 0
     }
 }
 
@@ -245,7 +254,10 @@ impl<'a> LaunchManifest<'a> {
             }
             for previous in 0..index {
                 let other = manifest.device(previous)?;
-                if other.segment == device.segment && other.requester == device.requester {
+                if other.segment == device.segment
+                    && other.requester == device.requester
+                    && (device.requester != AUTO_REQUESTER || other.kind == device.kind)
+                {
                     return Err(Error::InvalidManifest);
                 }
             }
@@ -451,14 +463,19 @@ impl<'a> LaunchManifest<'a> {
                         ManifestDeviceKind::Display
                             | ManifestDeviceKind::Nvme
                             | ManifestDeviceKind::Vmd
+                            | ManifestDeviceKind::Usb
                     )))
             || (block_device
                 && usize::from(device.is_ephemeral())
                     + usize::from(device.is_read_only())
                     + usize::from(device.is_partitioned())
+                    + usize::from(device.is_writable())
                     != 1)
             || (!block_device
-                && (device.is_ephemeral() || device.is_read_only() || device.is_partitioned()))
+                && (device.is_ephemeral()
+                    || device.is_read_only()
+                    || device.is_partitioned()
+                    || device.is_writable()))
             || (device.is_partitioned()
                 && (device.storage_disk_guid == [0; 16]
                     || device.storage_partition_type_guid == [0; 16]

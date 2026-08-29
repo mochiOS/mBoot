@@ -1,0 +1,234 @@
+From 9f654241f8df6b18275b33ce40d42ce036bb0cb9 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Sat, 29 Aug 2026 00:00:00 +0900
+Subject: [PATCH] x86/mboot: install the mochiOS rootfs
+
+Copy the installer payload into an explicitly selected mochiOS GPT
+partition. Revalidate both the type and unique GUID immediately before the
+first write, and never write outside the selected partition range.
+---
+ arch/x86/kernel/cpu/mboot.c | 179 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 179 insertions(+)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 5fd390272d02..216e621d1ed2 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -99,6 +99,7 @@
+ #define MBOOT_CONTROL_DISPLAY_INFO 19
+ #define MBOOT_CONTROL_PRESENT_DISPLAY 20
+ #define MBOOT_CONTROL_CLOSE_DISPLAY 21
++#define MBOOT_CONTROL_INSTALL_PARTITION 22
+ #define MBOOT_CONTROL_STATUS_OK 0
+ #define MBOOT_CONTROL_STATUS_UNSUPPORTED_VERSION 1
+ #define MBOOT_CONTROL_STATUS_INVALID_REQUEST 2
+@@ -113,6 +114,14 @@
+ #define MBOOT_STORAGE_QUERY_DISK 0
+ #define MBOOT_STORAGE_QUERY_PARTITION_GUIDS 1
+ #define MBOOT_STORAGE_QUERY_PARTITION_RANGE 2
++static const u8 mboot_mochios_partition_type[16] = {
++	0x68, 0x63, 0x6f, 0x6d, 0x4f, 0x69, 0x00, 0x53,
++	0x80, 0x00, 0x6d, 0x50, 0x61, 0x72, 0x74, 0x01,
++};
++static const u8 mboot_installer_payload_type[16] = {
++	0x68, 0x63, 0x6f, 0x6d, 0x4f, 0x69, 0x00, 0x53,
++	0x80, 0x00, 0x6d, 0x50, 0x61, 0x72, 0x74, 0x02,
++};
+ #define MBOOT_DEVICE_KIND_OTHER 0
+ #define MBOOT_DEVICE_KIND_BLOCK 1
+ #define MBOOT_DEVICE_KIND_NETWORK 2
+@@ -2133,6 +2142,181 @@ static void mboot_control_inspect_storage(const struct mboot_control_request *req
+ 		response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
+ }
+ 
++static int mboot_installer_find_payload(struct block_device *target_bdev,
++					struct file **source_file,
++					u64 *source_first, u64 *source_count)
++{
++	struct class_dev_iter iterator;
++	struct device *device;
++	int found = 0;
++	int result = -ENOENT;
++
++	*source_file = NULL;
++	class_dev_iter_init(&iterator, &block_class, NULL, &disk_type);
++	while ((device = class_dev_iter_next(&iterator))) {
++		struct gendisk *disk = dev_to_disk(device);
++		struct file *file;
++		u32 ordinal;
++
++		if (!disk_live(disk) || disk_devt(disk) == target_bdev->bd_dev)
++			continue;
++		file = bdev_file_open_by_dev(disk_devt(disk), BLK_OPEN_READ,
++					     NULL, NULL);
++		if (IS_ERR(file))
++			continue;
++		for (ordinal = 0; ordinal < 128; ordinal++) {
++			u64 guids[4] = { 0 };
++			u64 range[4] = { 0 };
++
++			result = mboot_storage_inspect(file,
++					MBOOT_STORAGE_QUERY_PARTITION_GUIDS,
++					ordinal, guids);
++			if (result == -ENOENT)
++				break;
++			if (result)
++				continue;
++			if (guids[0] != get_unaligned_le64(mboot_installer_payload_type) ||
++			    guids[1] != get_unaligned_le64(mboot_installer_payload_type + 8))
++				continue;
++			result = mboot_storage_inspect(file,
++					MBOOT_STORAGE_QUERY_PARTITION_RANGE,
++					ordinal, range);
++			if (result)
++				break;
++			if (found++) {
++				result = -EEXIST;
++				fput(file);
++				goto out;
++			}
++			*source_file = file;
++			*source_first = range[0];
++			*source_count = range[1];
++			file = NULL;
++			result = 0;
++			break;
++		}
++		if (file)
++			fput(file);
++	}
++out:
++	class_dev_iter_exit(&iterator);
++	if (result && *source_file) {
++		fput(*source_file);
++		*source_file = NULL;
++	}
++	return found == 1 && !result ? 0 : result ?: -ENOENT;
++}
++
++static int mboot_installer_copy_partition(struct file *target,
++					   const u64 arguments[4], u64 values[4])
++{
++	struct file *source = NULL;
++	u64 guids[4] = { 0 };
++	u64 range[4] = { 0 };
++	u64 source_first = 0;
++	u64 source_count = 0;
++	u64 copied = 0;
++	u8 *buffer;
++	int result;
++
++	if (arguments[0] > U32_MAX || arguments[3] ||
++	    (!arguments[1] && !arguments[2]))
++		return -EINVAL;
++	result = mboot_storage_inspect(target,
++				       MBOOT_STORAGE_QUERY_PARTITION_GUIDS,
++				       arguments[0], guids);
++	if (result)
++		return result;
++	if (guids[0] != get_unaligned_le64(mboot_mochios_partition_type) ||
++	    guids[1] != get_unaligned_le64(mboot_mochios_partition_type + 8) ||
++	    guids[2] != arguments[1] || guids[3] != arguments[2])
++		return -ESTALE;
++	result = mboot_storage_inspect(target,
++				       MBOOT_STORAGE_QUERY_PARTITION_RANGE,
++				       arguments[0], range);
++	if (result)
++		return result;
++	result = mboot_installer_find_payload(file_bdev(target), &source,
++					      &source_first, &source_count);
++	if (result)
++		return result;
++	if (!source_count || source_count > range[1]) {
++		result = -ENOSPC;
++		goto out_source;
++	}
++	buffer = kvmalloc(SZ_1M, GFP_KERNEL);
++	if (!buffer) {
++		result = -ENOMEM;
++		goto out_source;
++	}
++	while (copied < source_count * MBOOT_BLOCK_SECTOR_SIZE) {
++		size_t chunk = min_t(u64, SZ_1M,
++				     source_count * MBOOT_BLOCK_SECTOR_SIZE - copied);
++		u64 source_offset = source_first * MBOOT_BLOCK_SECTOR_SIZE + copied;
++		u64 target_offset = range[0] * MBOOT_BLOCK_SECTOR_SIZE + copied;
++
++		result = mboot_block_read_exact(source, source_offset, buffer, chunk);
++		if (!result)
++			result = mboot_block_write_exact(target, target_offset, buffer, chunk);
++		if (result)
++			break;
++		copied += chunk;
++	}
++	kvfree(buffer);
++	if (!result && vfs_fsync(target, 0))
++		result = -EIO;
++	if (!result) {
++		values[0] = copied;
++		values[1] = range[0];
++		values[2] = range[1];
++	}
++out_source:
++	fput(source);
++	return result;
++}
++
++static void mboot_control_install_partition(const struct mboot_control_request *request,
++					     struct mboot_control_response *response)
++{
++	const struct mboot_pci_frontend *device;
++	struct file *file;
++	int result;
++
++	if (!request->device_id || request->device_id > mboot_pci_device_count)
++		return;
++	device = &mboot_pci_devices[request->device_id - 1];
++	if (mboot_control_device_kind(&device->info) != MBOOT_DEVICE_KIND_BLOCK ||
++	    device->info.flags & (MBOOT_PCI_FLAG_READ_ONLY |
++				  MBOOT_PCI_FLAG_PARTITIONED)) {
++		response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
++		return;
++	}
++	if (mboot_block_file || mboot_block_ring) {
++		response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
++		return;
++	}
++	file = mboot_block_open(&device->info);
++	if (IS_ERR(file)) {
++		response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
++		return;
++	}
++	result = mboot_installer_copy_partition(file, request->arguments,
++						response->values);
++	fput(file);
++	mboot_block_first_sector = 0;
++	mboot_block_sector_count = 0;
++	if (!result)
++		response->status = MBOOT_CONTROL_STATUS_OK;
++	else if (result == -ENOENT)
++		response->status = MBOOT_CONTROL_STATUS_NOT_FOUND;
++	else if (result == -ENOSPC || result == -ERANGE)
++		response->status = MBOOT_CONTROL_STATUS_OUT_OF_RANGE;
++	else if (result == -EINVAL || result == -ESTALE || result == -EEXIST)
++		response->status = MBOOT_CONTROL_STATUS_INVALID_REQUEST;
++	else
++		response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
++}
++
+ static void mboot_control_handle(const struct mboot_control_request *request,
+ 				 struct mboot_control_response *response)
+ {
+@@ -2172,6 +2356,9 @@ static void mboot_control_handle(const struct mboot_control_request *request,
+ 		return;
+ 	}
+ 	switch (request->operation) {
++	case MBOOT_CONTROL_INSTALL_PARTITION:
++		mboot_control_install_partition(request, response);
++		return;
+ 	case MBOOT_CONTROL_CREATE_PARTITION:
+ 	case MBOOT_CONTROL_DELETE_PARTITION:
+ 		mboot_control_mutate_storage(request, response);
+-- 
+2.51.0
+

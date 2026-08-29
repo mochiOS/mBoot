@@ -7,6 +7,7 @@ UEFI_NET_DIR ?= $(OUTPUT_DIR)/uefi-net
 MDRIVER_KERNEL ?=
 MDRIVER_INITRAMFS ?=
 MOCHIOS_INITFS ?=
+MOCHIOS_ROOTFS ?=
 
 CARGO ?= $(shell command -v cargo 2>/dev/null)
 RUSTC ?= $(shell command -v rustc 2>/dev/null)
@@ -17,7 +18,7 @@ MNU_INPUTS := $(shell find $(MNU_DIR)/src $(MNU_DIR)/crates/abi/src \
 	-type f -print 2>/dev/null) \
 	$(wildcard $(MNU_DIR)/Cargo.toml $(MNU_DIR)/crates/abi/Cargo.toml)
 IMAGE_INPUTS := $(MBOOT_INPUTS) $(MNU_INPUTS) $(CONFIG) \
-	$(wildcard $(MDRIVER_KERNEL) $(MDRIVER_INITRAMFS) $(MOCHIOS_INITFS))
+	$(wildcard $(MDRIVER_KERNEL) $(MDRIVER_INITRAMFS) $(MOCHIOS_INITFS) $(MOCHIOS_ROOTFS))
 
 .PHONY: all build clean device-io-test mdriver-test help image image-test qemu-test setup test
 .PHONY: hv-build hv-device-io-test hv-mdriver-test hv-image hv-image-test hv-qemu-test hv-test
@@ -50,6 +51,7 @@ $(IMAGE): $(SETUP_STAMP) $(IMAGE_INPUTS)
 	MBOOT_MDRIVER_KERNEL="$(MDRIVER_KERNEL)" \
 	MBOOT_MDRIVER_INITRAMFS="$(MDRIVER_INITRAMFS)" \
 	MBOOT_MOCHIOS_INITFS="$(MOCHIOS_INITFS)" \
+	MBOOT_MOCHIOS_ROOTFS="$(MOCHIOS_ROOTFS)" \
 		scripts/build-image.pl \
 		--config "$(CONFIG)" \
 		--mnu-dir "$(MNU_DIR)" \

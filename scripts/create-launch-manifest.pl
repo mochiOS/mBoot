@@ -119,6 +119,7 @@ for my $device (@{$config->{devices}}) {
     my $flags = ($device->{required} ? 1 : 0) |
         ($device->{ephemeral} ? 2 : 0) | ($device->{read_only} ? 4 : 0) |
         ($device->{partitioned} ? 8 : 0);
+    $flags |= 16 if $device->{writable};
     my $requester = $device->{requester} eq 'auto' ? 0xffff : $device->{requester};
     my $storage_guids = $device->{partitioned}
         ? pack_gpt_guid($device->{storage_disk_guid})
