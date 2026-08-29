@@ -962,7 +962,10 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
     let (pin, primary, secondary, exit, entry) = unsafe {
         (
             adjusted_vm_control(1, read_msr(pin_msr)),
-            adjusted_vm_control((1 << 7) | (1 << 31), read_msr(primary_msr)),
+            adjusted_vm_control(
+                (1 << 7) | (1 << 28) | (1 << 31),
+                read_msr(primary_msr),
+            ),
             adjusted_vm_control(
                 (1 << 1) | if pvh { 1 << 7 } else { 0 },
                 read_msr(IA32_VMX_PROCBASED_CTLS2),
@@ -983,6 +986,9 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
     };
     if secondary & (1 << 1) == 0 {
         return Err(Error::NestedPagingUnavailable);
+    }
+    if primary & (1 << 28) == 0 {
+        return Err(Error::UnsupportedCpu);
     }
     if pvh && secondary & (1 << 7) == 0 {
         return Err(Error::UnsupportedCpu);
@@ -1414,6 +1420,14 @@ mod tests {
     fn vm_controls_include_required_bits_and_remove_unsupported_bits() {
         let capability = 0b0010 | (0b0111u64 << 32);
         assert_eq!(adjusted_vm_control(0b1101, capability), 0b0111);
+    }
+
+    #[test]
+    fn primary_controls_request_msr_bitmap_support() {
+        let desired = (1 << 7) | (1 << 28) | (1 << 31);
+        let capability = desired << 32;
+        assert_eq!(adjusted_vm_control(desired, capability), desired);
+        assert_ne!(adjusted_vm_control(desired, capability) & (1 << 28), 0);
     }
 
     #[test]
