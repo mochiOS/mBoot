@@ -464,6 +464,23 @@ impl Svm {
         Ok(unsafe { read_u64(self.vmcb_phys, VMCB_RSP) })
     }
 
+    /// Reads CR0 and CR3 from a stopped guest for early paging diagnostics.
+    ///
+    /// # Safety
+    /// The vCPU must have entered at least once, be stopped, and remain owned
+    /// by the current SVM-enabled CPU.
+    pub unsafe fn guest_paging_state(&self) -> Result<(u64, u64), Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        Ok(unsafe {
+            (
+                read_u64(self.vmcb_phys, VMCB_CR0),
+                read_u64(self.vmcb_phys, VMCB_CR3),
+            )
+        })
+    }
+
     /// Emulates an intercepted architectural MSR read from stopped guest state.
     ///
     /// # Safety

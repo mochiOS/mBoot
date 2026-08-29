@@ -974,12 +974,13 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                         .guest_instruction_pointer()
                 }
                 .unwrap_or(0);
-                let stack_pointer = unsafe {
+                let (cr0, cr3) = unsafe {
                     runtime_domains[index]
                         .virtualization
-                        .guest_stack_pointer()
+                        .guest_paging_state()
                 }
-                .unwrap_or(0);
+                .unwrap_or((0, 0));
+                let paging_state = (cr0 << 32) | (cr3 & u64::from(u32::MAX));
                 isolate_crashed_domain(
                     index,
                     &mut runtime_domains,
@@ -992,7 +993,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     manifest,
                     raw_reason,
                     instruction_pointer,
-                    stack_pointer,
+                    paging_state,
                 );
                 continue;
             }

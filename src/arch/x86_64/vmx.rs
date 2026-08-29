@@ -696,6 +696,19 @@ impl Vmx {
         Ok(unsafe { vmread(GUEST_RSP) })
     }
 
+    /// Reads CR0 and CR3 from a stopped guest for early paging diagnostics.
+    ///
+    /// # Safety
+    /// The vCPU must have entered at least once, be stopped, and remain owned
+    /// by the current VMX-enabled CPU.
+    pub unsafe fn guest_paging_state(&self) -> Result<(u64, u64), Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
+        Ok(unsafe { (vmread(GUEST_CR0), vmread(GUEST_CR3)) })
+    }
+
     /// Emulates an intercepted architectural MSR read from stopped guest state.
     ///
     /// # Safety

@@ -350,6 +350,17 @@ impl Virtualization {
         }
     }
 
+    /// Reads CR0 and CR3 from a stopped vCPU for early paging diagnostics.
+    ///
+    /// # Safety
+    /// The vCPU must have entered at least once and be stopped on its owner CPU.
+    pub unsafe fn guest_paging_state(&self) -> Result<(u64, u64), Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.guest_paging_state() },
+            Virtualization::Amd(svm) => unsafe { svm.guest_paging_state() },
+        }
+    }
+
     /// Reads an intercepted architectural MSR from stopped guest state.
     ///
     /// # Safety

@@ -65,13 +65,18 @@ pub fn domain_crash(domain_id: u32, raw_reason: u64, address: u64, info: u64) {
     let mut location = *b"ADDR 00000000";
     write_hex_u32(&mut location[5..13], address as u32);
     draw_centered(&location, line_y(3));
-    let mut context = if raw_reason == 2 {
-        *b"RSP  00000000"
+    if raw_reason == 2 {
+        let mut cr0 = *b"CR0  00000000";
+        write_hex_u32(&mut cr0[5..13], (info >> 32) as u32);
+        draw_centered(&cr0, line_y(4));
+        let mut cr3 = *b"CR3  00000000";
+        write_hex_u32(&mut cr3[5..13], info as u32);
+        draw_centered(&cr3, line_y(5));
     } else {
-        *b"INFO 00000000"
-    };
-    write_hex_u32(&mut context[5..13], info as u32);
-    draw_centered(&context, line_y(4));
+        let mut context = *b"INFO 00000000";
+        write_hex_u32(&mut context[5..13], info as u32);
+        draw_centered(&context, line_y(4));
+    }
 }
 
 pub fn backend(intel: bool) {
