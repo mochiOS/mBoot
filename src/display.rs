@@ -56,7 +56,7 @@ pub fn gpu_handoff(requester: u16) {
     draw_hex(u64::from(requester), line_y(2));
 }
 
-pub fn domain_crash(domain_id: u32, raw_reason: u64, address: u64) {
+pub fn domain_crash(domain_id: u32, raw_reason: u64, address: u64, info: u64) {
     show(0x006B_2028, b"DOMAIN", b"CRASH");
     let mut detail = *b"00 0000";
     write_hex_u8(&mut detail[0..2], domain_id as u8);
@@ -65,6 +65,13 @@ pub fn domain_crash(domain_id: u32, raw_reason: u64, address: u64) {
     let mut location = *b"ADDR 00000000";
     write_hex_u32(&mut location[5..13], address as u32);
     draw_centered(&location, line_y(3));
+    let mut context = if raw_reason == 2 {
+        *b"RSP  00000000"
+    } else {
+        *b"INFO 00000000"
+    };
+    write_hex_u32(&mut context[5..13], info as u32);
+    draw_centered(&context, line_y(4));
 }
 
 pub fn backend(intel: bool) {

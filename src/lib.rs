@@ -339,6 +339,17 @@ impl Virtualization {
         }
     }
 
+    /// Reads the stack pointer from a stopped vCPU for crash reporting.
+    ///
+    /// # Safety
+    /// The vCPU must have entered at least once and be stopped on its owner CPU.
+    pub unsafe fn guest_stack_pointer(&self) -> Result<u64, Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.guest_stack_pointer() },
+            Virtualization::Amd(svm) => unsafe { svm.guest_stack_pointer() },
+        }
+    }
+
     /// Reads an intercepted architectural MSR from stopped guest state.
     ///
     /// # Safety

@@ -674,6 +674,19 @@ impl Vmx {
         Ok(unsafe { vmread(GUEST_RIP) })
     }
 
+    /// Reads the stack pointer from a stopped guest for crash reporting.
+    ///
+    /// # Safety
+    /// The vCPU must have entered at least once, be stopped, and remain owned
+    /// by the current VMX-enabled CPU.
+    pub unsafe fn guest_stack_pointer(&self) -> Result<u64, Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
+        Ok(unsafe { vmread(GUEST_RSP) })
+    }
+
     /// Emulates an intercepted architectural MSR read from stopped guest state.
     ///
     /// # Safety

@@ -448,6 +448,18 @@ impl Svm {
         Ok(unsafe { read_u64(self.vmcb_phys, VMCB_RIP) })
     }
 
+    /// Reads the stack pointer from a stopped guest for crash reporting.
+    ///
+    /// # Safety
+    /// The vCPU must have entered at least once, be stopped, and remain owned
+    /// by the current SVM-enabled CPU.
+    pub unsafe fn guest_stack_pointer(&self) -> Result<u64, Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        Ok(unsafe { read_u64(self.vmcb_phys, VMCB_RSP) })
+    }
+
     /// Emulates an intercepted architectural MSR read from stopped guest state.
     ///
     /// # Safety

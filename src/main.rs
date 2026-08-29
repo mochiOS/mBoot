@@ -974,6 +974,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                         .guest_instruction_pointer()
                 }
                 .unwrap_or(0);
+                let stack_pointer = unsafe {
+                    runtime_domains[index]
+                        .virtualization
+                        .guest_stack_pointer()
+                }
+                .unwrap_or(0);
                 isolate_crashed_domain(
                     index,
                     &mut runtime_domains,
@@ -986,7 +992,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     manifest,
                     raw_reason,
                     instruction_pointer,
-                    0,
+                    stack_pointer,
                 );
                 continue;
             }
@@ -1795,7 +1801,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 .then_some(runtime.crash_info)
                 .flatten()
         }) {
-            display::domain_crash(crash.domain_id, crash.raw_reason, crash.fault_address);
+            display::domain_crash(
+                crash.domain_id,
+                crash.raw_reason,
+                crash.fault_address,
+                crash.fault_info,
+            );
         } else {
             display::failure(53);
         }
@@ -1851,7 +1862,7 @@ fn isolate_crashed_domain(
         next_restart_count,
         DOMAIN_CRASH_STATUS_CRASHED,
     ));
-    display::domain_crash(domain_id.get(), raw_reason, fault_address);
+    display::domain_crash(domain_id.get(), raw_reason, fault_address, fault_info);
     cleanup_domain_resources(
         index,
         runtime_domains,
