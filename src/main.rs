@@ -59,8 +59,9 @@ const MAX_GUEST_MEMORY_PAGES: usize = 65_536;
 const GRANT_WINDOW_PAGES: usize = 16;
 const DEVICE_WINDOW_PAGES: usize = 64;
 const DEVICE_WINDOW_START: u64 = 0x1000_0000;
-const DEVICE_WINDOW_LIMIT: u64 = 0x80_0000_0000;
+const DEVICE_WINDOW_LIMIT: u64 = mnu_abi::hypervisor::DOMAIN_DEVICE_ADDRESS_LIMIT;
 const SPARSE_LEVEL2_PAGES: usize = 512;
+const SPARSE_LEVEL3_PAGES: usize = 2;
 const SPARSE_LEVEL1_PAGES: usize = 256;
 const DOMAIN_BOOT_INFO_GPA: u64 = 0x3000;
 const MAX_CONSOLE_WRITE: u64 = 4096;
@@ -2160,10 +2161,24 @@ fn claim_pci_device(
                 requester,
                 error
             );
+            for bar in descriptor.bars[..descriptor.bar_count]
+                .iter()
+                .filter(|bar| bar.length != 0)
+            {
+                log!(
+                    "PCI requester {:04x} BAR{} range={:#x}..{:#x}",
+                    requester,
+                    bar.index,
+                    bar.physical_address,
+                    bar.physical_address.saturating_add(bar.length)
+                );
+            }
             return false;
         }
     };
     let nested_root = runtime_domains[index].domain.nested_pages().hardware_root();
+    let mut mapped_bars = [pci::PciBar::default(); pci::MAX_DEVICE_BARS];
+    let mut mapped_count = 0;
     for bar in bars.iter().filter(|bar| bar.length != 0) {
         if unsafe {
             runtime_domains[index]
@@ -2173,11 +2188,19 @@ fn claim_pci_device(
         }
         .is_err()
         {
-            if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
+            if !rollback_pci_mapping(
+                index,
+                runtime_domains,
+                assignments,
+                requester,
+                mapped_bars,
+            ) {
                 halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
             }
             return false;
         }
+        mapped_bars[mapped_count] = *bar;
+        mapped_count += 1;
     }
     if unsafe {
         runtime_domains[index]
@@ -2473,15 +2496,22 @@ fn allocate_nested_pages(
     let level1_pages = guest_pages.div_ceil(512);
     Ok(NestedPageResources {
         root: allocate_page(boot_services)?,
-        level3: allocate_page(boot_services)?,
+        level3: boot_services
+            .allocate_pages(
+                AllocateType::AnyPages,
+                MemoryType::LOADER_DATA,
+                SPARSE_LEVEL3_PAGES,
+            )
+            .map_err(|error| error.status())?,
+        level3_pages: SPARSE_LEVEL3_PAGES,
         level2: boot_services
             .allocate_pages(
                 AllocateType::AnyPages,
                 MemoryType::LOADER_DATA,
-                SPARSE_LEVEL2_PAGES,
+                SPARSE_LEVEL2_PAGES * SPARSE_LEVEL3_PAGES,
             )
             .map_err(|error| error.status())?,
-        level2_pages: SPARSE_LEVEL2_PAGES,
+        level2_pages: SPARSE_LEVEL2_PAGES * SPARSE_LEVEL3_PAGES,
         level1: boot_services
             .allocate_pages(
                 AllocateType::AnyPages,

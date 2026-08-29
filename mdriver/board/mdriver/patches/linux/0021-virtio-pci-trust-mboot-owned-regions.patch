@@ -1,0 +1,78 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] virtio-pci: trust mBoot-owned regions
+
+mBoot assigns each PCI function exclusively, validates its firmware BARs, and
+maps only those BAR pages into mDriver. The reduced Linux e820 map intentionally
+does not describe the machine-wide MMIO apertures, so the generic iomem resource
+reservation cannot reserve those high ranges. Skip that redundant reservation
+only for an mBoot guest; capability validation and ioremap remain unchanged.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ drivers/virtio/virtio_pci_modern_dev.c | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+--- a/drivers/virtio/virtio_pci_modern_dev.c
++++ b/drivers/virtio/virtio_pci_modern_dev.c
+@@ -1,10 +1,22 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <linux/virtio_pci_modern.h>
++#ifdef CONFIG_X86
++#include <asm/hypervisor.h>
++#endif
+ #include <linux/module.h>
+ #include <linux/pci.h>
+ #include <linux/delay.h>
+ 
++static bool vp_mboot_owns_regions(void)
++{
++#ifdef CONFIG_X86
++	return hypervisor_is_type(X86_HYPER_MBOOT);
++#else
++	return false;
++#endif
++}
++
+ /*
+  * vp_modern_map_capability - map a part of virtio pci capability
+  * @mdev: the modern virtio-pci device
+@@ -291,10 +303,12 @@
+ 					    IORESOURCE_IO | IORESOURCE_MEM,
+ 					    &mdev->modern_bars);
+ 
+-	err = pci_request_selected_regions(pci_dev, mdev->modern_bars,
+-					   "virtio-pci-modern");
+-	if (err)
+-		return err;
++	if (!vp_mboot_owns_regions()) {
++		err = pci_request_selected_regions(pci_dev, mdev->modern_bars,
++						   "virtio-pci-modern");
++		if (err)
++			return err;
++	}
+ 
+ 	err = -EINVAL;
+ 	mdev->common = vp_modern_map_capability(mdev, common,
+@@ -364,7 +378,8 @@
+ err_map_isr:
+ 	pci_iounmap(pci_dev, mdev->common);
+ err_map_common:
+-	pci_release_selected_regions(pci_dev, mdev->modern_bars);
++	if (!vp_mboot_owns_regions())
++		pci_release_selected_regions(pci_dev, mdev->modern_bars);
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(vp_modern_probe);
+@@ -383,7 +398,8 @@
+ 		pci_iounmap(pci_dev, mdev->notify_base);
+ 	pci_iounmap(pci_dev, mdev->isr);
+ 	pci_iounmap(pci_dev, mdev->common);
+-	pci_release_selected_regions(pci_dev, mdev->modern_bars);
++	if (!vp_mboot_owns_regions())
++		pci_release_selected_regions(pci_dev, mdev->modern_bars);
+ }
+ EXPORT_SYMBOL_GPL(vp_modern_remove);
+ 
+-- 
+2.39.5

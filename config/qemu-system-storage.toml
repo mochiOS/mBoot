@@ -1,0 +1,76 @@
+version = 6
+toolchain = "nightly-2026-05-14"
+disk_size_mib = 128
+esp_size_mib = 96
+disk_guid = "6d426f6f-7400-4b00-8a00-000000000710"
+esp_guid = "6d426f6f-7400-4b00-8a00-000000000711"
+
+[[domains]]
+id = 1
+role = "system"
+memory_mib = 256
+vcpus = 1
+capabilities = 0
+format = "native-elf"
+image = "mochios-system"
+path = '\EFI\MBOOT\MOCHIOS.ELF'
+initramfs = "mochios"
+initramfs_path = '\EFI\MBOOT\INITFS.IMG'
+autostart = true
+required = true
+restart = "never"
+max_restarts = 0
+
+[[channels]]
+domain_a = 1
+port_a = 1
+domain_b = 2
+port_b = 1
+
+[[channels]]
+domain_a = 1
+port_a = 2
+domain_b = 2
+port_b = 2
+
+[[channels]]
+domain_a = 1
+port_a = 3
+domain_b = 2
+port_b = 3
+
+[[channels]]
+domain_a = 1
+port_a = 4
+domain_b = 2
+port_b = 4
+
+# This requester is the second virtio-blk device created by
+# scripts/test-system-storage.sh. It is a test-only, enrolled partition.
+[[devices]]
+segment = 0
+requester = 0x18
+kind = "block"
+domain = 2
+required = true
+partitioned = true
+storage_disk_guid = "6d426f6f-7400-4b00-8a00-00000000d101"
+storage_partition_type_guid = "6d6f6368-694f-5300-8000-6d5061727401"
+storage_partition_guid = "6d426f6f-7400-4b00-8a00-00000000d102"
+
+[[domains]]
+id = 2
+role = "hardware"
+memory_mib = 64
+vcpus = 1
+capabilities = 0x3
+format = "linux-pvh"
+image = "mdriver"
+path = '\EFI\MBOOT\MDRIVER.ELF'
+initramfs = "mdriver"
+initramfs_path = '\EFI\MBOOT\MDRIVER.CPIO'
+command_line = "earlycon=uart,io,0x3f8 console=ttyS0 rdinit=/init pci=off acpi=off maxcpus=0 panic=-1"
+autostart = true
+required = true
+restart = "never"
+max_restarts = 0

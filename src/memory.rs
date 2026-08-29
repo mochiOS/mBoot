@@ -24,6 +24,7 @@ const NESTED_LARGE_PAGE: u64 = 1 << 7;
 pub struct NestedPageResources {
     pub root: u64,
     pub level3: u64,
+    pub level3_pages: usize,
     pub level2: u64,
     pub level2_pages: usize,
     pub level1: u64,
@@ -51,10 +52,14 @@ impl NestedPageResources {
             }
         }
         let required_level1_pages = self.guest_pages.div_ceil(ENTRY_COUNT);
+        let required_level3_pages = self.level2_pages.div_ceil(ENTRY_COUNT);
         if self.guest_pages == 0
             || required_level1_pages > ENTRY_COUNT
+            || required_level3_pages == 0
+            || required_level3_pages > ENTRY_COUNT
+            || self.level3_pages != required_level3_pages
             || self.level2_pages == 0
-            || self.level2_pages > ENTRY_COUNT
+            || self.level2_pages > ENTRY_COUNT * ENTRY_COUNT
             || self.level1_pages != required_level1_pages
             || self.device_level1_pages == 0
         {
@@ -68,6 +73,8 @@ impl NestedPageResources {
 pub struct NestedPageTable {
     backend: BackendKind,
     root: u64,
+    level3: u64,
+    level3_pages: usize,
     level1: u64,
     level1_pages: usize,
     level2: u64,
@@ -91,11 +98,14 @@ impl NestedPageTable {
         resources: NestedPageResources,
     ) -> Result<Self, Error> {
         resources.validate()?;
-        for page in [resources.root, resources.level3] {
-            // SAFETY: The function contract gives mBoot exclusive writable ownership.
-            unsafe { write_bytes(page as *mut u8, 0, PAGE_SIZE as usize) };
-        }
+        // SAFETY: The function contract gives mBoot exclusive writable ownership.
+        unsafe { write_bytes(resources.root as *mut u8, 0, PAGE_SIZE as usize) };
         unsafe {
+            write_bytes(
+                resources.level3 as *mut u8,
+                0,
+                resources.level3_pages * PAGE_SIZE as usize,
+            );
             write_bytes(
                 resources.level2 as *mut u8,
                 0,
@@ -123,7 +133,13 @@ impl NestedPageTable {
         };
         // SAFETY: All tables were validated, zeroed, and are exclusively owned.
         unsafe {
-            write_entry(resources.root, 0, resources.level3 | link_flags);
+            for index in 0..resources.level3_pages {
+                write_entry(
+                    resources.root,
+                    index,
+                    (resources.level3 + index as u64 * PAGE_SIZE) | link_flags,
+                );
+            }
             write_entry(resources.level3, 0, resources.level2 | link_flags);
             for index in 0..resources.level1_pages {
                 write_entry(
@@ -154,6 +170,8 @@ impl NestedPageTable {
         Ok(Self {
             backend,
             root: resources.root,
+            level3: resources.level3,
+            level3_pages: resources.level3_pages,
             level1: resources.level1,
             level1_pages: resources.level1_pages,
             level2: resources.level2,
@@ -394,12 +412,17 @@ impl NestedPageTable {
     }
 
     fn sparse_level2_entry(&self, guest: u64) -> Result<*mut u64, Error> {
-        let level3_index = usize::try_from(guest >> 30).map_err(|_| Error::InvalidPage)?;
-        if level3_index >= self.level2_pages {
+        let level2_index = usize::try_from(guest >> 30).map_err(|_| Error::InvalidPage)?;
+        if level2_index >= self.level2_pages {
             return Err(Error::InvalidPage);
         }
-        let level3_entry = unsafe { (self.level3_table() as *mut u64).add(level3_index) };
-        let expected = self.level2 + level3_index as u64 * PAGE_SIZE;
+        let level3_page = level2_index / ENTRY_COUNT;
+        if level3_page >= self.level3_pages {
+            return Err(Error::InvalidPage);
+        }
+        let level3_table = self.level3 + level3_page as u64 * PAGE_SIZE;
+        let level3_entry = unsafe { (level3_table as *mut u64).add(level2_index % ENTRY_COUNT) };
+        let expected = self.level2 + level2_index as u64 * PAGE_SIZE;
         let current = unsafe { read_volatile(level3_entry) } & 0x000f_ffff_ffff_f000;
         if current == 0 {
             let link_flags = match self.backend {
@@ -411,12 +434,6 @@ impl NestedPageTable {
             return Err(Error::InvalidPage);
         }
         Ok(unsafe { (expected as *mut u64).add(((guest >> 21) & 0x1ff) as usize) })
-    }
-
-    fn level3_table(&self) -> u64 {
-        // The root's first entry is installed by initialize and points here.
-        // Keeping the address avoids reading architecture-specific flag bits.
-        (unsafe { read_volatile(self.root as *const u64) }) & 0x000f_ffff_ffff_f000
     }
 
     fn page_entry(&self, guest_page: u64) -> Result<(u64, usize), Error> {
@@ -492,6 +509,8 @@ impl NestedPageTable {
         Self {
             backend,
             root,
+            level3: root,
+            level3_pages: 1,
             level1: root,
             level1_pages: guest_pages.div_ceil(ENTRY_COUNT),
             level2: root,
@@ -674,6 +693,7 @@ mod tests {
         NestedPageResources {
             root: root.0.as_mut_ptr() as u64,
             level3: level3.0.as_mut_ptr() as u64,
+            level3_pages: 1,
             level2: level2.0.as_mut_ptr() as u64,
             level2_pages: 1,
             level1: level1.0.as_mut_ptr() as u64,

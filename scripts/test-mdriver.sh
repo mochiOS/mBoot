@@ -68,9 +68,11 @@ fi
     -accel "$ACCEL" \
     -cpu "$CPU" \
     -machine q35 \
+    -global q35-pcihost.pci-hole64-size=32G \
+    -global q35-pcihost.x-pci-hole64-fix=off \
     -boot menu=off,strict=on \
     -smp 1 \
-    -m 512 \
+    -m 1024 \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd" \
     -drive "if=none,id=disk,format=raw,file=$WORK/mdriver.img" \

@@ -1,0 +1,104 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mBoot: map only assigned high MMIO
+
+mBoot may place a guest-visible PCI BAR above the Hardware Domain RAM limit.
+Such an address is not accepted by the generic phys_addr_valid() check even
+though mBoot has mapped that exact BAR into the guest nested page tables.
+
+Accept an out-of-RAM ioremap only when the complete requested range is covered
+by a BAR returned for an assigned device. Keep the normal validation for native
+Linux and every other hypervisor.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ arch/x86/include/asm/hypervisor.h |  6 ++++++
+ arch/x86/kernel/cpu/mboot.c       | 30 ++++++++++++++++++++++++++++++
+ arch/x86/mm/ioremap.c             |  5 ++++-
+ 3 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/hypervisor.h b/arch/x86/include/asm/hypervisor.h
+--- a/arch/x86/include/asm/hypervisor.h
++++ b/arch/x86/include/asm/hypervisor.h
+@@ -67,6 +67,8 @@
+ extern const struct hypervisor_x86 x86_hyper_acrn;
+ extern const struct hypervisor_x86 x86_hyper_mboot;
+ extern struct hypervisor_x86 x86_hyper_xen_hvm;
++
++bool mboot_pci_mmio_valid(u64 address, unsigned long size);
+ 
+ extern bool nopv;
+ extern enum x86_hypervisor_type x86_hyper_type;
+@@ -83,5 +85,9 @@ static inline bool hypervisor_is_type(enum x86_hypervisor_type type)
+ {
+ 	return type == X86_HYPER_NATIVE;
+ }
++static inline bool mboot_pci_mmio_valid(u64 address, unsigned long size)
++{
++	return false;
++}
+ #endif /* CONFIG_HYPERVISOR_GUEST */
+ #endif /* _ASM_X86_HYPERVISOR_H */
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -531,6 +531,36 @@ mboot_pci_resource_for_bar(const struct mboot_pci_frontend *device,
+ 	return NULL;
+ }
+ 
++bool mboot_pci_mmio_valid(u64 address, unsigned long size)
++{
++	u64 end;
++	unsigned int device_index;
++
++	if (!size || check_add_overflow(address, size - 1, &end))
++		return false;
++
++	for (device_index = 0; device_index < mboot_pci_device_count;
++	     device_index++) {
++		const struct mboot_pci_frontend *device =
++			&mboot_pci_devices[device_index];
++		unsigned int resource_index;
++
++		for (resource_index = 0;
++		     resource_index < device->resource_count; resource_index++) {
++			const struct mboot_pci_resource *resource =
++				&device->resources[resource_index];
++			u64 resource_end;
++
++			if (check_add_overflow(resource->guest_address,
++					       resource->length - 1, &resource_end))
++				continue;
++			if (address >= resource->guest_address && end <= resource_end)
++				return true;
++		}
++	}
++	return false;
++}
++
+ static int mboot_pci_config_read(struct pci_bus *bus, unsigned int devfn,
+ 				 int where, int size, u32 *value)
+ {
+diff --git a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
+--- a/arch/x86/mm/ioremap.c
++++ b/arch/x86/mm/ioremap.c
+@@ -26,6 +26,7 @@
+ #include <asm/pgalloc.h>
+ #include <asm/memtype.h>
+ #include <asm/setup.h>
++#include <asm/hypervisor.h>
+ 
+ #include "physaddr.h"
+ 
+@@ -200,7 +201,9 @@ __ioremap_caller(resource_size_t phys_addr, unsigned long size,
+ 	if (!size || last_addr < phys_addr)
+ 		return NULL;
+ 
+-	if (!phys_addr_valid(phys_addr)) {
++	if (!phys_addr_valid(phys_addr) &&
++	    !(hypervisor_is_type(X86_HYPER_MBOOT) &&
++	      mboot_pci_mmio_valid(phys_addr, size))) {
+ 		printk(KERN_WARNING "ioremap: invalid physical address %llx\n",
+ 		       (unsigned long long)phys_addr);
+ 		WARN_ON_ONCE(1);
+-- 
+2.39.5

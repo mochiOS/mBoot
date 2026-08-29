@@ -1,0 +1,74 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: separate prefetchable PCI windows
+
+Publish distinct root-bus windows for ordinary and prefetchable MMIO. A single
+non-prefetchable window spanning both kinds prevents Linux from reserving a
+64-bit prefetchable BAR, even though mBoot mapped the BAR correctly.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ arch/x86/kernel/cpu/mboot.c | 26 ++++++++++++++++++--------
+ 1 file changed, 18 insertions(+), 8 deletions(-)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -286,7 +286,7 @@
+ };
+ 
+ static struct mboot_pci_frontend mboot_pci_devices[MBOOT_MAX_ASSIGNED_DEVICES];
+-static struct resource mboot_pci_bus_windows[256];
++static struct resource mboot_pci_bus_windows[256][2];
+ static struct pci_bus *mboot_pci_buses[256];
+ static unsigned int mboot_pci_device_count;
+ static struct irq_domain *mboot_irq_domain;
+@@ -641,9 +641,9 @@
+ static int __init mboot_pci_scan_bus(unsigned int bus_number)
+ {
+ 	struct pci_bus *bus;
+-	struct resource *window = &mboot_pci_bus_windows[bus_number];
+ 	struct pci_sysdata *sysdata;
+ 	unsigned int index;
++	bool found = false;
+ 	LIST_HEAD(resources);
+ 
+ 	sysdata = kzalloc(sizeof(*sysdata), GFP_KERNEL);
+@@ -661,6 +661,11 @@
+ 		     resource_index < device->resource_count; resource_index++) {
+ 			const struct mboot_pci_resource *resource =
+ 				&device->resources[resource_index];
++			u32 attributes = device->config[PCI_BASE_ADDRESS_0 / 4 +
++							 resource->bar_index];
++			bool prefetch = attributes & PCI_BASE_ADDRESS_MEM_PREFETCH;
++			struct resource *window =
++				&mboot_pci_bus_windows[bus_number][prefetch];
+ 			resource_size_t end = resource->guest_address +
+ 					      resource->length - 1;
+ 
+@@ -668,15 +673,21 @@
+ 				window->start = resource->guest_address;
+ 			if (!window->flags || end > window->end)
+ 				window->end = end;
+-			window->flags = IORESOURCE_MEM | IORESOURCE_PCI_FIXED;
+-			window->name = "mBoot PCI MMIO";
++			window->flags = IORESOURCE_MEM | IORESOURCE_PCI_FIXED |
++				(prefetch ? IORESOURCE_PREFETCH : 0);
++			window->name = prefetch ? "mBoot PCI prefetchable MMIO" :
++						  "mBoot PCI MMIO";
++			found = true;
+ 		}
+ 	}
+-	if (!window->flags) {
++	if (!found) {
+ 		kfree(sysdata);
+ 		return -ENODEV;
+ 	}
+-	pci_add_resource(&resources, window);
++	for (index = 0; index < ARRAY_SIZE(mboot_pci_bus_windows[bus_number]); index++)
++		if (mboot_pci_bus_windows[bus_number][index].flags)
++			pci_add_resource(&resources,
++					 &mboot_pci_bus_windows[bus_number][index]);
+ 	bus = pci_scan_root_bus(NULL, bus_number, &mboot_pci_ops, sysdata,
+ 				&resources);
+ 	if (!bus) {
+-- 
+2.39.5
