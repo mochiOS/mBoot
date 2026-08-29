@@ -58,6 +58,13 @@ storage_disk_guid = "6d426f6f-7400-4b00-8a00-00000000d101"
 storage_partition_type_guid = "6d6f6368-694f-5300-8000-6d5061727401"
 storage_partition_guid = "6d426f6f-7400-4b00-8a00-00000000d102"
 
+[[devices]]
+segment = 0
+requester = "auto"
+kind = "display"
+domain = 2
+required = true
+
 [[domains]]
 id = 2
 role = "hardware"

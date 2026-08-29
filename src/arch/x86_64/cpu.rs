@@ -1,4 +1,8 @@
-use core::arch::x86_64::{__cpuid, __cpuid_count};
+use core::arch::{
+    asm,
+    x86_64::{__cpuid, __cpuid_count},
+};
+use core::mem::size_of;
 
 use crate::BackendKind;
 
@@ -41,6 +45,44 @@ pub fn detect() -> CpuFeatures {
     }
 
     features
+}
+
+pub fn fill_hardware_random(destination: &mut [u8]) -> bool {
+    if __cpuid(1).ecx & (1 << 30) == 0 {
+        return false;
+    }
+    let mut previous = None;
+    for chunk in destination.chunks_mut(size_of::<u64>()) {
+        let mut sample = None;
+        for _ in 0..10 {
+            let value: u64;
+            let available: u8;
+            unsafe {
+                asm!(
+                    "rdrand {value}",
+                    "setc {available}",
+                    value = out(reg) value,
+                    available = out(reg_byte) available,
+                    options(nomem, nostack)
+                );
+            }
+            if available != 0 {
+                sample = Some(value);
+                break;
+            }
+        }
+        let Some(value) = sample else {
+            destination.fill(0);
+            return false;
+        };
+        if previous == Some(value) {
+            destination.fill(0);
+            return false;
+        }
+        previous = Some(value);
+        chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+    }
+    true
 }
 
 const fn vendor_bytes(ebx: u32, edx: u32, ecx: u32) -> [u8; 12] {

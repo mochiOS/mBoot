@@ -38,6 +38,7 @@ use mnu_abi::hypervisor::{
     GRANT_FLAG_WRITABLE, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED,
     HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
 };
+use sha2::{Digest, Sha256};
 use uefi::fs::Error as FsError;
 use uefi::prelude::*;
 #[cfg(feature = "uefi-net")]
@@ -46,9 +47,10 @@ use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::network::pxe::{BaseCode, DhcpV4Packet, Mode};
 #[cfg(feature = "uefi-net")]
 use uefi::proto::network::IpAddress;
+use uefi::proto::rng::Rng;
 #[cfg(feature = "uefi-net")]
 use uefi::table::boot::ScopedProtocol;
-use uefi::table::boot::{AllocateType, MemoryType};
+use uefi::table::boot::{AllocateType, BootServices, MemoryType};
 use uefi::table::cfg::ACPI2_GUID;
 #[cfg(feature = "uefi-net")]
 use uefi::CStr8;
@@ -116,6 +118,7 @@ struct PreparedDomain {
     vcpu_control_page: u64,
     msr_permission_map: u64,
     msr_state_page: u64,
+    entropy_root: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
@@ -150,6 +153,7 @@ struct RuntimeDomain {
     image_format: ManifestImageFormat,
     initramfs: Option<Vec<u8>>,
     command_line: String,
+    entropy_root: [u8; 32],
 }
 
 impl BootMemoryMap {
@@ -281,6 +285,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
 
     let boot_services = system_table.boot_services();
+    let Some(boot_entropy) = collect_boot_entropy(boot_services) else {
+        log!("no secure boot entropy source is available");
+        display::failure(61);
+        return Status::SECURITY_VIOLATION;
+    };
+    log!("secure boot entropy collected");
     let iommu_resources = match iommu_topology {
         Some(topology) => match allocate_iommu_resources(boot_services, topology) {
             Ok(tables) => tables,
@@ -476,6 +486,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             vcpu_control_page,
             msr_permission_map,
             msr_state_page,
+            entropy_root: boot_entropy,
         });
         runnable.push(true);
     }
@@ -751,7 +762,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             DEVICE_WINDOW_LIMIT - DEVICE_WINDOW_START,
             0,
             domain.capabilities(),
-        );
+        )
+        .with_entropy_seed(derive_domain_entropy(
+            &prepared.entropy_root,
+            prepared.id,
+            0,
+        ));
         let Some(boot_info_host) = domain
             .nested_pages()
             .guest_host_address(DOMAIN_BOOT_INFO_GPA, size_of::<DomainBootInfo>() as u64)
@@ -820,6 +836,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             image_format: prepared.image_format,
             initramfs: prepared.initramfs,
             command_line: prepared.command_line,
+            entropy_root: prepared.entropy_root,
         });
     }
 
@@ -1513,13 +1530,15 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 HYPERCALL_INVALID_ARGUMENT
             };
             if let Some(delivery) = delivery {
-                log!(
-                    "Event Channel {}:{} -> {}:{}",
-                    sender.get(),
-                    vm_exit.arg0,
-                    delivery.domain.get(),
-                    delivery.port
-                );
+                if delivery.first_delivery {
+                    log!(
+                        "Event Channel {}:{} -> {}:{}",
+                        sender.get(),
+                        vm_exit.arg0,
+                        delivery.domain.get(),
+                        delivery.port
+                    );
+                }
                 if let Some(target_index) = target_index {
                     if runtime_domains[target_index].waiting {
                         let port = event_channels
@@ -1973,7 +1992,12 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
         DEVICE_WINDOW_LIMIT - DEVICE_WINDOW_START,
         runtime.restart_count,
         runtime.domain.capabilities(),
-    );
+    )
+    .with_entropy_seed(derive_domain_entropy(
+        &runtime.entropy_root,
+        runtime.domain.id().get(),
+        runtime.restart_count,
+    ));
     let Some(boot_info_host) = runtime
         .domain
         .nested_pages()
@@ -2415,6 +2439,34 @@ fn allocate_page(boot_services: &BootServices) -> Result<u64, Status> {
     boot_services
         .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
         .map_err(|error| error.status())
+}
+
+fn collect_boot_entropy(boot_services: &BootServices) -> Option<[u8; 32]> {
+    let mut material = [0u8; 64];
+    let firmware_available = boot_services
+        .get_handle_for_protocol::<Rng>()
+        .ok()
+        .and_then(|handle| boot_services.open_protocol_exclusive::<Rng>(handle).ok())
+        .is_some_and(|mut rng| rng.get_rng(None, &mut material[..32]).is_ok());
+    let hardware_available = cpu::fill_hardware_random(&mut material[32..]);
+    if !firmware_available && !hardware_available {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"mBoot Domain entropy root v1");
+    hasher.update([u8::from(firmware_available), u8::from(hardware_available)]);
+    hasher.update(material);
+    material.fill(0);
+    Some(hasher.finalize().into())
+}
+
+fn derive_domain_entropy(root: &[u8; 32], domain_id: u32, restart_count: u32) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mBoot Domain entropy v1");
+    hasher.update(root);
+    hasher.update(domain_id.to_le_bytes());
+    hasher.update(restart_count.to_le_bytes());
+    hasher.finalize().into()
 }
 
 fn allocate_msr_permission_map(

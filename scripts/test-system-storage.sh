@@ -6,6 +6,7 @@ IMAGE=${HV_DISK_IMAGE:?HV_DISK_IMAGE is required}
 SOURCE_ROOT_DISK=${MOCHIOS_ROOT_DISK:?MOCHIOS_ROOT_DISK is required}
 QEMU=${QEMU:-qemu-system-x86_64}
 KEEP_ARTIFACTS=${KEEP_SYSTEM_STORAGE_ARTIFACTS:-0}
+DESKTOP_MARKER=${SYSTEM_STORAGE_DESKTOP_MARKER:-}
 ACCEL=${HV_ACCEL:-auto}
 if [[ $ACCEL == auto ]]; then
     if [[ -r /dev/kvm && -w /dev/kvm ]]; then
@@ -89,7 +90,9 @@ suffix_before=$(dd if="$WORK/system-root.img" bs=512 skip="$((target_last + 1))"
     -device virtio-blk-pci,drive=boot,addr=0x2,bootindex=1 \
     -drive "if=none,id=system,format=raw,file=$WORK/system-root.img" \
     -device virtio-blk-pci,drive=system,addr=0x3,disable-legacy=on,iommu_platform=on \
+    -device virtio-gpu-pci,addr=0x4,disable-legacy=on,iommu_platform=on,xres=320,yres=200 \
     -device amd-iommu,dma-remap=on \
+    -vga none \
     -display none \
     -monitor none \
     -serial "file:$WORK/serial.log" \
@@ -99,10 +102,16 @@ suffix_before=$(dd if="$WORK/system-root.img" bs=512 skip="$((target_last + 1))"
 QEMU_PID=$!
 
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
+    marker_ready=1
+    if [[ -n $DESKTOP_MARKER ]] \
+        && ! grep -Fq "$DESKTOP_MARKER" "$WORK/serial.log" 2>/dev/null; then
+        marker_ready=0
+    fi
     if grep -Fq '[Domain 1] [INFO]  mDriver storage mounted (read-write)' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver: block data I/O completed' "$WORK/serial.log" \
         && grep -Fq 'cext: loaded bundle ext2' "$WORK/serial.log" \
-        && grep -Fq '[mBoot] Hardware Domain 2 ready' "$WORK/serial.log"; then
+        && grep -Fq '[mBoot] Hardware Domain 2 ready' "$WORK/serial.log" \
+        && [[ $marker_ready == 1 ]]; then
         kill "$QEMU_PID" 2>/dev/null || true
         wait "$QEMU_PID" 2>/dev/null || true
         QEMU_PID=
@@ -117,7 +126,7 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
             echo 'data outside the enrolled partition changed' >&2
             exit 1
         }
-        grep -E 'Hardware Domain 2 ready|block data I/O completed|mDriver storage|loaded bundle ext2' "$WORK/serial.log"
+        grep -E 'Hardware Domain 2 ready|block data I/O completed|mDriver storage|loaded bundle ext2|Binder.app' "$WORK/serial.log"
         echo 'test-system-storage: PASS'
         exit 0
     fi

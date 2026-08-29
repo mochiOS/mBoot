@@ -95,7 +95,14 @@ global_asm!(
     "push r15",
     "push rdi",
     "push rsi",
-    "mov rax, [rsp]",
+    "push rdx",
+    // VMRUN does not switch the complete syscall/segment MSR set. Save the
+    // host extension state, then load the state belonging to this vCPU.
+    "mov rax, rdx",
+    "vmsave rax",
+    "mov rax, rdi",
+    "vmload rax",
+    "mov rax, [rsp + 8]",
     "mov rbx, [rax + 32]",
     "mov rbp, [rax + 40]",
     "mov r12, [rax + 48]",
@@ -110,15 +117,10 @@ global_asm!(
     "mov r9, [rax + 96]",
     "mov r10, [rax + 104]",
     "mov r11, [rax + 112]",
-    "mov rax, [rsp + 8]",
+    "mov rax, [rsp + 16]",
     "sti",
     "vmrun rax",
-    // VMEXIT clears GIF. Briefly open it so the pending host interrupt is
-    // dispatched through mBoot's IDT, then close it before handling the exit.
-    "stgi",
-    "nop",
-    "clgi",
-    "cli",
+    // Capture every guest GPR before restoring host extension state.
     "push rbx",
     "push rbp",
     "push r12",
@@ -133,7 +135,19 @@ global_asm!(
     "push r9",
     "push r10",
     "push r11",
+    // Persist this vCPU's syscall/segment MSRs and restore mBoot's values
+    // before a host interrupt handler can run.
+    "mov rax, [rsp + 128]",
+    "vmsave rax",
     "mov rax, [rsp + 112]",
+    "vmload rax",
+    // VMEXIT clears GIF. Briefly open it so the pending host interrupt is
+    // dispatched through mBoot's IDT, then close it before handling the exit.
+    "stgi",
+    "nop",
+    "clgi",
+    "cli",
+    "mov rax, [rsp + 120]",
     "mov rcx, [rsp + 104]",
     "mov [rax + 32], rcx",
     "mov rcx, [rsp + 96]",
@@ -163,7 +177,7 @@ global_asm!(
     "mov rcx, [rsp]",
     "mov [rax + 112], rcx",
     "add rsp, 112",
-    "add rsp, 16",
+    "add rsp, 24",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -174,7 +188,7 @@ global_asm!(
 );
 
 unsafe extern "sysv64" {
-    fn mboot_svm_enter(vmcb: u64, context: *mut SvmRunContext);
+    fn mboot_svm_enter(vmcb: u64, context: *mut SvmRunContext, host_save: u64);
 }
 
 pub struct Svm {
@@ -404,9 +418,10 @@ impl Svm {
         if !self.active || !self.started {
             return Err(Error::InvalidState);
         }
-        // V_IRQ remains pending in the VMCB until IF, GIF and the interrupt
-        // shadow permit delivery, so SVM can accept it immediately.
-        Ok(true)
+        // V_IRQ remains set until IF, GIF and the interrupt shadow permit the
+        // guest to accept it. Reusing the injection slot before then would
+        // replace the pending vector and lose an interrupt from another device.
+        Ok(unsafe { read_u64(self.vmcb_phys, VMCB_INTERRUPT_CONTROL) } & V_IRQ == 0)
     }
 
     /// Requests an ASID translation flush before the next VMRUN.
@@ -427,7 +442,7 @@ impl Svm {
         super::timer::prepare_entry();
         // SAFETY: EFER.SVME and VM_HSAVE_PA are configured. The assembly bridge
         // preserves host callee-saved registers and captures guest registers.
-        unsafe { mboot_svm_enter(self.vmcb_phys, &raw mut self.run_context) };
+        unsafe { mboot_svm_enter(self.vmcb_phys, &raw mut self.run_context, self.hsave_phys) };
 
         // SAFETY: VMEXIT completed and the processor wrote the control area.
         let exit_code = unsafe { read_u64(self.vmcb_phys, VMCB_EXIT_CODE) };

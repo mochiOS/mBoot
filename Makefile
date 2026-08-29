@@ -11,6 +11,13 @@ MOCHIOS_INITFS ?=
 CARGO ?= $(shell command -v cargo 2>/dev/null)
 RUSTC ?= $(shell command -v rustc 2>/dev/null)
 MNU_ABI_PATCH = $(if $(wildcard $(MNU_DIR)/crates/abi/Cargo.toml),--config 'patch."https://github.com/mochiOS/mnu".mnu-abi.path="$(MNU_DIR)/crates/abi"')
+MBOOT_INPUTS := $(shell find $(CURDIR)/src $(CURDIR)/scripts -type f -print 2>/dev/null) \
+	$(CURDIR)/Cargo.toml $(CURDIR)/Cargo.lock
+MNU_INPUTS := $(shell find $(MNU_DIR)/src $(MNU_DIR)/crates/abi/src \
+	-type f -print 2>/dev/null) \
+	$(wildcard $(MNU_DIR)/Cargo.toml $(MNU_DIR)/crates/abi/Cargo.toml)
+IMAGE_INPUTS := $(MBOOT_INPUTS) $(MNU_INPUTS) $(CONFIG) \
+	$(wildcard $(MDRIVER_KERNEL) $(MDRIVER_INITRAMFS) $(MOCHIOS_INITFS))
 
 .PHONY: all build clean device-io-test mdriver-test help image image-test qemu-test setup test
 .PHONY: hv-build hv-device-io-test hv-mdriver-test hv-image hv-image-test hv-qemu-test hv-test
@@ -32,7 +39,9 @@ test:
 	@test -n "$(CARGO)" || { echo 'cargo was not found' >&2; exit 1; }
 	$(CARGO) test --package mboot --lib $(MNU_ABI_PATCH)
 
-image: $(SETUP_STAMP)
+image: $(IMAGE)
+
+$(IMAGE): $(SETUP_STAMP) $(IMAGE_INPUTS)
 	@test -f "$(MNU_DIR)/Cargo.toml" || { \
 		echo 'mnu repository was not found; set MNU_DIR=/path/to/mnu' >&2; exit 1; \
 	}

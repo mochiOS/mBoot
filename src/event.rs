@@ -15,6 +15,7 @@ struct Endpoint {
     domain: DomainId,
     port: u32,
     pending: bool,
+    delivery_reported: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +28,7 @@ struct EventChannel {
 pub struct EventDelivery {
     pub domain: DomainId,
     pub port: u32,
+    pub first_delivery: bool,
 }
 
 pub struct EventChannelTable {
@@ -61,11 +63,13 @@ impl EventChannelTable {
                 domain: domain_a,
                 port: port_a,
                 pending: false,
+                delivery_reported: false,
             },
             b: Endpoint {
                 domain: domain_b,
                 port: port_b,
                 pending: false,
+                delivery_reported: false,
             },
         });
         Ok(())
@@ -75,16 +79,22 @@ impl EventChannelTable {
         for channel in self.channels.iter_mut().flatten() {
             if channel.a.domain == sender && channel.a.port == port {
                 channel.b.pending = true;
+                let first_delivery = !channel.b.delivery_reported;
+                channel.b.delivery_reported = true;
                 return Ok(EventDelivery {
                     domain: channel.b.domain,
                     port: channel.b.port,
+                    first_delivery,
                 });
             }
             if channel.b.domain == sender && channel.b.port == port {
                 channel.a.pending = true;
+                let first_delivery = !channel.a.delivery_reported;
+                channel.a.delivery_reported = true;
                 return Ok(EventDelivery {
                     domain: channel.a.domain,
                     port: channel.a.port,
+                    first_delivery,
                 });
             }
         }
@@ -151,6 +161,7 @@ mod tests {
             Ok(EventDelivery {
                 domain: DomainId::new(2),
                 port: 11,
+                first_delivery: true,
             })
         );
         assert_eq!(table.receive(DomainId::new(1)), None);
@@ -160,6 +171,7 @@ mod tests {
             Ok(EventDelivery {
                 domain: DomainId::new(1),
                 port: 7,
+                first_delivery: true,
             })
         );
         assert_eq!(table.receive(DomainId::new(1)), Some(7));
@@ -175,8 +187,12 @@ mod tests {
         table
             .connect(DomainId::new(1), 1, DomainId::new(2), 1)
             .unwrap();
-        assert!(table.send(DomainId::new(1), 1).is_ok());
-        assert!(table.send(DomainId::new(1), 1).is_ok());
+        assert!(table
+            .send(DomainId::new(1), 1)
+            .is_ok_and(|delivery| delivery.first_delivery));
+        assert!(table
+            .send(DomainId::new(1), 1)
+            .is_ok_and(|delivery| !delivery.first_delivery));
         assert!(table.has_pending(DomainId::new(2)));
         assert_eq!(table.receive(DomainId::new(2)), Some(1));
         assert!(!table.has_pending(DomainId::new(2)));
