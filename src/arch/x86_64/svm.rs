@@ -8,6 +8,10 @@ const EFER: u32 = 0xc000_0080;
 const VM_CR: u32 = 0xc001_0114;
 const VM_HSAVE_PA: u32 = 0xc001_0117;
 const EFER_SVME: u64 = 1 << 12;
+const EFER_SCE: u64 = 1 << 0;
+const EFER_LME: u64 = 1 << 8;
+const EFER_NXE: u64 = 1 << 11;
+const CR0_PAGING: u64 = 1 << 31;
 const VM_CR_SVMDIS: u64 = 1 << 4;
 
 const VMCB_INTERCEPT_MISC1: usize = 0x00c;
@@ -480,17 +484,9 @@ impl Svm {
             return Err(Error::InvalidState);
         }
         let current = unsafe { read_u64(self.vmcb_phys, VMCB_EFER) };
-        let writable = (1 << 0) | (1 << 11);
-        if value & !writable != current & !writable {
-            return Err(Error::InvalidState);
-        }
-        unsafe {
-            write_u64(
-                self.vmcb_phys,
-                VMCB_EFER,
-                (current & !writable) | (value & writable),
-            )
-        };
+        let cr0 = unsafe { read_u64(self.vmcb_phys, VMCB_CR0) };
+        let updated = updated_guest_efer(current, cr0, value).ok_or(Error::InvalidState)?;
+        unsafe { write_u64(self.vmcb_phys, VMCB_EFER, updated) };
         Ok(())
     }
 
@@ -747,6 +743,17 @@ fn validate_page(phys: u64) -> Result<(), Error> {
     }
 }
 
+fn updated_guest_efer(current: u64, cr0: u64, requested: u64) -> Option<u64> {
+    let writable = EFER_SCE | EFER_LME | EFER_NXE;
+    if requested & !writable != current & !writable {
+        return None;
+    }
+    if cr0 & CR0_PAGING != 0 && (requested ^ current) & EFER_LME != 0 {
+        return None;
+    }
+    Some((current & !writable) | (requested & writable))
+}
+
 const fn valid_guest_asid(asid: u32, address_space_ids: u32) -> bool {
     asid != 0 && asid < address_space_ids
 }
@@ -775,5 +782,18 @@ mod tests {
         assert!(valid_guest_asid(1, 16));
         assert!(valid_guest_asid(15, 16));
         assert!(!valid_guest_asid(16, 16));
+    }
+
+    #[test]
+    fn efer_lme_can_change_only_while_paging_is_disabled() {
+        assert_eq!(
+            updated_guest_efer(EFER_SVME, 0, EFER_SVME | EFER_LME),
+            Some(EFER_SVME | EFER_LME)
+        );
+        assert_eq!(
+            updated_guest_efer(EFER_SVME, CR0_PAGING, EFER_SVME | EFER_LME),
+            None
+        );
+        assert_eq!(updated_guest_efer(EFER_SVME, 0, 0), None);
     }
 }

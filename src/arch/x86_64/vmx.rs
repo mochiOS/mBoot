@@ -34,6 +34,11 @@ const IA32_EFER: u32 = 0xc000_0080;
 const FEATURE_CONTROL_LOCK: u64 = 1 << 0;
 const FEATURE_CONTROL_VMX_OUTSIDE_SMX: u64 = 1 << 2;
 const CR4_VMXE: u64 = 1 << 13;
+const CR0_PAGING: u64 = 1 << 31;
+const EFER_SCE: u64 = 1 << 0;
+const EFER_LME: u64 = 1 << 8;
+const EFER_LMA: u64 = 1 << 10;
+const EFER_NXE: u64 = 1 << 11;
 
 const PIN_BASED_CONTROLS: u64 = 0x4000;
 const PRIMARY_CONTROLS: u64 = 0x4002;
@@ -482,6 +487,7 @@ impl Vmx {
             ..VmxRunContext::default()
         };
         super::timer::prepare_entry();
+        unsafe { synchronize_guest_long_mode()? };
         // SAFETY: The VMCS host RIP/RSP target the assembly return trampoline.
         if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
             // SAFETY: VMfailValid leaves the current VMCS readable. A zero value
@@ -512,6 +518,7 @@ impl Vmx {
         self.run_context.rax = result;
         self.run_context.resume = 1;
         super::timer::prepare_entry();
+        unsafe { synchronize_guest_long_mode()? };
         // SAFETY: The VMCS and captured register state belong to this stopped vCPU.
         if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
             // SAFETY: VMfailValid leaves the current VMCS readable. A zero value
@@ -531,6 +538,7 @@ impl Vmx {
         unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
         self.run_context.resume = 1;
         super::timer::prepare_entry();
+        unsafe { synchronize_guest_long_mode()? };
         if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
             return Err(Error::GuestEntryFailed(unsafe {
                 vmread(VM_INSTRUCTION_ERROR)
@@ -571,6 +579,7 @@ impl Vmx {
         unsafe { vmwrite(GUEST_RIP, rip + instruction_len)? };
         self.run_context.resume = 1;
         super::timer::prepare_entry();
+        unsafe { synchronize_guest_long_mode()? };
         if unsafe { mboot_vmx_launch(&raw mut self.run_context) } != 0 {
             return Err(Error::GuestEntryFailed(unsafe {
                 vmread(VM_INSTRUCTION_ERROR)
@@ -709,11 +718,9 @@ impl Vmx {
         }
         unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
         let current = unsafe { vmread(GUEST_EFER) };
-        let writable = (1 << 0) | (1 << 11);
-        if value & !writable != current & !writable {
-            return Err(Error::InvalidState);
-        }
-        unsafe { vmwrite(GUEST_EFER, (current & !writable) | (value & writable)) }
+        let cr0 = unsafe { vmread(GUEST_CR0) };
+        let updated = updated_guest_efer(current, cr0, value).ok_or(Error::InvalidState)?;
+        unsafe { vmwrite(GUEST_EFER, updated) }
     }
 
     unsafe fn decode_exit(&self) -> Result<VmExit, Error> {
@@ -1146,6 +1153,28 @@ unsafe fn initialize_host_state() -> Result<(), Error> {
     Ok(())
 }
 
+unsafe fn synchronize_guest_long_mode() -> Result<(), Error> {
+    let efer = unsafe { vmread(GUEST_EFER) };
+    let mut controls = unsafe { vmread(ENTRY_CONTROLS) };
+    if efer & EFER_LMA != 0 {
+        controls |= 1 << 9;
+    } else {
+        controls &= !(1 << 9);
+    }
+    unsafe { vmwrite(ENTRY_CONTROLS, controls) }
+}
+
+fn updated_guest_efer(current: u64, cr0: u64, requested: u64) -> Option<u64> {
+    let writable = EFER_SCE | EFER_LME | EFER_NXE;
+    if requested & !writable != current & !writable {
+        return None;
+    }
+    if cr0 & CR0_PAGING != 0 && (requested ^ current) & EFER_LME != 0 {
+        return None;
+    }
+    Some((current & !writable) | (requested & writable))
+}
+
 unsafe fn initialize_guest_msr_lists(page: u64) -> Result<(), Error> {
     validate_page(page)?;
     unsafe { write_bytes(page as *mut u8, 0, 4096) };
@@ -1374,5 +1403,16 @@ mod tests {
         assert!(!supports_ept(primary, secondary, capabilities & !(1 << 25)));
         assert!(!supports_ept(0, secondary, capabilities));
         assert!(!supports_ept(primary, 0, capabilities));
+    }
+
+    #[test]
+    fn efer_lme_can_change_only_while_paging_is_disabled() {
+        assert_eq!(updated_guest_efer(0, 0, EFER_LME), Some(EFER_LME));
+        assert_eq!(updated_guest_efer(0, CR0_PAGING, EFER_LME), None);
+        assert_eq!(
+            updated_guest_efer(EFER_LME | EFER_LMA, CR0_PAGING, EFER_LME | EFER_LMA),
+            Some(EFER_LME | EFER_LMA)
+        );
+        assert_eq!(updated_guest_efer(0, 0, EFER_LMA), None);
     }
 }
