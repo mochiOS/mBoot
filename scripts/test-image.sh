@@ -8,20 +8,31 @@ QEMU=${QEMU:-qemu-system-x86_64}
 ACCEL=${HV_ACCEL:-kvm}
 CPU=${HV_CPU:-host}
 TIMEOUT_SECONDS=${HV_TIMEOUT_SECONDS:-30}
+MEMORY_MIB=${HV_MEMORY_MIB:-1024}
 OVMF_CODE="$ROOT/firmware/OVMF_CODE_4M.fd"
 OVMF_VARS="$ROOT/firmware/OVMF_VARS_4M.fd"
 DOMAIN_COUNT=$($ROOT/scripts/config-value.pl "$CONFIG" domain_count)
 SYSTEM_IMAGE=$($ROOT/scripts/config-value.pl "$CONFIG" system_image)
 HARDWARE_BOOTSTRAP_ID=$($ROOT/scripts/config-value.pl "$CONFIG" hardware_bootstrap_id)
 GPU_TEST=${HV_GPU_TEST:-0}
+DESKTOP_MARKER=${HV_DESKTOP_MARKER:-}
+IOMMU_TEST=${HV_IOMMU_TEST:-intel}
 
 QEMU_GPU_ARGS=()
 if [[ $GPU_TEST == 1 ]]; then
-    QEMU_GPU_ARGS+=(
-        -device intel-iommu,intremap=on
-        -vga none
-        -device virtio-vga
-    )
+    if [[ $IOMMU_TEST == amd ]]; then
+        QEMU_GPU_ARGS+=(
+            -device amd-iommu,dma-remap=on
+            -vga none
+            -device virtio-gpu-pci,disable-legacy=on,iommu_platform=on
+        )
+    else
+        QEMU_GPU_ARGS+=(
+            -device intel-iommu,intremap=on
+            -vga none
+            -device virtio-vga
+        )
+    fi
 fi
 
 test -s "$IMAGE" || { echo "missing image: $IMAGE" >&2; exit 1; }
@@ -48,7 +59,7 @@ cp --sparse=always "$IMAGE" "$WORK/mochiOS.img"
     -machine q35 \
     -boot menu=off,strict=on \
     -smp 1 \
-    -m 512 \
+    -m "$MEMORY_MIB" \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd" \
     -drive "if=none,id=disk,format=raw,file=$WORK/mochiOS.img" \
@@ -70,9 +81,15 @@ else
     expected="[mBoot] bootstrap complete; $DOMAIN_COUNT Domain"
 fi
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
+    marker_ready=1
+    if [[ -n $DESKTOP_MARKER ]] \
+        && ! grep -Fq "$DESKTOP_MARKER" "$WORK/serial.log" 2>/dev/null; then
+        marker_ready=0
+    fi
     if grep -Fq "$expected" "$WORK/serial.log" 2>/dev/null \
         && { [[ $HARDWARE_BOOTSTRAP_ID == 0 ]] \
-            || grep -Fq "[mBoot] Hardware Domain $HARDWARE_BOOTSTRAP_ID ready" "$WORK/serial.log" 2>/dev/null; }; then
+            || grep -Fq "[mBoot] Hardware Domain $HARDWARE_BOOTSTRAP_ID ready" "$WORK/serial.log" 2>/dev/null; } \
+        && [[ $marker_ready == 1 ]]; then
         break
     fi
     kill -0 "$QEMU_PID" 2>/dev/null || break
@@ -83,6 +100,13 @@ grep -Fq "$expected" "$WORK/serial.log" || {
     echo "hypervisor image did not reach its expected Domain state" >&2
     exit 1
 }
+if [[ -n $DESKTOP_MARKER ]]; then
+    grep -Fq "$DESKTOP_MARKER" "$WORK/serial.log" || {
+        sed -n '1,260p' "$WORK/serial.log" >&2
+        echo "desktop marker was not reached: $DESKTOP_MARKER" >&2
+        exit 1
+    }
+fi
 if [[ $HARDWARE_BOOTSTRAP_ID != 0 ]]; then
     grep -Fq "[mBoot] Hardware Domain $HARDWARE_BOOTSTRAP_ID ready" "$WORK/serial.log" || {
         sed -n '1,200p' "$WORK/serial.log" >&2

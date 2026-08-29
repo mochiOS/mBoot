@@ -60,6 +60,7 @@ const MAX_MEMORY_REGIONS: usize = 256;
 const MAX_GUEST_MEMORY_PAGES: usize = 65_536;
 const GRANT_WINDOW_PAGES: usize = 16;
 const DEVICE_WINDOW_PAGES: usize = 64;
+const DOMAIN_STACK_BYTES: u64 = 1024 * 1024;
 const DEVICE_WINDOW_START: u64 = 0x1000_0000;
 const DEVICE_WINDOW_LIMIT: u64 = mnu_abi::hypervisor::DOMAIN_DEVICE_ADDRESS_LIMIT;
 const SPARSE_LEVEL2_PAGES: usize = 512;
@@ -697,7 +698,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                         image::load_boot_module(
                             module,
                             guest_image.loaded_end(),
-                            grant_window_start(&nested),
+                            domain_stack_bottom(&nested),
                             &nested,
                         )
                     } {
@@ -804,7 +805,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 nested_root: domain.nested_pages().hardware_root(),
                 page_table_root: guest_cr3,
                 entry: guest_image.entry(),
-                stack: device_window_start(domain.nested_pages()) - 16,
+                stack: domain_stack_pointer(domain.nested_pages()),
                 boot_info: if prepared.image_format == ManifestImageFormat::NativeElf {
                     DOMAIN_BOOT_INFO_GPA
                 } else {
@@ -1961,7 +1962,7 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
                     image::load_boot_module(
                         module,
                         guest_image.loaded_end(),
-                        grant_window_start(runtime.domain.nested_pages()),
+                        domain_stack_bottom(runtime.domain.nested_pages()),
                         runtime.domain.nested_pages(),
                     )
                 } {
@@ -2020,6 +2021,7 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
     }
     runtime.guest.page_table_root = page_table_root;
     runtime.guest.entry = guest_image.entry();
+    runtime.guest.stack = domain_stack_pointer(runtime.domain.nested_pages());
     runtime.guest.boot_info = if runtime.image_format == ManifestImageFormat::NativeElf {
         DOMAIN_BOOT_INFO_GPA
     } else {
@@ -2376,6 +2378,14 @@ fn grant_window_start(memory: &NestedPageTable) -> u64 {
 
 fn device_window_start(memory: &NestedPageTable) -> u64 {
     grant_window_start(memory) - DEVICE_WINDOW_PAGES as u64 * 4096
+}
+
+fn domain_stack_bottom(memory: &NestedPageTable) -> u64 {
+    device_window_start(memory) - DOMAIN_STACK_BYTES
+}
+
+fn domain_stack_pointer(memory: &NestedPageTable) -> u64 {
+    device_window_start(memory) - 16
 }
 
 fn grant_window_contains(memory: &NestedPageTable, guest_page: u64) -> bool {

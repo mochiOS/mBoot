@@ -1,7 +1,7 @@
 version = 6
 toolchain = "nightly-2026-05-14"
-disk_size_mib = 128
-esp_size_mib = 96
+disk_size_mib = 224
+esp_size_mib = 192
 disk_guid = "6d426f6f-7400-4b00-8a00-000000000700"
 esp_guid = "6d426f6f-7400-4b00-8a00-000000000701"
 
@@ -44,6 +44,13 @@ domain_a = 1
 port_a = 4
 domain_b = 2
 port_b = 4
+
+[[devices]]
+segment = 0
+requester = "auto"
+kind = "display"
+domain = 2
+required = true
 
 [[domains]]
 id = 2
