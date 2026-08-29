@@ -1759,7 +1759,20 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             stopped_domains,
             crashed_domains
         );
-        display::isolation_success();
+        // `isolate_crashed_domain` already showed the failure, but another
+        // Domain may have updated the framebuffer before the scheduler became
+        // idle.  A crashed required Domain is not a successful isolation boot:
+        // keep its diagnostic visible instead of replacing it with a green
+        // `ISOLATION OK` screen.
+        if let Some(crash) = runtime_domains.iter().find_map(|runtime| {
+            (runtime.domain.state() == DomainState::Crashed)
+                .then_some(runtime.crash_info)
+                .flatten()
+        }) {
+            display::domain_crash(crash.domain_id, crash.raw_reason);
+        } else {
+            display::failure(53);
+        }
     } else {
         log!(
             "{} resident Domain(s) waiting; {} crash(es) isolated",
