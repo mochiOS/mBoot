@@ -338,4 +338,26 @@ impl Virtualization {
             Virtualization::Amd(svm) => unsafe { svm.guest_instruction_pointer() },
         }
     }
+
+    /// Reads an intercepted architectural MSR from stopped guest state.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped on its owner CPU.
+    pub unsafe fn read_guest_msr(&self, msr: u32) -> Result<u64, Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.read_guest_msr(msr) },
+            Virtualization::Amd(svm) => unsafe { svm.read_guest_msr(msr) },
+        }
+    }
+
+    /// Writes an intercepted architectural MSR into stopped guest state.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped on its owner CPU.
+    pub unsafe fn write_guest_msr(&mut self, msr: u32, value: u64) -> Result<(), Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe { vmx.write_guest_msr(msr, value) },
+            Virtualization::Amd(svm) => unsafe { svm.write_guest_msr(msr, value) },
+        }
+    }
 }

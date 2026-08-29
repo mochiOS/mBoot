@@ -448,6 +448,40 @@ impl Svm {
         Ok(unsafe { read_u64(self.vmcb_phys, VMCB_RIP) })
     }
 
+    /// Emulates an intercepted architectural MSR read from stopped guest state.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped and remain owned by the current SVM-enabled CPU.
+    pub unsafe fn read_guest_msr(&self, msr: u32) -> Result<u64, Error> {
+        if !self.active || msr != EFER {
+            return Err(Error::InvalidState);
+        }
+        Ok(unsafe { read_u64(self.vmcb_phys, VMCB_EFER) })
+    }
+
+    /// Emulates an intercepted architectural MSR write into stopped guest state.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped and remain owned by the current SVM-enabled CPU.
+    pub unsafe fn write_guest_msr(&mut self, msr: u32, value: u64) -> Result<(), Error> {
+        if !self.active || msr != EFER {
+            return Err(Error::InvalidState);
+        }
+        let current = unsafe { read_u64(self.vmcb_phys, VMCB_EFER) };
+        let writable = (1 << 0) | (1 << 11);
+        if value & !writable != current & !writable {
+            return Err(Error::InvalidState);
+        }
+        unsafe {
+            write_u64(
+                self.vmcb_phys,
+                VMCB_EFER,
+                (current & !writable) | (value & writable),
+            )
+        };
+        Ok(())
+    }
+
     unsafe fn enter(&mut self) -> Result<VmExit, Error> {
         // SAFETY: The stopped guest owns its VMCB RAX field.
         unsafe { write_u64(self.vmcb_phys, VMCB_RAX, self.run_context.rax) };

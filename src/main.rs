@@ -1022,24 +1022,38 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             if runtime.interrupts.update_timer(timer::now()).is_err() {
                 halt_with_error("Virtual APIC timer", mboot::Error::InvalidState)
             }
-            runtime.resume_kind = match runtime.interrupts.read_msr(vm_exit.msr) {
-                Ok(value) => ResumeKind::MsrRead(value),
-                Err(_) => ResumeKind::GeneralProtection,
-            };
+            let value = runtime
+                .interrupts
+                .read_msr(vm_exit.msr)
+                .ok()
+                .or_else(|| unsafe {
+                    runtime
+                        .virtualization
+                        .read_guest_msr(vm_exit.msr)
+                        .ok()
+                });
+            runtime.resume_kind =
+                value.map_or(ResumeKind::GeneralProtection, ResumeKind::MsrRead);
             continue;
         }
         if vm_exit.reason == VmExitReason::MsrWrite {
             if runtime.interrupts.update_timer(timer::now()).is_err() {
                 halt_with_error("Virtual APIC timer", mboot::Error::InvalidState)
             }
-            runtime.resume_kind = if runtime
+            let written = runtime
                 .interrupts
                 .write_msr(vm_exit.msr, vm_exit.msr_value)
-                .is_err()
-            {
-                ResumeKind::GeneralProtection
-            } else {
+                .is_ok()
+                || unsafe {
+                    runtime
+                        .virtualization
+                        .write_guest_msr(vm_exit.msr, vm_exit.msr_value)
+                        .is_ok()
+                };
+            runtime.resume_kind = if written {
                 ResumeKind::MsrWrite
+            } else {
+                ResumeKind::GeneralProtection
             };
             continue;
         }

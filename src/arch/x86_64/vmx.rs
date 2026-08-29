@@ -674,6 +674,35 @@ impl Vmx {
         Ok(unsafe { vmread(GUEST_RIP) })
     }
 
+    /// Emulates an intercepted architectural MSR read from stopped guest state.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped and remain owned by the current VMX-enabled CPU.
+    pub unsafe fn read_guest_msr(&self, msr: u32) -> Result<u64, Error> {
+        if !self.active || msr != IA32_EFER {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
+        Ok(unsafe { vmread(GUEST_EFER) })
+    }
+
+    /// Emulates an intercepted architectural MSR write into stopped guest state.
+    ///
+    /// # Safety
+    /// The vCPU must be stopped and remain owned by the current VMX-enabled CPU.
+    pub unsafe fn write_guest_msr(&mut self, msr: u32, value: u64) -> Result<(), Error> {
+        if !self.active || msr != IA32_EFER {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
+        let current = unsafe { vmread(GUEST_EFER) };
+        let writable = (1 << 0) | (1 << 11);
+        if value & !writable != current & !writable {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmwrite(GUEST_EFER, (current & !writable) | (value & writable)) }
+    }
+
     unsafe fn decode_exit(&self) -> Result<VmExit, Error> {
         // SAFETY: A VM exit returned through the configured host trampoline.
         let reason = unsafe { vmread(EXIT_REASON) } & 0xffff;
