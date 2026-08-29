@@ -54,6 +54,10 @@ const ENTRY_MSR_LOAD_COUNT: u64 = 0x4014;
 const ENTRY_INTERRUPTION_INFO: u64 = 0x4016;
 const ENTRY_EXCEPTION_ERROR_CODE: u64 = 0x4018;
 const SECONDARY_CONTROLS: u64 = 0x401e;
+const CR0_GUEST_HOST_MASK: u64 = 0x6000;
+const CR4_GUEST_HOST_MASK: u64 = 0x6002;
+const CR0_READ_SHADOW: u64 = 0x6004;
+const CR4_READ_SHADOW: u64 = 0x6006;
 const MSR_BITMAP: u64 = 0x2004;
 const EXIT_MSR_STORE_ADDRESS: u64 = 0x2006;
 const EXIT_MSR_LOAD_ADDRESS: u64 = 0x2008;
@@ -1091,23 +1095,41 @@ unsafe fn initialize_guest_state(config: GuestConfig) -> Result<(), Error> {
     }
     // SAFETY: All remaining values satisfy IA-32e guest VM-entry checks.
     unsafe {
+        let requested_cr0 = if pvh { 0x11 } else { 0x8001_0033 };
+        let requested_cr4 = if pvh { 0 } else { 1 << 5 };
+        let cr0_fixed0 = read_msr(IA32_VMX_CR0_FIXED0);
+        let cr0_fixed1 = read_msr(IA32_VMX_CR0_FIXED1);
+        let cr4_fixed0 = read_msr(IA32_VMX_CR4_FIXED0);
+        let cr4_fixed1 = read_msr(IA32_VMX_CR4_FIXED1);
         let mut guest_cr0 = adjusted_control_register(
-            if pvh { 0x11 } else { 0x8001_0033 },
-            read_msr(IA32_VMX_CR0_FIXED0),
-            read_msr(IA32_VMX_CR0_FIXED1),
+            requested_cr0,
+            cr0_fixed0,
+            cr0_fixed1,
         );
         if pvh {
             guest_cr0 &= !(1 << 31);
             guest_cr0 |= 1;
         }
         let guest_cr4 = adjusted_control_register(
-            if pvh { 0 } else { 1 << 5 },
-            read_msr(IA32_VMX_CR4_FIXED0),
-            read_msr(IA32_VMX_CR4_FIXED1),
+            requested_cr4,
+            cr4_fixed0,
+            cr4_fixed1,
         );
         vmwrite(GUEST_CR0, guest_cr0)?;
         vmwrite(GUEST_CR3, if pvh { 0 } else { config.page_table_root })?;
         vmwrite(GUEST_CR4, guest_cr4)?;
+        // VMX may require CR0.NE and CR4.VMXE even when ordinary guest
+        // software is allowed to clear them. Keep those host-required bits in
+        // the VMCS while the read shadows expose the architectural guest view.
+        // PE and PG remain guest-owned under unrestricted-guest execution so a
+        // PVH kernel can perform its own protected/long-mode transition.
+        vmwrite(
+            CR0_GUEST_HOST_MASK,
+            fixed_mask_for_guest(cr0_fixed0, (1 << 0) | CR0_PAGING),
+        )?;
+        vmwrite(CR4_GUEST_HOST_MASK, fixed_mask_for_guest(cr4_fixed0, 0))?;
+        vmwrite(CR0_READ_SHADOW, requested_cr0)?;
+        vmwrite(CR4_READ_SHADOW, requested_cr4)?;
         vmwrite(GUEST_DR7, 0x400)?;
         vmwrite(GUEST_RSP, config.stack)?;
         vmwrite(GUEST_RIP, config.entry)?;
@@ -1186,6 +1208,10 @@ fn updated_guest_efer(current: u64, cr0: u64, requested: u64) -> Option<u64> {
         return None;
     }
     Some((current & !writable) | (requested & writable))
+}
+
+const fn fixed_mask_for_guest(fixed0: u64, guest_owned: u64) -> u64 {
+    fixed0 & !guest_owned
 }
 
 unsafe fn initialize_guest_msr_lists(page: u64) -> Result<(), Error> {
@@ -1372,6 +1398,16 @@ mod tests {
     #[test]
     fn fixed_bits_are_applied_in_architectural_order() {
         assert_eq!(adjusted_control_register(0b0101, 0b0010, 0b0111), 0b0111);
+    }
+
+    #[test]
+    fn vmx_only_hides_host_required_control_bits() {
+        let fixed0 = CR0_PAGING | (1 << 5) | 1;
+        assert_eq!(
+            fixed_mask_for_guest(fixed0, CR0_PAGING | 1),
+            1 << 5
+        );
+        assert_eq!(fixed_mask_for_guest(1 << 13, 0), 1 << 13);
     }
 
     #[test]
