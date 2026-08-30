@@ -85,6 +85,20 @@ pub fn gpu_dma_transition(requester: u16, stage: &[u8]) {
     draw_hex(u64::from(requester), line_y(2));
 }
 
+pub fn iommu_register_failure(requester: u16, status: u32, fault: u32, root: u64) {
+    show(0x006B_2028, b"IOMMU", b"ENABLE ERROR");
+    draw_hex(u64::from(requester), line_y(2));
+    let mut status_line = *b"GSTS 00000000";
+    write_hex_u32(&mut status_line[5..13], status);
+    draw_centered(&status_line, line_y(3));
+    let mut fault_line = *b"FSTS 00000000";
+    write_hex_u32(&mut fault_line[5..13], fault);
+    draw_centered(&fault_line, line_y(4));
+    let mut root_line = *b"RTLO 00000000";
+    write_hex_u32(&mut root_line[5..13], root as u32);
+    draw_centered(&root_line, line_y(5));
+}
+
 pub fn domain_crash(domain_id: u32, raw_reason: u64, address: u64, info: u64) {
     show(0x006B_2028, b"DOMAIN", b"CRASH");
     let mut detail = *b"00 0000";

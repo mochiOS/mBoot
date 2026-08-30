@@ -2433,7 +2433,7 @@ fn claim_pci_device(
     };
     if devices.is_firmware_deferred(requester) {
         display::gpu_dma_transition(requester, b"GPU IOMMU");
-        if unsafe {
+        let takeover = unsafe {
             remapper.take_over_deferred_display(0, requester, |stage| {
                 let label: &[u8] = match stage {
                     IntelTransitionStage::Tables => b"IOMMU TABLES",
@@ -2447,13 +2447,22 @@ fn claim_pci_device(
                 };
                 display::gpu_dma_transition(requester, label);
             })
-        }
-        .is_err()
-        {
+        };
+        if takeover.is_err() {
+            let registers = unsafe { remapper.intel_register_snapshot(0, requester) };
             if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
                 halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
             }
-            display::mdriver_claim_failure(requester, b"IOMMU HANDOFF ERROR");
+            if let Some(registers) = registers {
+                display::iommu_register_failure(
+                    requester,
+                    registers.global_status,
+                    registers.fault_status,
+                    registers.root_table,
+                );
+            } else {
+                display::mdriver_claim_failure(requester, b"IOMMU HANDOFF ERROR");
+            }
             return false;
         }
         display::gpu_dma_transition(requester, b"IOMMU DMA MAP");

@@ -23,6 +23,7 @@ const INTEL_GLOBAL_COMMAND: u64 = 0x18;
 const INTEL_GLOBAL_STATUS: u64 = 0x1c;
 const INTEL_ROOT_TABLE_ADDRESS: u64 = 0x20;
 const INTEL_CONTEXT_COMMAND: u64 = 0x28;
+const INTEL_FAULT_STATUS: u64 = 0x34;
 const INTEL_PROTECTED_MEMORY_ENABLE: u64 = 0x64;
 const INTEL_TRANSLATION_ENABLE: u32 = 1 << 31;
 const INTEL_SET_ROOT_POINTER: u32 = 1 << 30;
@@ -59,6 +60,7 @@ const AMD_COMMAND_INVALIDATE_DTE: u32 = 2;
 const AMD_COMMAND_INVALIDATE_PAGES: u32 = 3;
 const AMD_INVALIDATE_ALL_PAGES: u64 = 0x7fff_ffff_ffff_f000 | 3;
 const REGISTER_WAIT_LIMIT: usize = 1_000_000;
+const INTEL_ENABLE_WAIT_LIMIT: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IommuKind {
@@ -288,6 +290,13 @@ pub struct DmaRemapper {
     units: [UnitRuntime; MAX_IOMMU_UNITS],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntelRegisterSnapshot {
+    pub global_status: u32,
+    pub fault_status: u32,
+    pub root_table: u64,
+}
+
 pub const fn deny_all_table_pages(kind: IommuKind) -> usize {
     match kind {
         IommuKind::IntelVtd => INTEL_TABLE_PAGES,
@@ -296,6 +305,30 @@ pub const fn deny_all_table_pages(kind: IommuKind) -> usize {
 }
 
 impl DmaRemapper {
+    /// Captures the small VT-d register set needed to diagnose a failed
+    /// requester transition. The values are read only and do not acknowledge
+    /// or clear faults.
+    ///
+    /// # Safety
+    /// IOMMU MMIO must remain mapped and exclusively owned by mBoot.
+    pub unsafe fn intel_register_snapshot(
+        &self,
+        segment: u16,
+        requester: u16,
+    ) -> Option<IntelRegisterSnapshot> {
+        if self.topology.kind != IommuKind::IntelVtd {
+            return None;
+        }
+        let index = (0..self.topology.unit_count)
+            .find(|index| self.unit_handles(*index, segment, requester))?;
+        let base = self.topology.units[index].register_base;
+        Some(IntelRegisterSnapshot {
+            global_status: unsafe { mmio_read_u32(base, INTEL_GLOBAL_STATUS) },
+            fault_status: unsafe { mmio_read_u32(base, INTEL_FAULT_STATUS) },
+            root_table: unsafe { mmio_read_u64(base, INTEL_ROOT_TABLE_ADDRESS) },
+        })
+    }
+
     /// Installs deny-by-default tables and takes ownership of every described
     /// remapping unit except a firmware display unit that was explicitly deferred.
     ///
@@ -755,7 +788,12 @@ unsafe fn enable_intel_protection_with_progress(
             INTEL_GLOBAL_COMMAND,
             INTEL_TRANSLATION_ENABLE,
         );
-        wait_intel_status(unit.register_base, INTEL_TRANSLATION_ENABLE, true)?;
+        wait_intel_status_with_limit(
+            unit.register_base,
+            INTEL_TRANSLATION_ENABLE,
+            true,
+            INTEL_ENABLE_WAIT_LIMIT,
+        )?;
         disable_intel_protected_memory(unit, capability, progress)?;
     }
     Ok(next_page)
@@ -1408,7 +1446,16 @@ unsafe fn queue_amd_command(
 }
 
 unsafe fn wait_intel_status(base: u64, mask: u32, set: bool) -> Result<(), Error> {
-    for _ in 0..REGISTER_WAIT_LIMIT {
+    unsafe { wait_intel_status_with_limit(base, mask, set, REGISTER_WAIT_LIMIT) }
+}
+
+unsafe fn wait_intel_status_with_limit(
+    base: u64,
+    mask: u32,
+    set: bool,
+    limit: usize,
+) -> Result<(), Error> {
+    for _ in 0..limit {
         // SAFETY: The caller guarantees the Intel VT-d register range is mapped.
         let status = unsafe { mmio_read_u32(base, INTEL_GLOBAL_STATUS) };
         if (status & mask != 0) == set {
