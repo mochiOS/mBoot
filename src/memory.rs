@@ -478,6 +478,44 @@ impl NestedPageTable {
         Ok(0)
     }
 
+    /// Extends a Native Domain's initial identity map over a sparse device range.
+    /// Nested translation must separately map every page in the range.
+    ///
+    /// # Safety
+    /// `initialize_guest_page_tables` must have completed and the vCPU must be stopped.
+    pub unsafe fn map_guest_identity_device_range(
+        &self,
+        guest_start: u64,
+        len: u64,
+    ) -> Result<(), Error> {
+        let end = guest_start.checked_add(len).ok_or(Error::InvalidPage)?;
+        if guest_start < self.guest_memory_size()
+            || guest_start & (PAGE_SIZE - 1) != 0
+            || len == 0
+            || len & (PAGE_SIZE - 1) != 0
+            || end > 1024 * 1024 * 1024
+        {
+            return Err(Error::InvalidPage);
+        }
+        let directory = self.guest_base + 2 * PAGE_SIZE;
+        let first =
+            usize::try_from(guest_start / LARGE_PAGE_SIZE).map_err(|_| Error::InvalidPage)?;
+        let last = usize::try_from((end - 1) / LARGE_PAGE_SIZE).map_err(|_| Error::InvalidPage)?;
+        if last >= ENTRY_COUNT {
+            return Err(Error::InvalidPage);
+        }
+        for index in first..=last {
+            unsafe {
+                write_entry(
+                    directory,
+                    index,
+                    index as u64 * LARGE_PAGE_SIZE | GUEST_LARGE_PAGE_FLAGS,
+                )
+            };
+        }
+        Ok(())
+    }
+
     /// Clears all Domain RAM before a fresh image is loaded.
     ///
     /// # Safety

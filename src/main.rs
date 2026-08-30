@@ -21,7 +21,8 @@ use mboot::grant::{GrantRef, GrantTable};
 use mboot::interrupt::VirtualLocalApic;
 use mboot::iommu::{self, IommuKind};
 use mboot::manifest::{
-    LaunchManifest, ManifestDomainRole, ManifestImageFormat, ManifestRestartPolicy,
+    LaunchManifest, ManifestDeviceKind, ManifestDomainRole, ManifestImageFormat,
+    ManifestRestartPolicy, AUTO_REQUESTER,
 };
 use mboot::memory::{NestedPageResources, NestedPageTable};
 use mboot::pci;
@@ -514,10 +515,25 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             }
         }
     }
+    let firmware_framebuffer = display::framebuffer_info();
+    let firmware_framebuffer_fallback = iommu_topology.is_none() && firmware_framebuffer.is_some();
     if !device_policies.is_empty() && iommu_topology.is_none() {
-        log!("device assignment requires an ACPI IOMMU description");
-        display::failure(17);
-        return Status::UNSUPPORTED;
+        let automatic_fallback_is_safe = firmware_framebuffer_fallback
+            && device_policies.iter().all(|policy| {
+                policy.requester == AUTO_REQUESTER
+                    && (!policy.is_required() || policy.kind == ManifestDeviceKind::Display)
+            });
+        if automatic_fallback_is_safe {
+            log!(
+                "IOMMU unavailable; disabling {} automatic PCI assignment policy entry(s) and retaining the firmware framebuffer",
+                device_policies.len()
+            );
+            device_policies.clear();
+        } else {
+            log!("device assignment requires an ACPI IOMMU description");
+            display::failure(17);
+            return Status::UNSUPPORTED;
+        }
     }
 
     // SAFETY: All required firmware allocations are complete and no boot service
@@ -686,6 +702,48 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         } else {
             0
         };
+        let domain_framebuffer = if firmware_framebuffer_fallback
+            && prepared.role == DomainRole::System
+            && prepared.image_format == ManifestImageFormat::NativeElf
+        {
+            let framebuffer = firmware_framebuffer.expect("fallback requires a framebuffer");
+            let host_page = framebuffer.address & !0xfff;
+            let offset = framebuffer.address - host_page;
+            let Some(mapped_len) = framebuffer
+                .size
+                .checked_add(offset)
+                .and_then(|length| length.checked_add(0xfff))
+                .map(|length| length & !0xfff)
+            else {
+                halt_with_error("firmware framebuffer", mboot::Error::InvalidPage)
+            };
+            let guest_page = align_up_4k(nested.guest_memory_size().max(DEVICE_WINDOW_START));
+            let Some(guest_address) = guest_page.checked_add(offset) else {
+                halt_with_error("firmware framebuffer", mboot::Error::InvalidPage)
+            };
+            // SAFETY: GOP supplied the physical framebuffer range. The System
+            // Domain is stopped, and no PCI function is assigned in fallback mode.
+            if unsafe { nested.map_device_range(guest_page, host_page, mapped_len) }
+                .and_then(|()| unsafe {
+                    nested.map_guest_identity_device_range(guest_page, mapped_len)
+                })
+                .is_err()
+            {
+                halt_with_error("firmware framebuffer", mboot::Error::InvalidPage)
+            }
+            log!(
+                "firmware framebuffer mapped into System Domain: guest={:#x} host={:#x} size={} {}x{} stride={}",
+                guest_address,
+                framebuffer.address,
+                framebuffer.size,
+                framebuffer.width,
+                framebuffer.height,
+                framebuffer.stride
+            );
+            Some((guest_address, framebuffer))
+        } else {
+            None
+        };
         // SAFETY: The Domain is stopped and its RAM is exclusively owned by mBoot.
         let guest_image = match unsafe {
             match prepared.image_format {
@@ -761,7 +819,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
             BackendKind::AmdSvm => HYPERVISOR_BACKEND_AMD_SVM,
         };
-        let boot_info = DomainBootInfo::new(
+        let mut boot_info = DomainBootInfo::new(
             domain.id().get(),
             0,
             backend_id,
@@ -781,6 +839,16 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             prepared.id,
             0,
         ));
+        if let Some((guest_address, framebuffer)) = domain_framebuffer {
+            boot_info = boot_info.with_framebuffer(
+                guest_address,
+                framebuffer.size,
+                framebuffer.width,
+                framebuffer.height,
+                framebuffer.stride,
+                framebuffer.format,
+            );
+        }
         let Some(boot_info_host) = domain
             .nested_pages()
             .guest_host_address(DOMAIN_BOOT_INFO_GPA, size_of::<DomainBootInfo>() as u64)
@@ -1770,6 +1838,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     if runtime.domain.role() == DomainRole::System {
                         log!("mochiOS System Domain {} ready", runtime.domain.id().get());
                         display::mochios_ready();
+                        if firmware_framebuffer_fallback {
+                            display::handoff();
+                            log!("firmware framebuffer ownership transferred to mochiOS");
+                        }
                     } else {
                         log!("Hardware Domain {} ready", runtime.domain.id().get());
                         display::hardware_ready();
@@ -2485,6 +2557,10 @@ fn grant_window_start(memory: &NestedPageTable) -> u64 {
 
 fn device_window_start(memory: &NestedPageTable) -> u64 {
     grant_window_start(memory) - DEVICE_WINDOW_PAGES as u64 * 4096
+}
+
+const fn align_up_4k(value: u64) -> u64 {
+    value.saturating_add(0xfff) & !0xfff
 }
 
 fn domain_stack_bottom(memory: &NestedPageTable) -> u64 {

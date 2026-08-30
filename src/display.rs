@@ -9,6 +9,16 @@ static HEIGHT: AtomicUsize = AtomicUsize::new(0);
 static STRIDE: AtomicUsize = AtomicUsize::new(0);
 static ORDER: AtomicU8 = AtomicU8::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FramebufferInfo {
+    pub address: u64,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+}
+
 pub fn initialize(boot_services: &BootServices) -> bool {
     let Ok(handle) = boot_services.get_handle_for_protocol::<GraphicsOutput>() else {
         return false;
@@ -49,6 +59,25 @@ pub fn handoff() {
     HEIGHT.store(0, Ordering::Relaxed);
     STRIDE.store(0, Ordering::Relaxed);
     ORDER.store(0, Ordering::Relaxed);
+}
+
+pub fn framebuffer_info() -> Option<FramebufferInfo> {
+    let address = ADDRESS.load(Ordering::Acquire) as u64;
+    let width = u32::try_from(WIDTH.load(Ordering::Relaxed)).ok()?;
+    let height = u32::try_from(HEIGHT.load(Ordering::Relaxed)).ok()?;
+    let stride = u32::try_from(STRIDE.load(Ordering::Relaxed)).ok()?;
+    let format = u32::from(ORDER.load(Ordering::Relaxed));
+    let size = u64::from(stride)
+        .checked_mul(u64::from(height))?
+        .checked_mul(4)?;
+    (address != 0 && size != 0).then_some(FramebufferInfo {
+        address,
+        size,
+        width,
+        height,
+        stride,
+        format,
+    })
 }
 
 pub fn gpu_handoff(requester: u16) {
