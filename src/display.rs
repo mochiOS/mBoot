@@ -120,8 +120,8 @@ pub fn mdriver_claim(requester: u16) {
     draw_hex(u64::from(requester), line_y(2));
 }
 
-pub fn mdriver_claim_failure(requester: u16) {
-    show(0x006B_2028, b"MDRIVER", b"CLAIM ERROR");
+pub fn mdriver_claim_failure(requester: u16, stage: &[u8]) {
+    show(0x006B_2028, b"MDRIVER", stage);
     draw_hex(u64::from(requester), line_y(2));
 }
 

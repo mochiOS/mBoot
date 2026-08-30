@@ -1207,11 +1207,6 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 );
                 HYPERCALL_SUCCESS
             } else {
-                if authorized {
-                    if let Some(requester) = requester {
-                        display::mdriver_claim_failure(requester);
-                    }
-                }
                 HYPERCALL_INVALID_ARGUMENT
             };
             continue;
@@ -2231,6 +2226,7 @@ fn claim_pci_device(
 ) -> bool {
     let domain_id = runtime_domains[index].domain.id().get();
     if devices.can_claim(domain_id, requester).is_err() {
+        display::mdriver_claim_failure(requester, b"POLICY ERROR");
         return false;
     }
     let descriptor = match unsafe { pci::probe_descriptor(requester) } {
@@ -2241,6 +2237,17 @@ fn claim_pci_device(
                 requester,
                 error
             );
+            let stage = match error {
+                pci::PciError::InvalidRequester => b"BDF ERROR" as &[u8],
+                pci::PciError::InvalidState => b"STATE ERROR",
+                pci::PciError::UnsupportedHeader => b"HEADER ERROR",
+                pci::PciError::UnsupportedBar => b"BAR TYPE ERROR",
+                pci::PciError::InvalidBar => b"BAR VALUE ERROR",
+                pci::PciError::DeviceWindowExhausted => b"WINDOW ERROR",
+                pci::PciError::InterruptUnavailable => b"IRQ ERROR",
+                pci::PciError::RegisterWriteFailed => b"PCI WRITE ERROR",
+            };
+            display::mdriver_claim_failure(requester, stage);
             return false;
         }
     };
@@ -2249,6 +2256,7 @@ fn claim_pci_device(
         .any(|bar| !memory_map.allows_device_mmio(bar.physical_address, bar.length))
     {
         log!("PCI requester {:04x} exposed an unsafe MMIO BAR", requester);
+        display::mdriver_claim_failure(requester, b"MMIO ERROR");
         return false;
     }
     let window_start = DEVICE_WINDOW_START;
@@ -2281,6 +2289,7 @@ fn claim_pci_device(
                     bar.physical_address.saturating_add(bar.length)
                 );
             }
+            display::mdriver_claim_failure(requester, b"WINDOW ERROR");
             return false;
         }
     };
@@ -2305,6 +2314,7 @@ fn claim_pci_device(
             ) {
                 halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
             }
+            display::mdriver_claim_failure(requester, b"EPT ERROR");
             return false;
         }
         mapped_bars[mapped_count] = *bar;
@@ -2320,12 +2330,14 @@ fn claim_pci_device(
         if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
             halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
         }
+        display::mdriver_claim_failure(requester, b"EPT FLUSH ERROR");
         return false;
     }
     let Some(remapper) = dma_remapper.as_mut() else {
         if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
             halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
         }
+        display::mdriver_claim_failure(requester, b"IOMMU ERROR");
         return false;
     };
     if devices.is_firmware_deferred(requester) {
@@ -2351,6 +2363,7 @@ fn claim_pci_device(
         if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
             halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
         }
+        display::mdriver_claim_failure(requester, b"DMA MAP ERROR");
         return false;
     }
     if devices.claim(domain_id, requester).is_err() {
@@ -2360,6 +2373,7 @@ fn claim_pci_device(
         if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
             halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
         }
+        display::mdriver_claim_failure(requester, b"STATE ERROR");
         return false;
     }
     true
