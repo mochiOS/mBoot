@@ -1076,9 +1076,6 @@ unsafe fn build_intel_tables(
         }
     }
     for mapping in mappings.iter().filter(|mapping| mapping.segment == 0) {
-        if temporary_identity_requester == Some(mapping.requester) {
-            continue;
-        }
         if mapping.base & 0xfff != 0
             || mapping.limit & 0xfff != 0xfff
             || mapping.limit < mapping.base
@@ -1086,6 +1083,14 @@ unsafe fn build_intel_tables(
         {
             return Err(Error::InvalidTable);
         }
+        let map_base = if temporary_identity_requester == Some(mapping.requester) {
+            if mapping.limit < INTEL_FIRMWARE_DISPLAY_IDENTITY_END {
+                continue;
+            }
+            mapping.base.max(INTEL_FIRMWARE_DISPLAY_IDENTITY_END)
+        } else {
+            mapping.base
+        };
         let bus = usize::from(mapping.requester >> 8);
         let device_function = usize::from(mapping.requester & 0xff);
         // SAFETY: Root and context entries are inside the caller-owned arena.
@@ -1104,7 +1109,7 @@ unsafe fn build_intel_tables(
             }
         }
         // SAFETY: The second-level root and all children belong to this arena.
-        unsafe { identity_map_intel(second_level, mapping.base, mapping.limit + 1, &mut arena)? };
+        unsafe { identity_map_intel(second_level, map_base, mapping.limit + 1, &mut arena)? };
     }
     Ok(arena.next_page)
 }
@@ -2071,16 +2076,17 @@ mod tests {
         let mapping = ReservedMapping {
             segment: 0,
             requester: 0x0010,
-            base: 0x2000_0000,
-            limit: 0x203f_ffff,
+            base: 0x4_2000_0000,
+            limit: 0x4_203f_ffff,
         };
-        unsafe { build_intel_tables(base, &[mapping], Some(0x0010)).unwrap() };
+        let next_page = unsafe { build_intel_tables(base, &[mapping], Some(0x0010)).unwrap() };
         let context = unsafe { read_volatile(base as *const u64) } & !0xfff;
         let low = unsafe { read_volatile((context + 0x10 * 16) as *const u64) };
         let high = unsafe { read_volatile((context + 0x10 * 16 + 8) as *const u64) };
         assert_ne!(low & !0xfff, 0);
         assert_eq!(low & 0xf, INTEL_CONTEXT_PRESENT);
         assert_eq!(high, (1_u64 << 8) | 2);
+        assert_eq!(next_page, 9);
     }
 
     #[test]
