@@ -639,6 +639,23 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 limit
             );
         }
+        if let Some((base, limit)) = unsafe { pci::intel_graphics_stolen_range(requester) } {
+            let Some(topology) = iommu_topology.as_mut() else {
+                halt_with_error("Intel graphics DMA range", mboot::Error::InvalidState)
+            };
+            if topology
+                .reserve_identity_range(0, requester, base, limit)
+                .is_err()
+            {
+                halt_with_error("Intel graphics DMA range", mboot::Error::InvalidPage)
+            }
+            log!(
+                "PCI display {:04x} retains Intel stolen-memory DMA range {:#x}..={:#x}",
+                requester,
+                base,
+                limit
+            );
+        }
     }
     let mut devices =
         match DeviceTable::from_pci(quarantine.inventory(), deferred_display, &device_policies) {

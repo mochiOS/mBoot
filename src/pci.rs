@@ -31,6 +31,13 @@ const MSIX_TABLE_OFFSET: u32 = 0xffff_fff8;
 const MSIX_ENTRY_MASKED: u32 = 1;
 const PCIE_DEVICE_CAP_FLR: u32 = 1 << 28;
 const PCIE_DEVICE_CONTROL_FLR: u16 = 1 << 15;
+const INTEL_VENDOR_ID: u16 = 0x8086;
+const INTEL_GRAPHICS_REQUESTER: u16 = 0x0010;
+const INTEL_BDSM: u8 = 0xb0;
+const INTEL_BGSM: u8 = 0xb4;
+const INTEL_TOLUD: u8 = 0xbc;
+const INTEL_MEMORY_BASE_MASK: u32 = 0xfff0_0000;
+const MAX_INTEL_STOLEN_MEMORY: u64 = 1024 * 1024 * 1024;
 pub const MAX_DEVICE_BARS: usize = 6;
 const MAX_BARS: usize = MAX_DEVICE_BARS;
 const MAX_ASSIGNMENTS: usize = 32;
@@ -392,6 +399,52 @@ pub struct QuarantineReport {
     active_requester_count: usize,
     inventory: [PciFunction; MAX_INVENTORY_FUNCTIONS],
     inventory_count: usize,
+}
+
+/// Returns the Intel integrated graphics memory reserved below TOLUD.
+///
+/// The range contains both the GTT stolen area and the graphics data stolen
+/// area. It is read from the Intel host bridge rather than guessed from the
+/// framebuffer address. Only the conventional integrated display requester is
+/// accepted so these chipset-specific registers are never interpreted for a
+/// discrete GPU.
+///
+/// # Safety
+/// The caller must exclusively own PCI configuration-space access.
+pub unsafe fn intel_graphics_stolen_range(requester: u16) -> Option<(u64, u64)> {
+    if requester != INTEL_GRAPHICS_REQUESTER
+        || unsafe { read_u16(0, 0, 0, 0) } != INTEL_VENDOR_ID
+        || unsafe { read_u8(0, 0, 0, 0x0b) } != 0x06
+        || unsafe { read_u16(0, 2, 0, 0) } != INTEL_VENDOR_ID
+        || unsafe { read_u8(0, 2, 0, 0x0b) } != 0x03
+    {
+        return None;
+    }
+    let bdsm = unsafe { read_u32(0, 0, 0, INTEL_BDSM) };
+    let bgsm = unsafe { read_u32(0, 0, 0, INTEL_BGSM) };
+    let tolud = unsafe { read_u32(0, 0, 0, INTEL_TOLUD) };
+    intel_graphics_stolen_range_from_registers(bdsm, bgsm, tolud)
+}
+
+fn intel_graphics_stolen_range_from_registers(
+    bdsm: u32,
+    bgsm: u32,
+    tolud: u32,
+) -> Option<(u64, u64)> {
+    let data_base = u64::from(bdsm & INTEL_MEMORY_BASE_MASK);
+    let gtt_base = u64::from(bgsm & INTEL_MEMORY_BASE_MASK);
+    let top = u64::from(tolud & INTEL_MEMORY_BASE_MASK);
+    let base = data_base.min(gtt_base);
+    let size = top.checked_sub(base)?;
+    if base == 0
+        || data_base >= top
+        || gtt_base >= top
+        || size == 0
+        || size > MAX_INTEL_STOLEN_MEMORY
+    {
+        return None;
+    }
+    Some((base, top - 1))
 }
 
 impl Default for QuarantineReport {
@@ -1148,6 +1201,27 @@ mod tests {
         assert!(!function_has_bus_master_control(0x06, 0x01));
         assert!(!function_has_bus_master_control(0x06, 0x04));
         assert!(function_has_bus_master_control(0x03, 0x00));
+    }
+
+    #[test]
+    fn intel_graphics_range_covers_gtt_and_data_stolen_memory() {
+        assert_eq!(
+            intel_graphics_stolen_range_from_registers(0x7800_0001, 0x7780_0001, 0x8000_0001),
+            Some((0x7780_0000, 0x7fff_ffff))
+        );
+    }
+
+    #[test]
+    fn invalid_intel_graphics_ranges_are_rejected() {
+        assert_eq!(intel_graphics_stolen_range_from_registers(0, 0, 0), None);
+        assert_eq!(
+            intel_graphics_stolen_range_from_registers(0x8000_0000, 0x7f00_0000, 0x8000_0000),
+            None
+        );
+        assert_eq!(
+            intel_graphics_stolen_range_from_registers(0x5000_0000, 0x4000_0000, 0x9000_0000),
+            None
+        );
     }
 
     fn descriptor(requester: u16, bar_lengths: &[u64]) -> PciDescriptor {
