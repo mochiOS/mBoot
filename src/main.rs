@@ -1142,9 +1142,14 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             let authorized = runtime_domains[index].domain.role() == DomainRole::Hardware
                 && runtime_domains[index].domain.capabilities() & DOMAIN_CAPABILITY_DEVICE_QUERY
                     != 0;
-            let info = usize::try_from(vm_exit.arg0)
-                .ok()
-                .and_then(|device_index| devices.query(domain_id, device_index));
+            let device_index = usize::try_from(vm_exit.arg0).ok();
+            let info = device_index.and_then(|device_index| devices.query(domain_id, device_index));
+            if authorized {
+                display::mdriver_query(
+                    u16::try_from(vm_exit.arg0).unwrap_or(u16::MAX),
+                    info.map(|info| info.requester),
+                );
+            }
             let destination = runtime_domains[index]
                 .domain
                 .nested_pages()
@@ -1175,6 +1180,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 && runtime_domains[index].domain.capabilities() & DOMAIN_CAPABILITY_DEVICE_CLAIM
                     != 0;
             let requester = u16::try_from(vm_exit.arg0).ok().filter(|value| *value != 0);
+            if authorized {
+                if let Some(requester) = requester {
+                    display::mdriver_claim(requester);
+                }
+            }
             let claimed = authorized
                 && vm_exit.arg1 == 0
                 && vm_exit.arg2 == 0
@@ -1197,6 +1207,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 );
                 HYPERCALL_SUCCESS
             } else {
+                if authorized {
+                    if let Some(requester) = requester {
+                        display::mdriver_claim_failure(requester);
+                    }
+                }
                 HYPERCALL_INVALID_ARGUMENT
             };
             continue;

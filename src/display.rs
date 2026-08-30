@@ -103,6 +103,28 @@ pub fn hardware_ready() {
     show(0x0017_4F35, b"MBOOT", b"HARDWARE OK");
 }
 
+pub fn mdriver_query(index: u16, requester: Option<u16>) {
+    show(0x0017_4F35, b"MDRIVER", b"QUERY");
+    let mut entry = *b"INDEX 0000";
+    write_hex_u16(&mut entry[6..10], index);
+    draw_centered(&entry, line_y(2));
+    if let Some(requester) = requester {
+        let mut device = *b"BDF   0000";
+        write_hex_u16(&mut device[6..10], requester);
+        draw_centered(&device, line_y(3));
+    }
+}
+
+pub fn mdriver_claim(requester: u16) {
+    show(0x0017_4F35, b"MDRIVER", b"CLAIM");
+    draw_hex(u64::from(requester), line_y(2));
+}
+
+pub fn mdriver_claim_failure(requester: u16) {
+    show(0x006B_2028, b"MDRIVER", b"CLAIM ERROR");
+    draw_hex(u64::from(requester), line_y(2));
+}
+
 pub fn failure(code: u8) {
     show(0x006B_2028, b"MBOOT", b"ERROR");
     let digits = [b'0' + (code / 10) % 10, b'0' + code % 10];
