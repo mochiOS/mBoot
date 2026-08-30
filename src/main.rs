@@ -2425,17 +2425,13 @@ fn claim_pci_device(
     };
     if devices.is_firmware_deferred(requester) {
         display::gpu_handoff(requester);
-        display::handoff();
         if unsafe { remapper.take_over_deferred_display(0, requester) }.is_err() {
             if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
                 halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
             }
+            display::mdriver_claim_failure(requester, b"IOMMU HANDOFF ERROR");
             return false;
         }
-        log!(
-            "firmware display {:04x} handed off to the Hardware Domain",
-            requester
-        );
     }
     let guest_base = runtime_domains[index].domain.nested_pages().guest_base();
     let guest_size = runtime_domains[index]
@@ -2449,6 +2445,7 @@ fn claim_pci_device(
         display::mdriver_claim_failure(requester, b"DMA MAP ERROR");
         return false;
     }
+    let firmware_display = devices.is_firmware_deferred(requester);
     if devices.claim(domain_id, requester).is_err() {
         if unsafe { remapper.detach(0, requester, domain_id) }.is_err() {
             halt_with_error("PCI DMA rollback", mboot::Error::InvalidState)
@@ -2458,6 +2455,16 @@ fn claim_pci_device(
         }
         display::mdriver_claim_failure(requester, b"STATE ERROR");
         return false;
+    }
+    if firmware_display {
+        // The framebuffer remains useful for reporting a failed transition.
+        // Stop mBoot output only after ownership and the GPU DMA context are
+        // both committed to the Hardware Domain.
+        display::handoff();
+        log!(
+            "firmware display {:04x} handed off to the Hardware Domain",
+            requester
+        );
     }
     true
 }

@@ -363,14 +363,6 @@ impl DmaRemapper {
         {
             return Err(Error::InvalidResources);
         }
-        if self
-            .topology
-            .reserved_mappings()
-            .iter()
-            .any(|mapping| mapping.segment == segment && mapping.requester == requester)
-        {
-            return Err(Error::ReservedDevice);
-        }
         let mut matched = false;
         for index in 0..self.topology.unit_count {
             if !self.unit_handles(index, segment, requester) {
@@ -392,6 +384,55 @@ impl DmaRemapper {
                     return Err(error);
                 }
             };
+            // Intel firmware can reserve a small identity-mapped DMA range for
+            // an integrated display controller. Preserve only the ranges that
+            // DMAR associates with this exact requester. They must not overlap
+            // the Domain's normal IOVA space, which starts at zero.
+            if self.topology.kind == IommuKind::IntelVtd {
+                let mut has_reserved_mapping = false;
+                for mapping in self.topology.reserved_mappings().iter().copied() {
+                    if mapping.segment != segment || mapping.requester != requester {
+                        continue;
+                    }
+                    has_reserved_mapping = true;
+                    if mapping.base < size {
+                        let _ = unsafe {
+                            self.detach(segment, requester, u32::from(domain_id))
+                        };
+                        return Err(Error::ReservedDevice);
+                    }
+                    if let Err(error) = unsafe {
+                        map_domain_reserved_identity(
+                            &mut self.units[index],
+                            root,
+                            mapping.base,
+                            mapping.limit,
+                        )
+                    } {
+                        let _ = unsafe {
+                            self.detach(segment, requester, u32::from(domain_id))
+                        };
+                        return Err(error);
+                    }
+                }
+                if has_reserved_mapping {
+                    // The deny-by-default table initially keeps this requester
+                    // in reserved Domain 1 so firmware DMA remains valid. Bus
+                    // mastering is disabled here, so it is safe to remove that
+                    // temporary context before installing the Hardware Domain
+                    // context below.
+                    if let Err(error) = unsafe {
+                        detach_intel_requester(
+                            &self.topology.units[index],
+                            &mut self.units[index],
+                            requester,
+                            1,
+                        )
+                    } {
+                        return Err(error);
+                    }
+                }
+            }
             let result = unsafe {
                 match self.topology.kind {
                     IommuKind::IntelVtd => attach_intel_requester(
@@ -527,6 +568,26 @@ impl DmaRemapper {
         self.topology
             .unit_handles_requester(index, segment, requester)
     }
+}
+
+unsafe fn map_domain_reserved_identity(
+    runtime: &mut UnitRuntime,
+    root: u64,
+    base: u64,
+    limit: u64,
+) -> Result<(), Error> {
+    if base & 0xfff != 0 || limit & 0xfff != 0xfff || limit < base {
+        return Err(Error::InvalidResources);
+    }
+    let end = limit.checked_add(1).ok_or(Error::InvalidResources)?;
+    let mut arena = TableArena {
+        base: runtime.resources.remapping_table,
+        next_page: runtime.next_domain_page,
+        page_count: INTEL_TABLE_PAGES,
+    };
+    unsafe { identity_map_intel(root, base, end, &mut arena)? };
+    runtime.next_domain_page = arena.next_page;
+    Ok(())
 }
 
 fn validate_resources(kind: IommuKind, resources: IommuResources) -> Result<(), Error> {
@@ -1704,6 +1765,38 @@ mod tests {
             unsafe { read_volatile((level1 + 8) as *const u64) },
             0x2000_1003
         );
+    }
+
+    #[test]
+    fn intel_domain_tables_keep_the_assigned_requesters_reserved_dma_range() {
+        #[repr(align(4096))]
+        struct Tables([u8; INTEL_TABLE_PAGES * 4096]);
+        let mut tables = Tables([0; INTEL_TABLE_PAGES * 4096]);
+        let base = tables.0.as_mut_ptr() as u64;
+        let mut runtime = UnitRuntime {
+            resources: IommuResources {
+                remapping_table: base,
+                ..EMPTY_RESOURCES
+            },
+            next_domain_page: 1,
+            ..EMPTY_UNIT_RUNTIME
+        };
+        let root = base;
+
+        unsafe {
+            map_domain_reserved_identity(
+                &mut runtime,
+                root,
+                0x2000_0000,
+                0x201f_ffff,
+            )
+            .unwrap()
+        };
+
+        let level3 = unsafe { read_volatile(root as *const u64) } & 0x000f_ffff_ffff_f000;
+        let level2 = unsafe { read_volatile(level3 as *const u64) } & 0x000f_ffff_ffff_f000;
+        let entry = unsafe { read_volatile((level2 + 0x100 * 8) as *const u64) };
+        assert_eq!(entry, 0x2000_0083);
     }
 
     #[test]
