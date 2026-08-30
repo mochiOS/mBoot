@@ -86,7 +86,22 @@ pub fn gpu_dma_transition(requester: u16, stage: &[u8]) {
 }
 
 pub fn iommu_register_failure(requester: u16, status: u32, fault: u32, root: u64) {
-    show(0x006B_2028, b"IOMMU", b"ENABLE ERROR");
+    iommu_register_report(requester, b"ENABLE ERROR", status, fault, root, 0x006B_2028);
+}
+
+pub fn iommu_register_state(requester: u16, status: u32, fault: u32, root: u64) {
+    iommu_register_report(requester, b"PRE ENABLE", status, fault, root, 0x0017_2033);
+}
+
+fn iommu_register_report(
+    requester: u16,
+    title: &[u8],
+    status: u32,
+    fault: u32,
+    root: u64,
+    color: u32,
+) {
+    show(color, b"IOMMU", title);
     draw_hex(u64::from(requester), line_y(2));
     let mut status_line = *b"GSTS 00000000";
     write_hex_u32(&mut status_line[5..13], status);

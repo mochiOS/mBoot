@@ -218,7 +218,11 @@ pub enum IntelTransitionStage {
     Root,
     Context,
     Iotlb,
-    Enable,
+    Enable {
+        global_status: u32,
+        fault_status: u32,
+        root_table: u64,
+    },
     ProtectedMemory,
 }
 
@@ -782,7 +786,11 @@ unsafe fn enable_intel_protection_with_progress(
         );
         wait_intel_status(unit.register_base, INTEL_SET_ROOT_POINTER, true)?;
         invalidate_intel_caches_with_progress(unit, progress)?;
-        progress(IntelTransitionStage::Enable);
+        progress(IntelTransitionStage::Enable {
+            global_status: mmio_read_u32(unit.register_base, INTEL_GLOBAL_STATUS),
+            fault_status: mmio_read_u32(unit.register_base, INTEL_FAULT_STATUS),
+            root_table: mmio_read_u64(unit.register_base, INTEL_ROOT_TABLE_ADDRESS),
+        });
         mmio_write_u32(
             unit.register_base,
             INTEL_GLOBAL_COMMAND,

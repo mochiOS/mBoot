@@ -2442,8 +2442,20 @@ fn claim_pci_device(
                     IntelTransitionStage::Root => b"IOMMU ROOT",
                     IntelTransitionStage::Context => b"IOMMU CONTEXT",
                     IntelTransitionStage::Iotlb => b"IOMMU IOTLB",
-                    IntelTransitionStage::Enable => b"IOMMU ENABLE",
                     IntelTransitionStage::ProtectedMemory => b"IOMMU PROTECTED",
+                    IntelTransitionStage::Enable {
+                        global_status,
+                        fault_status,
+                        root_table,
+                    } => {
+                        display::iommu_register_state(
+                            requester,
+                            global_status,
+                            fault_status,
+                            root_table,
+                        );
+                        return;
+                    }
                 };
                 display::gpu_dma_transition(requester, label);
             })
