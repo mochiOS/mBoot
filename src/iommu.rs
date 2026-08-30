@@ -19,6 +19,7 @@ const MAX_DOMAIN_MAPPINGS: usize = 8;
 const INTEL_VERSION: u64 = 0x00;
 const INTEL_CAPABILITY: u64 = 0x08;
 const INTEL_EXTENDED_CAPABILITY: u64 = 0x10;
+const INTEL_EXTENDED_CAPABILITY_COHERENT: u64 = 1;
 const INTEL_GLOBAL_COMMAND: u64 = 0x18;
 const INTEL_GLOBAL_STATUS: u64 = 0x1c;
 const INTEL_ROOT_TABLE_ADDRESS: u64 = 0x20;
@@ -829,6 +830,7 @@ unsafe fn enable_intel_protection_with_progress(
     let next_page = unsafe {
         build_intel_tables(root_table, mappings, temporary_identity_requester)?
     };
+    unsafe { flush_intel_table_cache(unit, root_table, next_page) };
 
     // Start from a known state. Requesters without an RMRR are unable to issue
     // new DMA; firmware-reserved requesters are immediately restored below.
@@ -893,6 +895,7 @@ unsafe fn replace_intel_protection(
     let next_page = unsafe {
         build_intel_tables(root_table, mappings, temporary_identity_requester)?
     };
+    unsafe { flush_intel_table_cache(unit, root_table, next_page) };
 
     // Firmware may leave translation, queued invalidation, and interrupt
     // remapping active on the display unit. Keep translation enabled throughout
@@ -1296,7 +1299,11 @@ unsafe fn attach_intel_requester(
         write_volatile(context_low.add(1), (u64::from(domain_id) << 8) | 2);
         dma_table_fence();
         write_volatile(context_low, root | 1);
-        dma_table_fence();
+        flush_intel_table_cache(
+            unit,
+            runtime.resources.remapping_table,
+            runtime.next_domain_page,
+        );
         invalidate_intel_caches(unit)?;
     }
     Ok(())
@@ -1327,7 +1334,11 @@ unsafe fn detach_intel_requester(
         write_volatile(context_low, 0);
         dma_table_fence();
         write_volatile(context_low.add(1), 0);
-        dma_table_fence();
+        flush_intel_table_cache(
+            unit,
+            runtime.resources.remapping_table,
+            runtime.next_domain_page,
+        );
         invalidate_intel_caches(unit)?;
     }
     Ok(())
@@ -1600,6 +1611,28 @@ unsafe fn mmio_write_u32(base: u64, offset: u64, value: u32) {
 unsafe fn mmio_write_u64(base: u64, offset: u64, value: u64) {
     // SAFETY: The caller provides a mapped register base and writable aligned offset.
     unsafe { write_volatile((base + offset) as *mut u64, value) };
+}
+
+unsafe fn flush_intel_table_cache(unit: &IommuUnit, base: u64, pages: usize) {
+    let coherent = unsafe {
+        mmio_read_u64(unit.register_base, INTEL_EXTENDED_CAPABILITY)
+            & INTEL_EXTENDED_CAPABILITY_COHERENT
+            != 0
+    };
+    if !coherent {
+        let end = base + pages as u64 * 4096;
+        let mut address = base;
+        while address < end {
+            // SAFETY: Every cache line belongs to the caller-owned VT-d table
+            // allocation. CLFLUSH writes back and invalidates it before the
+            // non-snooping remapping hardware walks the structure.
+            unsafe {
+                asm!("clflush [{}]", in(reg) address, options(nostack, preserves_flags));
+            }
+            address += 64;
+        }
+    }
+    unsafe { dma_table_fence() };
 }
 
 unsafe fn dma_table_fence() {
