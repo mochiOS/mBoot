@@ -1845,6 +1845,14 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     } else {
                         log!("Hardware Domain {} ready", runtime.domain.id().get());
                         display::hardware_ready();
+                        if deferred_display.is_some() {
+                            // Keep the firmware framebuffer available while
+                            // mDriver enumerates and probes the transferred GPU.
+                            // Its Ready notification is the first point where a
+                            // replacement display backend is known to exist.
+                            display::handoff();
+                            log!("boot display diagnostics handed off to the Hardware Domain");
+                        }
                     }
                     HYPERCALL_SUCCESS
                 }
@@ -2424,7 +2432,7 @@ fn claim_pci_device(
         return false;
     };
     if devices.is_firmware_deferred(requester) {
-        display::gpu_handoff(requester);
+        display::gpu_dma_transition(requester);
         if unsafe { remapper.take_over_deferred_display(0, requester) }.is_err() {
             if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
                 halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
@@ -2457,12 +2465,8 @@ fn claim_pci_device(
         return false;
     }
     if firmware_display {
-        // The framebuffer remains useful for reporting a failed transition.
-        // Stop mBoot output only after ownership and the GPU DMA context are
-        // both committed to the Hardware Domain.
-        display::handoff();
         log!(
-            "firmware display {:04x} handed off to the Hardware Domain",
+            "firmware display {:04x} DMA ownership transferred to the Hardware Domain",
             requester
         );
     }
