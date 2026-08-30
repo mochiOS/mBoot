@@ -1,0 +1,98 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: identify device discovery failures
+
+Include the failed discovery operation and PCI requester in the early boot
+status.  Preserve that specific status instead of replacing it with the generic
+device error page in the readiness caller.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ arch/x86/kernel/cpu/mboot.c | 38 ++++++++++++++++++++++++++++++--------
+ 1 file changed, 30 insertions(+), 8 deletions(-)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -315,6 +315,17 @@ static void mboot_boot_status(const char *status)
+ 			virt_to_phys((void *)status), strlen(status), 0);
+ }
+ 
++static void mboot_boot_device_error(const char *operation, u16 requester)
++{
++	char status[64];
++	int length;
++
++	length = scnprintf(status, sizeof(status),
++			   "DISPLAY\nMDRIVER %s %04X", operation, requester);
++	mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
++			virt_to_phys(status), length, 0);
++}
++
+ static void mboot_irq_mask(struct irq_data *data)
+ {
+ 	struct irq_cfg *cfg = irqd_cfg(data);
+@@ -861,8 +872,10 @@ static int __init mboot_query_and_claim_devices(void)
+ 
+ 	BUILD_BUG_ON(sizeof(*info) != 64);
+ 	info = kzalloc(sizeof(*info), GFP_KERNEL);
+-	if (!info)
++	if (!info) {
++		mboot_boot_device_error("ALLOC", 0);
+ 		return -ENOMEM;
++	}
+ 	for (index = 0; index < MBOOT_MAX_PCI_DEVICES; index++) {
+ 		unsigned long result;
+ 
+@@ -874,6 +887,7 @@ static int __init mboot_query_and_claim_devices(void)
+ 		if (result || !mboot_pci_info_valid(info)) {
+ 			pr_err("mDriver: invalid PCI inventory entry %u\n", index);
++			mboot_boot_device_error("QUERY", index);
+ 			kfree(info);
+ 			return -EIO;
+ 		}
+@@ -891,6 +905,7 @@ static int __init mboot_query_and_claim_devices(void)
+ 		if (result) {
+ 			pr_err("mDriver: PCI requester %04x claim failed: %lu\n",
+ 			       info->requester, result);
++			mboot_boot_device_error("CLAIM", info->requester);
+ 			kfree(info);
+ 			return -EIO;
+ 		}
+@@ -903,17 +918,25 @@ static int __init mboot_query_and_claim_devices(void)
+ 			pr_err("mDriver: PCI entry %u did not enter claimed-disabled\n",
+ 			       index);
++			mboot_boot_device_error("STATE", info->requester);
+ 			kfree(info);
+ 			return -EIO;
+ 		}
+ 		if (mboot_pci_device_count == MBOOT_MAX_ASSIGNED_DEVICES) {
++			mboot_boot_device_error("LIMIT", info->requester);
+ 			kfree(info);
+ 			return -ENOSPC;
+ 		}
+ 		mboot_pci_devices[mboot_pci_device_count].info = *info;
+-		if (mboot_pci_load_config(&mboot_pci_devices[mboot_pci_device_count]) ||
+-		    mboot_pci_load_resources(&mboot_pci_devices[mboot_pci_device_count])) {
++		if (mboot_pci_load_config(&mboot_pci_devices[mboot_pci_device_count])) {
++			mboot_boot_device_error("CONFIG", info->requester);
++			kfree(info);
++			return -EIO;
++		}
++		if (mboot_pci_load_resources(&mboot_pci_devices[mboot_pci_device_count])) {
++			mboot_boot_device_error("BAR", info->requester);
+ 			kfree(info);
+ 			return -EIO;
+ 		}
+@@ -3080,10 +3103,9 @@ static int __init mboot_report_ready(void)
+ 	unsigned long result;
+ 
+ 	mboot_boot_status("DISPLAY\nMDRIVER DEVICES");
+-	if (mboot_query_and_claim_devices()) {
+-		mboot_boot_status("DISPLAY\nMDRIVER DEVICE ERROR");
++	if (mboot_query_and_claim_devices())
+ 		return -EIO;
+-	}
+ 	mboot_boot_status("DISPLAY\nMDRIVER PCI");
+ 	if (mboot_pci_device_count && mboot_pci_publish_frontend()) {
+ 		mboot_boot_status("DISPLAY\nMDRIVER PCI ERROR");
+-- 
+2.39.5
