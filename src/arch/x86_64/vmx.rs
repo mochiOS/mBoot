@@ -146,6 +146,7 @@ const INTERRUPT_WINDOW_EXIT_REASON: u64 = 7;
 const CPUID_EXIT_REASON: u64 = 10;
 const HLT_EXIT_REASON: u64 = 12;
 const VMCALL_EXIT_REASON: u64 = 18;
+const CONTROL_REGISTER_ACCESS_EXIT_REASON: u64 = 28;
 const RDMSR_EXIT_REASON: u64 = 31;
 const WRMSR_EXIT_REASON: u64 = 32;
 const EPT_VIOLATION_EXIT_REASON: u64 = 48;
@@ -573,6 +574,23 @@ impl Vmx {
         unsafe { self.resume_instruction() }
     }
 
+    pub unsafe fn resume_control_register_write(
+        &mut self,
+        register: u8,
+        value: u64,
+    ) -> Result<VmExit, Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
+        match register {
+            0 => unsafe { write_guest_cr0(value)? },
+            4 => unsafe { write_guest_cr4(value)? },
+            _ => return Err(Error::InvalidState),
+        }
+        unsafe { self.resume_instruction() }
+    }
+
     unsafe fn resume_instruction(&mut self) -> Result<VmExit, Error> {
         if !self.active {
             return Err(Error::InvalidState);
@@ -850,6 +868,29 @@ impl Vmx {
                 fault_address: 0,
                 fault_info: 0,
             }),
+            CONTROL_REGISTER_ACCESS_EXIT_REASON => {
+                let qualification = unsafe { vmread(EXIT_QUALIFICATION) };
+                let register = (qualification & 0xf) as u8;
+                let access = (qualification >> 4) & 0x3;
+                let gpr = ((qualification >> 8) & 0xf) as u8;
+                if access != 0 || !matches!(register, 0 | 4) {
+                    return Err(Error::UnexpectedVmExit(reason));
+                }
+                Ok(VmExit {
+                    reason: VmExitReason::ControlRegisterWrite,
+                    raw_reason: reason,
+                    hypercall_number: 0,
+                    arg0: 0,
+                    arg1: 0,
+                    arg2: 0,
+                    msr: 0,
+                    msr_value: 0,
+                    cpuid_leaf: 0,
+                    cpuid_subleaf: 0,
+                    fault_address: unsafe { self.guest_gpr(gpr)? },
+                    fault_info: qualification,
+                })
+            }
             EPT_VIOLATION_EXIT_REASON => Ok(VmExit {
                 reason: VmExitReason::NestedPageFault,
                 raw_reason: reason,
@@ -865,6 +906,28 @@ impl Vmx {
                 fault_info: unsafe { vmread(EXIT_QUALIFICATION) },
             }),
             _ => Err(Error::UnexpectedVmExit(reason)),
+        }
+    }
+
+    unsafe fn guest_gpr(&self, register: u8) -> Result<u64, Error> {
+        match register {
+            0 => Ok(self.run_context.rax),
+            1 => Ok(self.run_context.rcx),
+            2 => Ok(self.run_context.rdx),
+            3 => Ok(self.run_context.rbx),
+            4 => Ok(unsafe { vmread(GUEST_RSP) }),
+            5 => Ok(self.run_context.rbp),
+            6 => Ok(self.run_context.rsi),
+            7 => Ok(self.run_context.rdi),
+            8 => Ok(self.run_context.r8),
+            9 => Ok(self.run_context.r9),
+            10 => Ok(self.run_context.r10),
+            11 => Ok(self.run_context.r11),
+            12 => Ok(self.run_context.r12),
+            13 => Ok(self.run_context.r13),
+            14 => Ok(self.run_context.r14),
+            15 => Ok(self.run_context.r15),
+            _ => Err(Error::InvalidState),
         }
     }
 
@@ -1203,6 +1266,40 @@ unsafe fn synchronize_guest_long_mode() -> Result<(), Error> {
         controls &= !(1 << 9);
     }
     unsafe { vmwrite(ENTRY_CONTROLS, controls) }
+}
+
+unsafe fn write_guest_cr0(requested: u64) -> Result<(), Error> {
+    let fixed0 = unsafe { read_msr(IA32_VMX_CR0_FIXED0) };
+    let fixed1 = unsafe { read_msr(IA32_VMX_CR0_FIXED1) };
+    if requested & !fixed1 != 0 {
+        return Err(Error::InvalidState);
+    }
+    let guest_owned = (1 << 0) | CR0_PAGING;
+    let actual = (requested | fixed_mask_for_guest(fixed0, guest_owned)) & fixed1;
+    unsafe {
+        vmwrite(GUEST_CR0, actual)?;
+        vmwrite(CR0_READ_SHADOW, requested)?;
+    }
+    let mut efer = unsafe { vmread(GUEST_EFER) };
+    if requested & CR0_PAGING != 0 && efer & EFER_LME != 0 {
+        efer |= EFER_LMA;
+    } else {
+        efer &= !EFER_LMA;
+    }
+    unsafe { vmwrite(GUEST_EFER, efer) }
+}
+
+unsafe fn write_guest_cr4(requested: u64) -> Result<(), Error> {
+    let fixed0 = unsafe { read_msr(IA32_VMX_CR4_FIXED0) };
+    let fixed1 = unsafe { read_msr(IA32_VMX_CR4_FIXED1) };
+    if requested & !fixed1 != 0 {
+        return Err(Error::InvalidState);
+    }
+    let actual = (requested | fixed_mask_for_guest(fixed0, 0)) & fixed1;
+    unsafe {
+        vmwrite(GUEST_CR4, actual)?;
+        vmwrite(CR4_READ_SHADOW, requested)
+    }
 }
 
 fn updated_guest_efer(current: u64, cr0: u64, requested: u64) -> Option<u64> {

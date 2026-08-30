@@ -70,6 +70,7 @@ pub enum VmExitReason {
     MsrRead,
     MsrWrite,
     Cpuid,
+    ControlRegisterWrite,
     NestedPageFault,
 }
 
@@ -268,6 +269,23 @@ impl Virtualization {
         match self {
             Virtualization::Intel(vmx) => unsafe { vmx.resume_cpuid(result) },
             Virtualization::Amd(svm) => unsafe { svm.resume_cpuid(result) },
+        }
+    }
+
+    /// Completes an intercepted write to CR0 or CR4 and resumes the vCPU.
+    ///
+    /// # Safety
+    /// The previous exit must be a control-register write from this vCPU.
+    pub unsafe fn resume_control_register_write(
+        &mut self,
+        register: u8,
+        value: u64,
+    ) -> Result<VmExit, Error> {
+        match self {
+            Virtualization::Intel(vmx) => unsafe {
+                vmx.resume_control_register_write(register, value)
+            },
+            Virtualization::Amd(_) => Err(Error::InvalidState),
         }
     }
 

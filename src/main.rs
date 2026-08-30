@@ -130,6 +130,7 @@ enum ResumeKind {
     MsrRead(u64),
     MsrWrite,
     Cpuid(CpuidResult),
+    ControlRegisterWrite { register: u8, value: u64 },
     GeneralProtection,
 }
 
@@ -949,6 +950,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     // SAFETY: These values complete the preceding intercepted CPUID.
                     unsafe { runtime.virtualization.resume_cpuid(result) }
                 }
+                ResumeKind::ControlRegisterWrite { register, value } => unsafe {
+                    runtime
+                        .virtualization
+                        .resume_control_register_write(register, value)
+                },
                 ResumeKind::GeneralProtection => {
                     // SAFETY: The vCPU is stopped at the rejected instruction.
                     if let Err(error) =
@@ -1081,6 +1087,13 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 GRANT_WINDOW_PAGES as u64 * 4096,
             );
             runtime.resume_kind = ResumeKind::Cpuid(result);
+            continue;
+        }
+        if vm_exit.reason == VmExitReason::ControlRegisterWrite {
+            runtime.resume_kind = ResumeKind::ControlRegisterWrite {
+                register: (vm_exit.fault_info & 0xf) as u8,
+                value: vm_exit.fault_address,
+            };
             continue;
         }
         if vm_exit.reason == VmExitReason::NestedPageFault {
