@@ -19,7 +19,7 @@ use mboot::domain::{Domain, DomainId, DomainRole, DomainState};
 use mboot::event::EventChannelTable;
 use mboot::grant::{GrantRef, GrantTable};
 use mboot::interrupt::VirtualLocalApic;
-use mboot::iommu::{self, IommuKind};
+use mboot::iommu::{self, IntelTransitionStage, IommuKind};
 use mboot::manifest::{
     LaunchManifest, ManifestDeviceKind, ManifestDomainRole, ManifestImageFormat,
     ManifestRestartPolicy, AUTO_REQUESTER,
@@ -2432,14 +2432,29 @@ fn claim_pci_device(
         return false;
     };
     if devices.is_firmware_deferred(requester) {
-        display::gpu_dma_transition(requester);
-        if unsafe { remapper.take_over_deferred_display(0, requester) }.is_err() {
+        display::gpu_dma_transition(requester, b"GPU IOMMU");
+        if unsafe {
+            remapper.take_over_deferred_display(0, requester, |stage| {
+                let label: &[u8] = match stage {
+                    IntelTransitionStage::Tables => b"IOMMU TABLES",
+                    IntelTransitionStage::Disable => b"IOMMU DISABLE",
+                    IntelTransitionStage::Root => b"IOMMU ROOT",
+                    IntelTransitionStage::Context => b"IOMMU CONTEXT",
+                    IntelTransitionStage::Iotlb => b"IOMMU IOTLB",
+                    IntelTransitionStage::Enable => b"IOMMU ENABLE",
+                };
+                display::gpu_dma_transition(requester, label);
+            })
+        }
+        .is_err()
+        {
             if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
                 halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
             }
             display::mdriver_claim_failure(requester, b"IOMMU HANDOFF ERROR");
             return false;
         }
+        display::gpu_dma_transition(requester, b"IOMMU DMA MAP");
     }
     let guest_base = runtime_domains[index].domain.nested_pages().guest_base();
     let guest_size = runtime_domains[index]

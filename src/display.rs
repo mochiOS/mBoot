@@ -80,8 +80,8 @@ pub fn framebuffer_info() -> Option<FramebufferInfo> {
     })
 }
 
-pub fn gpu_dma_transition(requester: u16) {
-    show(0x0017_2033, b"MBOOT", b"GPU IOMMU");
+pub fn gpu_dma_transition(requester: u16, stage: &[u8]) {
+    show(0x0017_2033, b"MBOOT", stage);
     draw_hex(u64::from(requester), line_y(2));
 }
 

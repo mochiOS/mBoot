@@ -201,6 +201,16 @@ pub enum Error {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntelTransitionStage {
+    Tables,
+    Disable,
+    Root,
+    Context,
+    Iotlb,
+    Enable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IommuResources {
     pub remapping_table: u64,
     pub domain_tables: u64,
@@ -474,6 +484,7 @@ impl DmaRemapper {
         &mut self,
         segment: u16,
         requester: u16,
+        mut progress: impl FnMut(IntelTransitionStage),
     ) -> Result<bool, Error> {
         if self.topology.kind != IommuKind::IntelVtd || requester == 0 {
             return Ok(false);
@@ -494,10 +505,11 @@ impl DmaRemapper {
             }
             let resources = self.units[index].resources;
             let next_domain_page = unsafe {
-                enable_intel_protection(
+                enable_intel_protection_with_progress(
                     &unit,
                     resources.remapping_table,
                     self.topology.reserved_mappings(),
+                    &mut progress,
                 )?
             };
             self.units[index] = UnitRuntime {
@@ -667,6 +679,15 @@ unsafe fn enable_intel_protection(
     root_table: u64,
     mappings: &[ReservedMapping],
 ) -> Result<usize, Error> {
+    unsafe { enable_intel_protection_with_progress(unit, root_table, mappings, &mut |_| {}) }
+}
+
+unsafe fn enable_intel_protection_with_progress(
+    unit: &IommuUnit,
+    root_table: u64,
+    mappings: &[ReservedMapping],
+    progress: &mut impl FnMut(IntelTransitionStage),
+) -> Result<usize, Error> {
     if root_table >> 52 != 0 {
         return Err(Error::InvalidResources);
     }
@@ -681,15 +702,18 @@ unsafe fn enable_intel_protection(
     }
 
     // SAFETY: The caller supplied INTEL_TABLE_PAGES zeroed contiguous pages.
+    progress(IntelTransitionStage::Tables);
     let next_page = unsafe { build_intel_tables(root_table, mappings)? };
 
     // Start from a known state. Requesters without an RMRR are unable to issue
     // new DMA; firmware-reserved requesters are immediately restored below.
     // SAFETY: GCMD is the command register of this exclusively owned unit.
+    progress(IntelTransitionStage::Disable);
     unsafe { mmio_write_u32(unit.register_base, INTEL_GLOBAL_COMMAND, 0) };
     // SAFETY: GSTS is readable while the unit processes the disable command.
     unsafe {
         wait_intel_status(unit.register_base, INTEL_TRANSLATION_ENABLE, false)?;
+        progress(IntelTransitionStage::Root);
         mmio_write_u64(unit.register_base, INTEL_ROOT_TABLE_ADDRESS, root_table);
         if mmio_read_u64(unit.register_base, INTEL_ROOT_TABLE_ADDRESS) & !0xfff != root_table {
             return Err(Error::RegisterWriteFailed);
@@ -701,7 +725,8 @@ unsafe fn enable_intel_protection(
             INTEL_SET_ROOT_POINTER,
         );
         wait_intel_status(unit.register_base, INTEL_SET_ROOT_POINTER, true)?;
-        invalidate_intel_caches(unit)?;
+        invalidate_intel_caches_with_progress(unit, progress)?;
+        progress(IntelTransitionStage::Enable);
         mmio_write_u32(
             unit.register_base,
             INTEL_GLOBAL_COMMAND,
@@ -713,7 +738,15 @@ unsafe fn enable_intel_protection(
 }
 
 unsafe fn invalidate_intel_caches(unit: &IommuUnit) -> Result<(), Error> {
+    unsafe { invalidate_intel_caches_with_progress(unit, &mut |_| {}) }
+}
+
+unsafe fn invalidate_intel_caches_with_progress(
+    unit: &IommuUnit,
+    progress: &mut impl FnMut(IntelTransitionStage),
+) -> Result<(), Error> {
     unsafe {
+        progress(IntelTransitionStage::Context);
         mmio_write_u64(
             unit.register_base,
             INTEL_CONTEXT_COMMAND,
@@ -729,6 +762,7 @@ unsafe fn invalidate_intel_caches(unit: &IommuUnit) -> Result<(), Error> {
         if iotlb_offset == 0 {
             return Err(Error::UnsupportedHardware);
         }
+        progress(IntelTransitionStage::Iotlb);
         let command = iotlb_offset + 8;
         mmio_write_u64(
             unit.register_base,
