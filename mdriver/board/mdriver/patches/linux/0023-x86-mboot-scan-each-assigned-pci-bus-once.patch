@@ -1,0 +1,36 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: scan each assigned PCI bus once
+
+Assigned devices are grouped by policy kind rather than PCI bus number.  A
+display controller on bus zero may therefore be followed by an NVMe controller
+on another bus and then an xHCI controller on bus zero.  Do not try to create a
+second Linux root bus when that happens.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ arch/x86/kernel/cpu/mboot.c | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -750,14 +750,16 @@ static int __init mboot_pci_publish_frontend(void)
+ 	unsigned int active = 0;
+ 	unsigned int resource_count = 0;
+ 	unsigned int index;
+-	u8 last_bus = 0xff;
+ 
+ 	for (index = 0; index < mboot_pci_device_count; index++) {
+ 		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+ 		u8 bus = device->info.requester >> 8;
+ 
+-		if (bus != last_bus && mboot_pci_scan_bus(bus))
++		if (mboot_pci_buses[bus])
++			continue;
++		if (mboot_pci_scan_bus(bus))
+ 			return -EIO;
+-		last_bus = bus;
+ 	}
+ 	for (index = 0; index < mboot_pci_device_count; index++) {
+ 		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+-- 
+2.39.5
