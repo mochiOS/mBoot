@@ -19,6 +19,7 @@ const MAX_DOMAIN_MAPPINGS: usize = 8;
 const INTEL_VERSION: u64 = 0x00;
 const INTEL_CAPABILITY: u64 = 0x08;
 const INTEL_EXTENDED_CAPABILITY: u64 = 0x10;
+const INTEL_EXTENDED_CAPABILITY_PASS_THROUGH: u64 = 1 << 6;
 const INTEL_GLOBAL_COMMAND: u64 = 0x18;
 const INTEL_GLOBAL_STATUS: u64 = 0x1c;
 const INTEL_ROOT_TABLE_ADDRESS: u64 = 0x20;
@@ -38,6 +39,8 @@ const INTEL_INVALIDATE_CONTEXT: u64 = 1 << 63;
 const INTEL_CONTEXT_GLOBAL: u64 = 1 << 61;
 const INTEL_INVALIDATE_IOTLB: u64 = 1 << 63;
 const INTEL_IOTLB_GLOBAL: u64 = 1 << 60;
+const INTEL_CONTEXT_PRESENT: u64 = 1;
+const INTEL_CONTEXT_PASS_THROUGH: u64 = 2 << 2;
 const AMD_DEVICE_TABLE_BASE: u64 = 0x00;
 const AMD_COMMAND_BUFFER_BASE: u64 = 0x08;
 const AMD_CONTROL: u64 = 0x18;
@@ -615,6 +618,7 @@ impl DmaRemapper {
                         &unit,
                         resources.remapping_table,
                         self.topology.reserved_mappings(),
+                        Some(requester),
                         &mut progress,
                     )?
                 }
@@ -624,6 +628,7 @@ impl DmaRemapper {
                         &unit,
                         resources.remapping_table,
                         self.topology.reserved_mappings(),
+                        Some(requester),
                         &mut progress,
                     )?
                 }
@@ -795,13 +800,16 @@ unsafe fn enable_intel_protection(
     root_table: u64,
     mappings: &[ReservedMapping],
 ) -> Result<usize, Error> {
-    unsafe { enable_intel_protection_with_progress(unit, root_table, mappings, &mut |_| {}) }
+    unsafe {
+        enable_intel_protection_with_progress(unit, root_table, mappings, None, &mut |_| {})
+    }
 }
 
 unsafe fn enable_intel_protection_with_progress(
     unit: &IommuUnit,
     root_table: u64,
     mappings: &[ReservedMapping],
+    pass_through_requester: Option<u16>,
     progress: &mut impl FnMut(IntelTransitionStage),
 ) -> Result<usize, Error> {
     if root_table >> 52 != 0 {
@@ -813,13 +821,21 @@ unsafe fn enable_intel_protection_with_progress(
     // guest-address width in CAP.SAGAW.
     // SAFETY: The capability register belongs to the same mapped unit.
     let capability = unsafe { mmio_read_u64(unit.register_base, INTEL_CAPABILITY) };
+    let extended = unsafe { mmio_read_u64(unit.register_base, INTEL_EXTENDED_CAPABILITY) };
     if version == 0 || capability >> 8 & 0x04 == 0 {
+        return Err(Error::UnsupportedHardware);
+    }
+    if pass_through_requester.is_some()
+        && extended & INTEL_EXTENDED_CAPABILITY_PASS_THROUGH == 0
+    {
         return Err(Error::UnsupportedHardware);
     }
 
     // SAFETY: The caller supplied INTEL_TABLE_PAGES zeroed contiguous pages.
     progress(IntelTransitionStage::Tables);
-    let next_page = unsafe { build_intel_tables(root_table, mappings)? };
+    let next_page = unsafe {
+        build_intel_tables(root_table, mappings, pass_through_requester)?
+    };
 
     // Start from a known state. Requesters without an RMRR are unable to issue
     // new DMA; firmware-reserved requesters are immediately restored below.
@@ -868,6 +884,7 @@ unsafe fn replace_intel_protection(
     unit: &IommuUnit,
     root_table: u64,
     mappings: &[ReservedMapping],
+    pass_through_requester: Option<u16>,
     progress: &mut impl FnMut(IntelTransitionStage),
 ) -> Result<usize, Error> {
     if root_table >> 52 != 0 {
@@ -875,12 +892,20 @@ unsafe fn replace_intel_protection(
     }
     let version = unsafe { mmio_read_u32(unit.register_base, INTEL_VERSION) };
     let capability = unsafe { mmio_read_u64(unit.register_base, INTEL_CAPABILITY) };
+    let extended = unsafe { mmio_read_u64(unit.register_base, INTEL_EXTENDED_CAPABILITY) };
     if version == 0 || capability >> 8 & 0x04 == 0 {
+        return Err(Error::UnsupportedHardware);
+    }
+    if pass_through_requester.is_some()
+        && extended & INTEL_EXTENDED_CAPABILITY_PASS_THROUGH == 0
+    {
         return Err(Error::UnsupportedHardware);
     }
 
     progress(IntelTransitionStage::Tables);
-    let next_page = unsafe { build_intel_tables(root_table, mappings)? };
+    let next_page = unsafe {
+        build_intel_tables(root_table, mappings, pass_through_requester)?
+    };
 
     // Firmware may leave translation, queued invalidation, and interrupt
     // remapping active on the display unit. Keep translation enabled throughout
@@ -1036,13 +1061,32 @@ impl TableArena {
 unsafe fn build_intel_tables(
     root_table: u64,
     mappings: &[ReservedMapping],
+    pass_through_requester: Option<u16>,
 ) -> Result<usize, Error> {
     let mut arena = TableArena {
         base: root_table,
         next_page: 1,
         page_count: INTEL_TABLE_PAGES,
     };
+    if let Some(requester) = pass_through_requester {
+        let bus = usize::from(requester >> 8);
+        let device_function = usize::from(requester & 0xff);
+        let context_table = unsafe { ensure_root_entry(root_table, bus, &mut arena)? };
+        let context_low = (context_table + device_function as u64 * 16) as *mut u64;
+        // Domain 1 exists only during the firmware-display handoff. The largest
+        // supported AGAW is required for a pass-through context entry.
+        unsafe {
+            write_volatile(context_low.add(1), (1_u64 << 8) | 2);
+            write_volatile(
+                context_low,
+                INTEL_CONTEXT_PRESENT | INTEL_CONTEXT_PASS_THROUGH,
+            );
+        }
+    }
     for mapping in mappings.iter().filter(|mapping| mapping.segment == 0) {
+        if pass_through_requester == Some(mapping.requester) {
+            continue;
+        }
         if mapping.base & 0xfff != 0
             || mapping.limit & 0xfff != 0xfff
             || mapping.limit < mapping.base
@@ -2016,7 +2060,7 @@ mod tests {
             base: 0x2000_0000,
             limit: 0x203f_ffff,
         };
-        unsafe { build_intel_tables(base, &[mapping]).unwrap() };
+        unsafe { build_intel_tables(base, &[mapping], None).unwrap() };
         let root = unsafe { read_volatile(base as *const u64) };
         assert_ne!(root & 1, 0);
         let context = root & !0xfff;
@@ -2024,6 +2068,26 @@ mod tests {
         let unrelated_context = unsafe { read_volatile((context + 0x18 * 16) as *const u64) };
         assert_ne!(display_context & 1, 0);
         assert_eq!(unrelated_context, 0);
+    }
+
+    #[test]
+    fn deferred_display_uses_a_temporary_pass_through_context() {
+        #[repr(align(4096))]
+        struct Tables([u8; INTEL_TABLE_PAGES * 4096]);
+        let mut tables = Tables([0; INTEL_TABLE_PAGES * 4096]);
+        let base = tables.0.as_mut_ptr() as u64;
+        let mapping = ReservedMapping {
+            segment: 0,
+            requester: 0x0010,
+            base: 0x2000_0000,
+            limit: 0x203f_ffff,
+        };
+        unsafe { build_intel_tables(base, &[mapping], Some(0x0010)).unwrap() };
+        let context = unsafe { read_volatile(base as *const u64) } & !0xfff;
+        let low = unsafe { read_volatile((context + 0x10 * 16) as *const u64) };
+        let high = unsafe { read_volatile((context + 0x10 * 16 + 8) as *const u64) };
+        assert_eq!(low, INTEL_CONTEXT_PRESENT | INTEL_CONTEXT_PASS_THROUGH);
+        assert_eq!(high, (1_u64 << 8) | 2);
     }
 
     #[test]

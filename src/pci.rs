@@ -593,6 +593,9 @@ pub unsafe fn probe_descriptor(requester: u16) -> Result<PciDescriptor, PciError
             original_command & !COMMAND_BUS_MASTER | COMMAND_INTERRUPT_DISABLE,
         )
     };
+    if unsafe { read_u16(bus, device, function, 4) } & COMMAND_BUS_MASTER != 0 {
+        return Err(PciError::RegisterWriteFailed);
+    }
     result
 }
 
