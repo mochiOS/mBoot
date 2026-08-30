@@ -25,6 +25,8 @@ const INTEL_ROOT_TABLE_ADDRESS: u64 = 0x20;
 const INTEL_CONTEXT_COMMAND: u64 = 0x28;
 const INTEL_TRANSLATION_ENABLE: u32 = 1 << 31;
 const INTEL_SET_ROOT_POINTER: u32 = 1 << 30;
+const INTEL_QUEUED_INVALIDATION_ENABLE: u32 = 1 << 26;
+const INTEL_INTERRUPT_REMAP_ENABLE: u32 = 1 << 25;
 const INTEL_INVALIDATE_CONTEXT: u64 = 1 << 63;
 const INTEL_CONTEXT_GLOBAL: u64 = 1 << 61;
 const INTEL_INVALIDATE_IOTLB: u64 = 1 << 63;
@@ -504,13 +506,25 @@ impl DmaRemapper {
                 continue;
             }
             let resources = self.units[index].resources;
-            let next_domain_page = unsafe {
-                enable_intel_protection_with_progress(
-                    &unit,
-                    resources.remapping_table,
-                    self.topology.reserved_mappings(),
-                    &mut progress,
-                )?
+            let status = unsafe { mmio_read_u32(unit.register_base, INTEL_GLOBAL_STATUS) };
+            let next_domain_page = if status & INTEL_TRANSLATION_ENABLE != 0 {
+                unsafe {
+                    replace_intel_protection(
+                        &unit,
+                        resources.remapping_table,
+                        self.topology.reserved_mappings(),
+                        &mut progress,
+                    )?
+                }
+            } else {
+                unsafe {
+                    enable_intel_protection_with_progress(
+                        &unit,
+                        resources.remapping_table,
+                        self.topology.reserved_mappings(),
+                        &mut progress,
+                    )?
+                }
             };
             self.units[index] = UnitRuntime {
                 resources,
@@ -733,6 +747,64 @@ unsafe fn enable_intel_protection_with_progress(
             INTEL_TRANSLATION_ENABLE,
         );
         wait_intel_status(unit.register_base, INTEL_TRANSLATION_ENABLE, true)?;
+    }
+    Ok(next_page)
+}
+
+unsafe fn replace_intel_protection(
+    unit: &IommuUnit,
+    root_table: u64,
+    mappings: &[ReservedMapping],
+    progress: &mut impl FnMut(IntelTransitionStage),
+) -> Result<usize, Error> {
+    if root_table >> 52 != 0 {
+        return Err(Error::InvalidResources);
+    }
+    let version = unsafe { mmio_read_u32(unit.register_base, INTEL_VERSION) };
+    let capability = unsafe { mmio_read_u64(unit.register_base, INTEL_CAPABILITY) };
+    if version == 0 || capability >> 8 & 0x04 == 0 {
+        return Err(Error::UnsupportedHardware);
+    }
+
+    progress(IntelTransitionStage::Tables);
+    let next_page = unsafe { build_intel_tables(root_table, mappings)? };
+
+    // Firmware may leave translation, queued invalidation, and interrupt
+    // remapping active on the display unit. Keep translation enabled throughout
+    // the handoff, but stop the two optional engines before using register-based
+    // invalidation. Non-reserved PCI bus masters are disabled, and the new root
+    // reproduces every firmware-reserved requester mapping before the switch.
+    progress(IntelTransitionStage::Disable);
+    unsafe {
+        mmio_write_u32(
+            unit.register_base,
+            INTEL_GLOBAL_COMMAND,
+            INTEL_TRANSLATION_ENABLE,
+        );
+        wait_intel_status(
+            unit.register_base,
+            INTEL_QUEUED_INVALIDATION_ENABLE,
+            false,
+        )?;
+        wait_intel_status(
+            unit.register_base,
+            INTEL_INTERRUPT_REMAP_ENABLE,
+            false,
+        )?;
+
+        progress(IntelTransitionStage::Root);
+        mmio_write_u64(unit.register_base, INTEL_ROOT_TABLE_ADDRESS, root_table);
+        if mmio_read_u64(unit.register_base, INTEL_ROOT_TABLE_ADDRESS) & !0xfff != root_table {
+            return Err(Error::RegisterWriteFailed);
+        }
+        dma_table_fence();
+        mmio_write_u32(
+            unit.register_base,
+            INTEL_GLOBAL_COMMAND,
+            INTEL_TRANSLATION_ENABLE | INTEL_SET_ROOT_POINTER,
+        );
+        wait_intel_status(unit.register_base, INTEL_SET_ROOT_POINTER, true)?;
+        invalidate_intel_caches_with_progress(unit, progress)?;
     }
     Ok(next_page)
 }
