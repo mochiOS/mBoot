@@ -2438,10 +2438,12 @@ fn claim_pci_device(
                 let label: &[u8] = match stage {
                     IntelTransitionStage::Tables => b"IOMMU TABLES",
                     IntelTransitionStage::Disable => b"IOMMU DISABLE",
+                    IntelTransitionStage::WriteBuffer => b"IOMMU WRITE BUFFER",
                     IntelTransitionStage::Root => b"IOMMU ROOT",
                     IntelTransitionStage::Context => b"IOMMU CONTEXT",
                     IntelTransitionStage::Iotlb => b"IOMMU IOTLB",
                     IntelTransitionStage::Enable => b"IOMMU ENABLE",
+                    IntelTransitionStage::ProtectedMemory => b"IOMMU PROTECTED",
                 };
                 display::gpu_dma_transition(requester, label);
             })

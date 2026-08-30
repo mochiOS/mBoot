@@ -23,10 +23,16 @@ const INTEL_GLOBAL_COMMAND: u64 = 0x18;
 const INTEL_GLOBAL_STATUS: u64 = 0x1c;
 const INTEL_ROOT_TABLE_ADDRESS: u64 = 0x20;
 const INTEL_CONTEXT_COMMAND: u64 = 0x28;
+const INTEL_PROTECTED_MEMORY_ENABLE: u64 = 0x64;
 const INTEL_TRANSLATION_ENABLE: u32 = 1 << 31;
 const INTEL_SET_ROOT_POINTER: u32 = 1 << 30;
+const INTEL_WRITE_BUFFER_FLUSH: u32 = 1 << 27;
 const INTEL_QUEUED_INVALIDATION_ENABLE: u32 = 1 << 26;
 const INTEL_INTERRUPT_REMAP_ENABLE: u32 = 1 << 25;
+const INTEL_PROTECTED_MEMORY_ENABLED: u32 = 1 << 31;
+const INTEL_PROTECTED_MEMORY_STATUS: u32 = 1;
+const INTEL_CAPABILITY_PROTECTED_MEMORY: u64 = (1 << 5) | (1 << 6);
+const INTEL_CAPABILITY_WRITE_BUFFER_FLUSH: u64 = 1 << 4;
 const INTEL_INVALIDATE_CONTEXT: u64 = 1 << 63;
 const INTEL_CONTEXT_GLOBAL: u64 = 1 << 61;
 const INTEL_INVALIDATE_IOTLB: u64 = 1 << 63;
@@ -206,10 +212,12 @@ pub enum Error {
 pub enum IntelTransitionStage {
     Tables,
     Disable,
+    WriteBuffer,
     Root,
     Context,
     Iotlb,
     Enable,
+    ProtectedMemory,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -727,6 +735,7 @@ unsafe fn enable_intel_protection_with_progress(
     // SAFETY: GSTS is readable while the unit processes the disable command.
     unsafe {
         wait_intel_status(unit.register_base, INTEL_TRANSLATION_ENABLE, false)?;
+        flush_intel_write_buffer(unit, capability, 0, progress)?;
         progress(IntelTransitionStage::Root);
         mmio_write_u64(unit.register_base, INTEL_ROOT_TABLE_ADDRESS, root_table);
         if mmio_read_u64(unit.register_base, INTEL_ROOT_TABLE_ADDRESS) & !0xfff != root_table {
@@ -747,6 +756,7 @@ unsafe fn enable_intel_protection_with_progress(
             INTEL_TRANSLATION_ENABLE,
         );
         wait_intel_status(unit.register_base, INTEL_TRANSLATION_ENABLE, true)?;
+        disable_intel_protected_memory(unit, capability, progress)?;
     }
     Ok(next_page)
 }
@@ -791,6 +801,12 @@ unsafe fn replace_intel_protection(
             INTEL_INTERRUPT_REMAP_ENABLE,
             false,
         )?;
+        flush_intel_write_buffer(
+            unit,
+            capability,
+            INTEL_TRANSLATION_ENABLE,
+            progress,
+        )?;
 
         progress(IntelTransitionStage::Root);
         mmio_write_u64(unit.register_base, INTEL_ROOT_TABLE_ADDRESS, root_table);
@@ -805,8 +821,58 @@ unsafe fn replace_intel_protection(
         );
         wait_intel_status(unit.register_base, INTEL_SET_ROOT_POINTER, true)?;
         invalidate_intel_caches_with_progress(unit, progress)?;
+        disable_intel_protected_memory(unit, capability, progress)?;
     }
     Ok(next_page)
+}
+
+unsafe fn flush_intel_write_buffer(
+    unit: &IommuUnit,
+    capability: u64,
+    active_commands: u32,
+    progress: &mut impl FnMut(IntelTransitionStage),
+) -> Result<(), Error> {
+    if capability & INTEL_CAPABILITY_WRITE_BUFFER_FLUSH == 0 {
+        return Ok(());
+    }
+    progress(IntelTransitionStage::WriteBuffer);
+    unsafe {
+        mmio_write_u32(
+            unit.register_base,
+            INTEL_GLOBAL_COMMAND,
+            active_commands | INTEL_WRITE_BUFFER_FLUSH,
+        );
+        wait_intel_status(unit.register_base, INTEL_WRITE_BUFFER_FLUSH, false)
+    }
+}
+
+unsafe fn disable_intel_protected_memory(
+    unit: &IommuUnit,
+    capability: u64,
+    progress: &mut impl FnMut(IntelTransitionStage),
+) -> Result<(), Error> {
+    if capability & INTEL_CAPABILITY_PROTECTED_MEMORY == 0 {
+        return Ok(());
+    }
+    progress(IntelTransitionStage::ProtectedMemory);
+    let value = unsafe { mmio_read_u32(unit.register_base, INTEL_PROTECTED_MEMORY_ENABLE) };
+    unsafe {
+        mmio_write_u32(
+            unit.register_base,
+            INTEL_PROTECTED_MEMORY_ENABLE,
+            value & !INTEL_PROTECTED_MEMORY_ENABLED,
+        );
+    }
+    for _ in 0..REGISTER_WAIT_LIMIT {
+        if unsafe { mmio_read_u32(unit.register_base, INTEL_PROTECTED_MEMORY_ENABLE) }
+            & INTEL_PROTECTED_MEMORY_STATUS
+            == 0
+        {
+            return Ok(());
+        }
+        spin_loop();
+    }
+    Err(Error::CommandTimeout)
 }
 
 unsafe fn invalidate_intel_caches(unit: &IommuUnit) -> Result<(), Error> {
