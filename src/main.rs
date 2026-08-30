@@ -51,7 +51,7 @@ use uefi::proto::rng::Rng;
 #[cfg(feature = "uefi-net")]
 use uefi::table::boot::ScopedProtocol;
 use uefi::table::boot::{AllocateType, BootServices, MemoryType};
-use uefi::table::cfg::ACPI2_GUID;
+use uefi::table::cfg::{ACPI_GUID, ACPI2_GUID};
 #[cfg(feature = "uefi-net")]
 use uefi::CStr8;
 use uefi::CString16;
@@ -223,6 +223,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         .config_table()
         .iter()
         .find(|entry| entry.guid == ACPI2_GUID)
+        .or_else(|| {
+            system_table
+                .config_table()
+                .iter()
+                .find(|entry| entry.guid == ACPI_GUID)
+        })
         .map(|entry| entry.address as usize as u64);
 
     let features = cpu::detect();
@@ -507,6 +513,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 return Status::LOAD_ERROR;
             }
         }
+    }
+    if !device_policies.is_empty() && iommu_topology.is_none() {
+        log!("device assignment requires an ACPI IOMMU description");
+        display::failure(17);
+        return Status::UNSUPPORTED;
     }
 
     // SAFETY: All required firmware allocations are complete and no boot service

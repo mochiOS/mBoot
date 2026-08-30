@@ -1228,28 +1228,49 @@ unsafe fn dma_table_fence() {
 /// `rsdp_address` and every ACPI pointer reachable from it must remain
 /// identity-mapped and readable for the duration of this call.
 pub unsafe fn discover(rsdp_address: u64) -> Result<Option<IommuTopology>, Error> {
-    // SAFETY: The caller guarantees the RSDP mapping, initially for its fixed header.
-    let rsdp = unsafe { table_bytes(rsdp_address, 36)? };
-    if &rsdp[..8] != b"RSD PTR " || !checksum_is_zero(&rsdp[..20]) || rsdp[15] < 2 {
+    // ACPI 1.0 defines a 20-byte RSDP. Read no further until its revision says
+    // the extended ACPI 2.0 fields are present.
+    let rsdp = unsafe { table_bytes(rsdp_address, 20)? };
+    if &rsdp[..8] != b"RSD PTR " || !checksum_is_zero(rsdp) {
         return Err(Error::InvalidRsdp);
     }
-    let rsdp_length = read_u32(rsdp, 20)? as usize;
-    if !(36..=MAX_ACPI_TABLE_SIZE).contains(&rsdp_length) {
+
+    let (root_address, root_signature, entry_size) = if rsdp[15] >= 2 {
+        let rsdp = unsafe { table_bytes(rsdp_address, 36)? };
+        let rsdp_length = read_u32(rsdp, 20)? as usize;
+        if !(36..=MAX_ACPI_TABLE_SIZE).contains(&rsdp_length) {
+            return Err(Error::InvalidRsdp);
+        }
+        let rsdp = unsafe { table_bytes(rsdp_address, rsdp_length)? };
+        if !checksum_is_zero(rsdp) {
+            return Err(Error::InvalidRsdp);
+        }
+        let xsdt_address = read_u64(rsdp, 24)?;
+        if xsdt_address != 0 {
+            (xsdt_address, b"XSDT" as &[u8], 8)
+        } else {
+            (u64::from(read_u32(rsdp, 16)?), b"RSDT" as &[u8], 4)
+        }
+    } else {
+        (u64::from(read_u32(rsdp, 16)?), b"RSDT" as &[u8], 4)
+    };
+    if root_address == 0 {
         return Err(Error::InvalidRsdp);
     }
-    // SAFETY: The validated RSDP length remains within the caller-owned ACPI mapping.
-    let rsdp = unsafe { table_bytes(rsdp_address, rsdp_length)? };
-    if !checksum_is_zero(rsdp) {
-        return Err(Error::InvalidRsdp);
-    }
-    let xsdt_address = read_u64(rsdp, 24)?;
-    // SAFETY: The caller's ACPI mapping guarantee covers the XSDT pointer from the RSDP.
-    let xsdt = unsafe { acpi_table(xsdt_address)? };
-    if &xsdt[..4] != b"XSDT" || !(xsdt.len() - ACPI_HEADER_SIZE).is_multiple_of(8) {
+    let root = unsafe { acpi_table(root_address)? };
+    if &root[..4] != root_signature
+        || !(root.len() - ACPI_HEADER_SIZE).is_multiple_of(entry_size)
+    {
         return Err(Error::InvalidTable);
     }
-    for entry in xsdt[ACPI_HEADER_SIZE..].chunks_exact(8) {
-        let address = u64::from_le_bytes(entry.try_into().map_err(|_| Error::InvalidTable)?);
+    for entry in root[ACPI_HEADER_SIZE..].chunks_exact(entry_size) {
+        let address = if entry_size == 8 {
+            u64::from_le_bytes(entry.try_into().map_err(|_| Error::InvalidTable)?)
+        } else {
+            u64::from(u32::from_le_bytes(
+                entry.try_into().map_err(|_| Error::InvalidTable)?,
+            ))
+        };
         // SAFETY: XSDT entries are firmware-provided physical pointers covered by
         // the discover contract.
         let header = unsafe { table_bytes(address, ACPI_HEADER_SIZE)? };
