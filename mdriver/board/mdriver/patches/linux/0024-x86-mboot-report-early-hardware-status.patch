@@ -1,0 +1,56 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: report early Hardware Domain status
+
+Show the device inventory and PCI publication stage on mBoot's boot display.
+This leaves a useful failure message when mDriver cannot reach the control
+channel, before Linux takes ownership of the physical display controller.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ arch/x86/kernel/cpu/mboot.c | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -29,6 +29,7 @@
+ #define MBOOT_SIGNATURE "MochiOSmBoot"
+ #define MBOOT_BACKEND_INTEL_VMX 1
+ #define MBOOT_BACKEND_AMD_SVM 2
++#define MBOOT_HYPERCALL_CONSOLE_WRITE 0
+ #define MBOOT_HYPERCALL_READY 3
+ #define MBOOT_HYPERCALL_EVENT_SEND 5
+ #define MBOOT_HYPERCALL_EVENT_WAIT 6
+@@ -306,6 +307,14 @@ static unsigned long mboot_hypercall(unsigned long number,
+ 				     unsigned long arg0, unsigned long arg1,
+ 				     unsigned long arg2);
+ 
++static void mboot_boot_status(const char *status)
++{
++	mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
++			virt_to_phys((void *)status), strlen(status), 0);
++}
++
+ static void mboot_irq_mask(struct irq_data *data)
+ {
+ 	struct irq_cfg *cfg = irqd_cfg(data);
+@@ -3067,11 +3076,20 @@ static int __init mboot_report_ready(void)
+ {
+ 	unsigned long result;
+ 
+-	if (mboot_query_and_claim_devices())
++	mboot_boot_status("DISPLAY\nMDRIVER DEVICES");
++	if (mboot_query_and_claim_devices()) {
++		mboot_boot_status("DISPLAY\nMDRIVER DEVICE ERROR");
+ 		return -EIO;
+-	if (mboot_pci_device_count && mboot_pci_publish_frontend())
++	}
++	mboot_boot_status("DISPLAY\nMDRIVER PCI");
++	if (mboot_pci_device_count && mboot_pci_publish_frontend()) {
++		mboot_boot_status("DISPLAY\nMDRIVER PCI ERROR");
+ 		return -EIO;
++	}
+ 	result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_SEND,
+ 				 MBOOT_CONTROL_PORT, 0, 0);
+ 	if (result)
+-- 
+2.39.5

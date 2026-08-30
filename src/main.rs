@@ -1722,7 +1722,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         runtime.pending_result = match vm_exit.hypercall_number {
             number if number == HypercallNumber::ConsoleWrite as u64 => handle_console_write(
                 runtime.domain.id(),
-                runtime.domain.role() == DomainRole::System,
+                matches!(
+                    runtime.domain.role(),
+                    DomainRole::System | DomainRole::Hardware
+                ),
                 runtime.domain.nested_pages(),
                 vm_exit.arg0,
                 vm_exit.arg1,
