@@ -221,10 +221,31 @@ impl IommuTopology {
         Ok(())
     }
     fn push_reserved_mapping(&mut self, mapping: ReservedMapping) -> Result<(), Error> {
+        let mut merged = mapping;
+        let mut index = 0;
+        while index < self.reserved_mapping_count {
+            let known = self.reserved_mappings[index];
+            let same_requester = known.segment == merged.segment
+                && known.requester == merged.requester;
+            let touches = known.base <= merged.limit.saturating_add(1)
+                && merged.base <= known.limit.saturating_add(1);
+            if same_requester && touches {
+                merged.base = merged.base.min(known.base);
+                merged.limit = merged.limit.max(known.limit);
+                let last = self.reserved_mapping_count - 1;
+                for position in index..last {
+                    self.reserved_mappings[position] = self.reserved_mappings[position + 1];
+                }
+                self.reserved_mapping_count = last;
+                self.reserved_mappings[self.reserved_mapping_count] = EMPTY_RESERVED_MAPPING;
+                continue;
+            }
+            index += 1;
+        }
         if self.reserved_mapping_count == self.reserved_mappings.len() {
             return Err(Error::TooManyReservedMappings);
         }
-        self.reserved_mappings[self.reserved_mapping_count] = mapping;
+        self.reserved_mappings[self.reserved_mapping_count] = merged;
         self.reserved_mapping_count += 1;
         Ok(())
     }
@@ -2033,6 +2054,34 @@ mod tests {
             Ok(())
         );
         assert_eq!(topology.reserved_mappings().len(), 1);
+    }
+
+    #[test]
+    fn overlapping_reserved_ranges_are_merged_before_table_construction() {
+        let mut topology = IommuTopology::new(IommuKind::IntelVtd);
+        topology
+            .push(IommuUnit {
+                segment: 0,
+                register_base: 0xfed9_0000,
+                include_all: true,
+                ..EMPTY_UNIT
+            })
+            .unwrap();
+        topology
+            .reserve_identity_range(0, 0x0010, 0x7800_0000, 0x7fff_ffff)
+            .unwrap();
+        topology
+            .reserve_identity_range(0, 0x0010, 0x7780_0000, 0x780f_ffff)
+            .unwrap();
+        assert_eq!(
+            topology.reserved_mappings(),
+            &[ReservedMapping {
+                segment: 0,
+                requester: 0x0010,
+                base: 0x7780_0000,
+                limit: 0x7fff_ffff,
+            }]
+        );
     }
 
     #[test]
