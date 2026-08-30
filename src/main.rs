@@ -248,7 +248,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         features.address_space_ids
     );
 
-    let iommu_topology = match rsdp_address {
+    let mut iommu_topology = match rsdp_address {
         // SAFETY: UEFI supplied this ACPI 2.0 RSDP pointer and Boot Services are
         // still active, so the firmware tables remain identity-mapped here.
         Some(address) => match unsafe { iommu::discover(address) } {
@@ -614,6 +614,31 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             requester >> 3 & 0x1f,
             requester & 7
         );
+        if let (Some(topology), Some(framebuffer)) =
+            (iommu_topology.as_mut(), firmware_framebuffer)
+        {
+            let base = framebuffer.address & !0xfff;
+            let Some(limit) = framebuffer
+                .address
+                .checked_add(framebuffer.size)
+                .and_then(|end| end.checked_add(0xfff))
+                .map(|end| (end & !0xfff).saturating_sub(1))
+            else {
+                halt_with_error("GOP framebuffer DMA range", mboot::Error::InvalidPage)
+            };
+            if topology
+                .reserve_identity_range(0, requester, base, limit)
+                .is_err()
+            {
+                halt_with_error("GOP framebuffer DMA range", mboot::Error::InvalidPage)
+            }
+            log!(
+                "PCI display {:04x} retains GOP framebuffer DMA range {:#x}..={:#x}",
+                requester,
+                base,
+                limit
+            );
+        }
     }
     let mut devices =
         match DeviceTable::from_pci(quarantine.inventory(), deferred_display, &device_policies) {

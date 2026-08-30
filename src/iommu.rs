@@ -142,6 +142,42 @@ impl IommuTopology {
         &self.reserved_mappings[..self.reserved_mapping_count]
     }
 
+    /// Adds one firmware-owned identity range for a specific requester. This is
+    /// used for boot resources such as a GOP framebuffer that are discovered
+    /// outside DMAR but must remain reachable during a controlled handoff.
+    pub fn reserve_identity_range(
+        &mut self,
+        segment: u16,
+        requester: u16,
+        base: u64,
+        limit: u64,
+    ) -> Result<(), Error> {
+        if self.kind != IommuKind::IntelVtd
+            || requester == 0
+            || base & 0xfff != 0
+            || limit & 0xfff != 0xfff
+            || limit < base
+            || limit >> 52 != 0
+            || !self.covers_requester(segment, requester)
+        {
+            return Err(Error::InvalidResources);
+        }
+        if self.reserved_mappings().iter().any(|mapping| {
+            mapping.segment == segment
+                && mapping.requester == requester
+                && mapping.base <= base
+                && mapping.limit >= limit
+        }) {
+            return Ok(());
+        }
+        self.push_reserved_mapping(ReservedMapping {
+            segment,
+            requester,
+            base,
+            limit,
+        })
+    }
+
     /// Returns whether one remapping unit is authoritative for a requester.
     /// Explicit VT-d scopes take precedence over an include-all unit.
     fn unit_handles_requester(&self, index: usize, segment: u16, requester: u16) -> bool {
@@ -1967,6 +2003,36 @@ mod tests {
         let unrelated_context = unsafe { read_volatile((context + 0x18 * 16) as *const u64) };
         assert_ne!(display_context & 1, 0);
         assert_eq!(unrelated_context, 0);
+    }
+
+    #[test]
+    fn gop_identity_range_is_scoped_to_one_covered_requester() {
+        let mut topology = IommuTopology::new(IommuKind::IntelVtd);
+        topology
+            .push(IommuUnit {
+                segment: 0,
+                register_base: 0xfed9_0000,
+                include_all: true,
+                ..EMPTY_UNIT
+            })
+            .unwrap();
+        topology
+            .reserve_identity_range(0, 0x0010, 0x8000_0000, 0x803f_ffff)
+            .unwrap();
+        assert_eq!(
+            topology.reserved_mappings(),
+            &[ReservedMapping {
+                segment: 0,
+                requester: 0x0010,
+                base: 0x8000_0000,
+                limit: 0x803f_ffff,
+            }]
+        );
+        assert_eq!(
+            topology.reserve_identity_range(0, 0x0010, 0x8000_1000, 0x8000_1fff),
+            Ok(())
+        );
+        assert_eq!(topology.reserved_mappings().len(), 1);
     }
 
     #[test]
