@@ -19,6 +19,7 @@ DESKTOP_MARKER=${HV_DESKTOP_MARKER:-}
 IOMMU_TEST=${HV_IOMMU_TEST:-intel}
 
 QEMU_GPU_ARGS=()
+QEMU_MACHINE=q35
 if [[ $GPU_TEST == 1 ]]; then
     if [[ $IOMMU_TEST == amd ]]; then
         QEMU_GPU_ARGS+=(
@@ -27,6 +28,9 @@ if [[ $GPU_TEST == 1 ]]; then
             -device virtio-gpu-pci,disable-legacy=on,iommu_platform=on
         )
     else
+        # QEMU cannot expose interrupt remapping through the in-kernel irqchip.
+        # Split mode keeps interrupt routing visible to the emulated VT-d unit.
+        QEMU_MACHINE=q35,kernel-irqchip=split
         QEMU_GPU_ARGS+=(
             -device intel-iommu,intremap=on
             -vga none
@@ -56,7 +60,7 @@ cp --sparse=always "$IMAGE" "$WORK/mochiOS.img"
 "$QEMU" \
     -accel "$ACCEL" \
     -cpu "$CPU" \
-    -machine q35 \
+    -machine "$QEMU_MACHINE" \
     -boot menu=off,strict=on \
     -smp 1 \
     -m "$MEMORY_MIB" \
