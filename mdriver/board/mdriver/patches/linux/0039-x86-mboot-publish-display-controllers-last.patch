@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000039 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 01:45:00 +0900
+Subject: [PATCH] x86/mboot: publish display controllers last
+
+Publishing another PCI function after a native GPU driver binds can make the
+diagnostic console write through a framebuffer the firmware no longer owns.
+Publish non-display functions first, announce the display probe before it
+starts, and only write a result afterwards when no GPU driver was bound.  The
+last visible message then also distinguishes an unbound driver from a bound
+driver that has not produced its framebuffer yet.
+---
+ arch/x86/kernel/cpu/mboot.c | 52 +++++++++++++++++++++++--------------
+ 1 file changed, 32 insertions(+), 20 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 666666666666..777777777777 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -778,6 +778,7 @@
+ 	unsigned int active = 0;
+ 	unsigned int resource_count = 0;
+ 	unsigned int index;
++	unsigned int pass;
+ 
+ 	for (index = 0; index < mboot_pci_device_count; index++) {
+ 		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+@@ -878,21 +879,35 @@
+ 		mboot_pci_device_count, resource_count, active);
+ 	mboot_boot_device_error("PCI BIND", mboot_pci_devices[0].info.requester);
+ 	mdelay(1000);
+-	for (index = 0; index < mboot_pci_device_count; index++) {
+-		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+-		u8 bus = device->info.requester >> 8;
+-		u8 devfn = device->info.requester & 0xff;
+-		struct pci_dev *pdev;
++	/*
++	 * Publish display controllers last.  Once a native GPU driver binds,
++	 * the firmware framebuffer no longer belongs to this diagnostic path.
++	 */
++	for (pass = 0; pass < 2; pass++) {
++		for (index = 0; index < mboot_pci_device_count; index++) {
++			struct mboot_pci_frontend *device = &mboot_pci_devices[index];
++			bool display = device->info.class == PCI_BASE_CLASS_DISPLAY;
++			u8 bus = device->info.requester >> 8;
++			u8 devfn = device->info.requester & 0xff;
++			struct pci_dev *pdev;
+ 
+-		mboot_boot_device_error("BIND", device->info.requester);
+-		pdev = pci_get_domain_bus_and_slot(0, bus, devfn);
+-		if (!pdev)
+-			return -ENODEV;
+-		pci_bus_add_device(pdev);
+-		device->driver_matched = pdev->dev.can_match;
+-		device->driver_bound = device_is_bound(&pdev->dev);
+-		pci_dev_put(pdev);
+-		mboot_boot_device_error("BOUND", device->info.requester);
++			if (display != (pass == 1))
++				continue;
++			mboot_boot_device_error(display ? "GPU PROBE" : "BIND",
++						device->info.requester);
++			pdev = pci_get_domain_bus_and_slot(0, bus, devfn);
++			if (!pdev)
++				return -ENODEV;
++			pci_bus_add_device(pdev);
++			device->driver_matched = pdev->dev.can_match;
++			device->driver_bound = device_is_bound(&pdev->dev);
++			pci_dev_put(pdev);
++			if (!display)
++				mboot_boot_device_error("BOUND", device->info.requester);
++			else if (!device->driver_bound)
++				mboot_boot_device_error("GPU UNBOUND",
++							device->info.requester);
++		}
+ 	}
+ 	return 0;
+ }
+-- 
+2.43.0

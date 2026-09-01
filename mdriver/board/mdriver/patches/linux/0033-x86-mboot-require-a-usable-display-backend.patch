@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000033 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 19:20:00 +0900
+Subject: [PATCH] x86/mboot: require a usable display backend
+
+Do not report the Hardware Domain as ready merely because its assigned PCI
+devices were published.  A display controller is useful to mochiOS only after
+a Linux driver is bound and a 32-bit framebuffer with imageblit support is
+available.  Wait briefly for asynchronous driver setup and leave a precise
+boot-screen error when the backend cannot be used.
+---
+ arch/x86/kernel/cpu/mboot.c | 92 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 92 insertions(+)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 111111111111..222222222222 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -1007,6 +1007,96 @@ static void *mboot_display_buffer;
+ static unsigned long mboot_display_grant_ref;
+ static u32 mboot_display_device_id;
+ static struct fb_info *mboot_display_info;
++static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info);
++
++static int __init mboot_wait_for_display_backend(void)
++{
++	unsigned int attempt;
++	bool display_present = false;
++	bool driver_bound = false;
++	bool driver_matched = false;
++	u16 display_vendor = 0;
++	u16 display_device = 0;
++
++	for (attempt = 0; attempt < mboot_pci_device_count; attempt++) {
++		const struct mboot_pci_frontend *device =
++			&mboot_pci_devices[attempt];
++		struct pci_dev *pdev;
++
++		if (mboot_control_device_kind(&device->info) !=
++		    MBOOT_DEVICE_KIND_DISPLAY)
++			continue;
++		display_present = true;
++		display_vendor = device->config[PCI_VENDOR_ID / 4] & 0xffff;
++		display_device = device->config[PCI_VENDOR_ID / 4] >> 16;
++		pdev = pci_get_domain_bus_and_slot(0,
++					       device->info.requester >> 8,
++					       device->info.requester & 0xff);
++		if (pdev) {
++			driver_matched = pdev->dev.can_match;
++			driver_bound = device_is_bound(&pdev->dev);
++			pci_dev_put(pdev);
++		}
++		if (driver_bound)
++			break;
++	}
++	if (!display_present)
++		return 0;
++
++	mboot_boot_status("DISPLAY\nMDRIVER GPU WAIT");
++	for (attempt = 0; attempt < 100; attempt++) {
++		if (driver_bound && num_registered_fb && registered_fb[0] &&
++		    registered_fb[0]->var.bits_per_pixel == 32 &&
++		    registered_fb[0]->fbops &&
++		    registered_fb[0]->fbops->fb_imageblit) {
++			mboot_boot_status("DISPLAY\nMDRIVER GPU READY");
++			return 0;
++		}
++		msleep(50);
++		if (!driver_bound) {
++			unsigned int index;
++
++			for (index = 0; index < mboot_pci_device_count; index++) {
++				const struct mboot_pci_frontend *device =
++					&mboot_pci_devices[index];
++				struct pci_dev *pdev;
++
++				if (mboot_control_device_kind(&device->info) !=
++				    MBOOT_DEVICE_KIND_DISPLAY)
++					continue;
++				pdev = pci_get_domain_bus_and_slot(0,
++						device->info.requester >> 8,
++						device->info.requester & 0xff);
++				if (pdev) {
++					/* Retry once after deferred probes have had time to run. */
++					if (attempt == 20 && !device_is_bound(&pdev->dev)) {
++						int attach_result = device_attach(&pdev->dev);
++
++						pr_info("mDriver: display probe retry returned %d\n",
++							attach_result);
++					}
++					driver_matched = pdev->dev.can_match;
++					driver_bound = device_is_bound(&pdev->dev);
++					pci_dev_put(pdev);
++				}
++				if (driver_bound)
++					break;
++			}
++		}
++	}
++	if (!driver_bound) {
++		char status[64];
++
++		scnprintf(status, sizeof(status),
++			  "DISPLAY\nMDRIVER GPU %s\n%04X %04X",
++			  driver_matched ? "PROBE ERROR" : "NO MATCH",
++			  display_vendor, display_device);
++		mboot_boot_status(status);
++	} else {
++		mboot_boot_status("DISPLAY\nMDRIVER GPU NO FB");
++	}
++	return -ENODEV;
++}
+ 
+ static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info)
+ {
+@@ -3133,6 +3223,8 @@ static int __init mboot_report_ready(void)
+ 		mboot_boot_status("DISPLAY\nMDRIVER PCI ERROR");
+ 		return -EIO;
+ 	}
++	if (mboot_wait_for_display_backend())
++		return -EIO;
+ 	result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_SEND,
+ 				 MBOOT_CONTROL_PORT, 0, 0);
+ 	if (result)
+-- 
+2.43.0

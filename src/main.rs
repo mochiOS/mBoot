@@ -58,7 +58,7 @@ use uefi::CStr8;
 use uefi::CString16;
 
 const MAX_MEMORY_REGIONS: usize = 256;
-const MAX_GUEST_MEMORY_PAGES: usize = 65_536;
+const MAX_GUEST_MEMORY_PAGES: usize = 131_072;
 const GRANT_WINDOW_PAGES: usize = 16;
 const DEVICE_WINDOW_PAGES: usize = 64;
 const DOMAIN_STACK_BYTES: u64 = 1024 * 1024;
@@ -516,7 +516,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         }
     }
     let firmware_framebuffer = display::framebuffer_info();
-    let firmware_framebuffer_fallback = iommu_topology.is_none() && firmware_framebuffer.is_some();
+    let display_assignment_requested = device_policies
+        .iter()
+        .any(|policy| policy.kind == ManifestDeviceKind::Display);
+    let firmware_framebuffer_fallback = firmware_framebuffer.is_some()
+        && (iommu_topology.is_none() || !display_assignment_requested);
     if !device_policies.is_empty() && iommu_topology.is_none() {
         let automatic_fallback_is_safe = firmware_framebuffer_fallback
             && device_policies.iter().all(|policy| {
@@ -695,8 +699,28 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             iommu::DmaRemapper::initialize(topology, &iommu_resources, deferred_display)
         } {
             Ok(remapper) => remapper,
-            Err(error) => halt_with_error("IOMMU protection", iommu_error(error)),
+            Err(error) => {
+                log!("IOMMU protection initialization failed: {:?}", error);
+                display::iommu_initialization_failure(iommu_error_label(error));
+                halt()
+            }
         };
+        if let Some(requester) = deferred_display {
+            // The remapper now limits the firmware GPU to its GOP and stolen
+            // memory identity ranges. Resume scanout only after that boundary
+            // exists; doing this before IOMMU enable would reopen unrestricted
+            // DMA from the display controller.
+            if unsafe { pci::resume_firmware_display(requester) }.is_err() {
+                log!("firmware display scanout could not be resumed");
+                halt_with_error("PCI DMA quarantine", mboot::Error::DeviceQuarantineFailed)
+            }
+            log!(
+                "PCI display {:02x}:{:02x}.{} firmware scanout resumed behind IOMMU",
+                requester >> 8,
+                requester >> 3 & 0x1f,
+                requester & 7
+            );
+        }
         log!(
             "IOMMU DMA protection enabled: {:?} {}",
             topology.kind(),
@@ -861,6 +885,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
             BackendKind::AmdSvm => HYPERVISOR_BACKEND_AMD_SVM,
         };
+        let external_device_window_start = external_device_window_start(domain.nested_pages());
         let mut boot_info = DomainBootInfo::new(
             domain.id().get(),
             0,
@@ -871,8 +896,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             boot_module_size,
             grant_window_start(domain.nested_pages()),
             GRANT_WINDOW_PAGES as u64 * 4096,
-            DEVICE_WINDOW_START,
-            DEVICE_WINDOW_LIMIT - DEVICE_WINDOW_START,
+            external_device_window_start,
+            DEVICE_WINDOW_LIMIT - external_device_window_start,
             0,
             domain.capabilities(),
         )
@@ -1797,14 +1822,26 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 _ => None,
             };
             runtime_domains[index].pending_result = match (vector, masked) {
-                (Some(vector), Some(masked))
-                    if vm_exit.arg2 == 0
-                        && runtime_domains[index]
-                            .interrupts
-                            .set_masked(vector, masked)
-                            .is_ok() =>
-                {
-                    HYPERCALL_SUCCESS
+                (Some(vector), Some(masked)) if vm_exit.arg2 == 0 => {
+                    let domain_id = runtime_domains[index].domain.id().get();
+                    let result = if masked {
+                        unsafe { pci_assignments.set_interrupt_mask(domain_id, vector, true) }
+                            .and_then(|()| {
+                                runtime_domains[index].interrupts.set_masked(vector, true)
+                                    .map_err(|_| pci::PciError::InvalidState)
+                            })
+                    } else {
+                        runtime_domains[index].interrupts.set_masked(vector, false)
+                            .map_err(|_| pci::PciError::InvalidState)
+                            .and_then(|()| unsafe {
+                                pci_assignments.set_interrupt_mask(domain_id, vector, false)
+                            })
+                    };
+                    if result.is_ok() {
+                        HYPERCALL_SUCCESS
+                    } else {
+                        HYPERCALL_INVALID_ARGUMENT
+                    }
                 }
                 _ => HYPERCALL_INVALID_ARGUMENT,
             };
@@ -1851,15 +1888,63 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             continue;
         }
         runtime.pending_result = match vm_exit.hypercall_number {
+            number if number == HypercallNumber::FirmwareFramebufferPresent as u64 => {
+                let x = vm_exit.arg0 as u32;
+                let y = (vm_exit.arg0 >> 32) as u32;
+                let width = vm_exit.arg1 as u32;
+                let height = (vm_exit.arg1 >> 32) as u32;
+                let byte_len = u64::from(width)
+                    .checked_mul(u64::from(height))
+                    .and_then(|pixels| pixels.checked_mul(4));
+                let pixels = byte_len
+                    .filter(|length| {
+                        *length != 0
+                            && *length
+                                <= mnu_abi::hypervisor::FIRMWARE_FRAMEBUFFER_MAX_TRANSFER as u64
+                    })
+                    .and_then(|length| {
+                        runtime
+                            .domain
+                            .nested_pages()
+                            .guest_host_address(vm_exit.arg2, length)
+                            .map(|address| (address, length))
+                    });
+                if runtime.domain.role() != DomainRole::System
+                    || !firmware_framebuffer_fallback
+                    || firmware_framebuffer.is_none()
+                    || pixels.is_none()
+                {
+                    HYPERCALL_INVALID_ARGUMENT
+                } else {
+                    let (address, length) = pixels.expect("validated framebuffer pixels");
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(address as *const u8, length as usize)
+                    };
+                    if display::present_firmware_frame(
+                        firmware_framebuffer.expect("validated firmware framebuffer"),
+                        x,
+                        y,
+                        width,
+                        height,
+                        bytes,
+                    ) {
+                        HYPERCALL_SUCCESS
+                    } else {
+                        HYPERCALL_INVALID_ARGUMENT
+                    }
+                }
+            }
             number if number == HypercallNumber::ConsoleWrite as u64 => handle_console_write(
                 runtime.domain.id(),
                 matches!(
                     runtime.domain.role(),
                     DomainRole::System | DomainRole::Hardware
                 ),
+                runtime.domain.role() == DomainRole::Hardware,
                 runtime.domain.nested_pages(),
                 vm_exit.arg0,
                 vm_exit.arg1,
+                vm_exit.arg2,
             ),
             number if number == HypercallNumber::Yield as u64 => {
                 runtime.yield_count += 1;
@@ -1886,7 +1971,6 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                         }
                     } else {
                         log!("Hardware Domain {} ready", runtime.domain.id().get());
-                        display::hardware_ready();
                         if deferred_display.is_some() {
                             // Keep the firmware framebuffer available while
                             // mDriver enumerates and probes the transferred GPU.
@@ -1894,6 +1978,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                             // replacement display backend is known to exist.
                             display::handoff();
                             log!("boot display diagnostics handed off to the Hardware Domain");
+                        } else {
+                            display::hardware_ready();
                         }
                     }
                     HYPERCALL_SUCCESS
@@ -2189,6 +2275,7 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
         BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
         BackendKind::AmdSvm => HYPERVISOR_BACKEND_AMD_SVM,
     };
+    let external_device_window_start = external_device_window_start(runtime.domain.nested_pages());
     let boot_info = DomainBootInfo::new(
         runtime.domain.id().get(),
         0,
@@ -2199,8 +2286,8 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
         boot_module_size,
         grant_window_start(runtime.domain.nested_pages()),
         GRANT_WINDOW_PAGES as u64 * 4096,
-        DEVICE_WINDOW_START,
-        DEVICE_WINDOW_LIMIT - DEVICE_WINDOW_START,
+        external_device_window_start,
+        DEVICE_WINDOW_LIMIT - external_device_window_start,
         runtime.restart_count,
         runtime.domain.capabilities(),
     )
@@ -2323,9 +2410,11 @@ fn notify_system_domain(runtime_domains: &mut [RuntimeDomain]) {
 fn handle_console_write(
     domain_id: DomainId,
     allow_display: bool,
+    allow_device_status: bool,
     memory: &NestedPageTable,
     address: u64,
     len: u64,
+    detail: u64,
 ) -> u64 {
     if len > MAX_CONSOLE_WRITE {
         return HYPERCALL_INVALID_ARGUMENT;
@@ -2343,6 +2432,8 @@ fn handle_console_write(
     if allow_display {
         if let Some(report) = bytes.strip_prefix(b"DISPLAY\n") {
             let _ = crate::display::console_page(report);
+        } else if allow_device_status && (1..=u64::from(u16::MAX) + 1).contains(&detail) {
+            crate::display::mdriver_device_status((detail - 1) as u16, bytes);
         }
     }
     HYPERCALL_SUCCESS
@@ -2380,24 +2471,35 @@ fn claim_pci_device(
                 pci::PciError::InterruptUnavailable => b"IRQ ERROR",
                 pci::PciError::RegisterWriteFailed => b"PCI WRITE ERROR",
             };
-            display::mdriver_claim_failure(requester, stage);
+            if error == pci::PciError::InvalidBar {
+                if let Some(failure) = pci::last_bar_probe_failure() {
+                    display::mdriver_bar_value_failure(requester, failure);
+                } else {
+                    display::mdriver_claim_failure(requester, stage);
+                }
+            } else {
+                display::mdriver_claim_failure(requester, stage);
+            }
             return false;
         }
     };
     if descriptor.bars[..descriptor.bar_count]
         .iter()
-        .any(|bar| !memory_map.allows_device_mmio(bar.physical_address, bar.length))
+        .any(|bar| {
+            bar.host_page_range()
+                .is_none_or(|(start, len)| !memory_map.allows_device_mmio(start, len))
+        })
     {
         log!("PCI requester {:04x} exposed an unsafe MMIO BAR", requester);
         display::mdriver_claim_failure(requester, b"MMIO ERROR");
         return false;
     }
-    let window_start = DEVICE_WINDOW_START;
+    let window_start = external_device_window_start(runtime_domains[index].domain.nested_pages());
     let bars = match assignments.insert(
         domain_id,
         descriptor,
         window_start,
-        DEVICE_WINDOW_LIMIT - DEVICE_WINDOW_START,
+        DEVICE_WINDOW_LIMIT - window_start,
     ) {
         Ok(bars) => {
             let mut copied = [pci::PciBar::default(); pci::MAX_DEVICE_BARS];
@@ -2430,11 +2532,37 @@ fn claim_pci_device(
     let mut mapped_bars = [pci::PciBar::default(); pci::MAX_DEVICE_BARS];
     let mut mapped_count = 0;
     for bar in bars.iter().filter(|bar| bar.length != 0) {
+        let Some((guest_start, mapped_len)) = bar.guest_page_range() else {
+            if !rollback_pci_mapping(
+                index,
+                runtime_domains,
+                assignments,
+                requester,
+                mapped_bars,
+            ) {
+                halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
+            }
+            display::mdriver_claim_failure(requester, b"EPT RANGE ERROR");
+            return false;
+        };
+        let Some((host_start, _)) = bar.host_page_range() else {
+            if !rollback_pci_mapping(
+                index,
+                runtime_domains,
+                assignments,
+                requester,
+                mapped_bars,
+            ) {
+                halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
+            }
+            display::mdriver_claim_failure(requester, b"EPT RANGE ERROR");
+            return false;
+        };
         if unsafe {
             runtime_domains[index]
                 .domain
                 .nested_pages()
-                .map_device_range(bar.guest_address, bar.physical_address, bar.length)
+                .map_device_range(guest_start, host_start, mapped_len)
         }
         .is_err()
         {
@@ -2526,11 +2654,17 @@ fn claim_pci_device(
         .domain
         .nested_pages()
         .guest_memory_size();
-    if unsafe { remapper.assign(0, requester, domain_id, guest_base, guest_size) }.is_err() {
+    if let Err(error) = unsafe { remapper.assign(0, requester, domain_id, guest_base, guest_size) } {
+        log!(
+            "PCI requester {:04x} DMA mapping failed for Domain {}: {:?}",
+            requester,
+            domain_id,
+            error
+        );
         if !rollback_pci_mapping(index, runtime_domains, assignments, requester, bars) {
             halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
         }
-        display::mdriver_claim_failure(requester, b"DMA MAP ERROR");
+        display::mdriver_dma_map_failure(requester, iommu_error_label(error));
         return false;
     }
     let firmware_display = devices.is_firmware_deferred(requester);
@@ -2615,11 +2749,14 @@ fn restore_pci_mapping(
 ) -> bool {
     let nested_root = runtime_domains[index].domain.nested_pages().hardware_root();
     for bar in bars.iter().filter(|bar| bar.length != 0) {
+        let Some((guest_start, mapped_len)) = bar.guest_page_range() else {
+            return false;
+        };
         if unsafe {
             runtime_domains[index]
                 .domain
                 .nested_pages()
-                .unmap_device_range(bar.guest_address, bar.length)
+                .unmap_device_range(guest_start, mapped_len)
         }
         .is_err()
         {
@@ -2644,6 +2781,10 @@ fn abi_domain_role(role: DomainRole) -> u32 {
 
 fn grant_window_start(memory: &NestedPageTable) -> u64 {
     memory.guest_memory_size() - GRANT_WINDOW_PAGES as u64 * 4096
+}
+
+fn external_device_window_start(memory: &NestedPageTable) -> u64 {
+    align_up_4k(memory.guest_memory_size().max(DEVICE_WINDOW_START))
 }
 
 fn device_window_start(memory: &NestedPageTable) -> u64 {
@@ -2711,11 +2852,20 @@ fn allocate_zeroed_pages(boot_services: &BootServices, pages: usize) -> Result<u
     Ok(address)
 }
 
-fn iommu_error(error: iommu::Error) -> mboot::Error {
+fn iommu_error_label(error: iommu::Error) -> &'static [u8] {
     match error {
-        iommu::Error::UnsupportedHardware => mboot::Error::UnsupportedIommu,
-        iommu::Error::CommandTimeout => mboot::Error::IommuCommandTimeout,
-        _ => mboot::Error::IommuInitializationFailed,
+        iommu::Error::InvalidRsdp => b"INVALID RSDP",
+        iommu::Error::InvalidTable => b"INVALID TABLE",
+        iommu::Error::TooManyUnits => b"TOO MANY UNITS",
+        iommu::Error::TooManyReservedMappings => b"TOO MANY RMRR",
+        iommu::Error::InvalidResources => b"INVALID RESOURCES",
+        iommu::Error::UnsupportedHardware => b"UNSUPPORTED MODE",
+        iommu::Error::RegisterWriteFailed => b"REGISTER COMMAND",
+        iommu::Error::CommandTimeout => b"COMMAND TIMEOUT",
+        iommu::Error::DeviceNotCovered => b"DEVICE UNCOVERED",
+        iommu::Error::ReservedDevice => b"RESERVED DEVICE",
+        iommu::Error::DomainIdUnavailable => b"DOMAIN ID",
+        iommu::Error::TableExhausted => b"TABLE EXHAUSTED",
     }
 }
 

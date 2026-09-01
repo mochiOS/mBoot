@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000034 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 19:50:00 +0900
+Subject: [PATCH] x86/mboot: avoid sleeping during display check
+
+The early Hardware Domain does not yet have a reliable scheduler timer for
+msleep().  Do not block its late initcall while checking the display backend.
+The PCI core has already attempted a synchronous probe, so retry it once and
+report the resulting match and bind state immediately.
+---
+ arch/x86/kernel/cpu/mboot.c | 65 ++++++++++---------------------------
+ 1 file changed, 16 insertions(+), 49 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 01db2db00000..7c0974100000 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -1011,16 +1011,16 @@ static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info);
+ 
+ static int __init mboot_wait_for_display_backend(void)
+ {
+-	unsigned int attempt;
++	unsigned int index;
+ 	bool display_present = false;
+ 	bool driver_bound = false;
+ 	bool driver_matched = false;
+ 	u16 display_vendor = 0;
+ 	u16 display_device = 0;
+ 
+-	for (attempt = 0; attempt < mboot_pci_device_count; attempt++) {
++	for (index = 0; index < mboot_pci_device_count; index++) {
+ 		const struct mboot_pci_frontend *device =
+-			&mboot_pci_devices[attempt];
++			&mboot_pci_devices[index];
+ 		struct pci_dev *pdev;
+ 
+ 		if (mboot_control_device_kind(&device->info) !=
+@@ -1033,8 +1033,17 @@ static int __init mboot_wait_for_display_backend(void)
+ 					       device->info.requester >> 8,
+ 					       device->info.requester & 0xff);
+ 		if (pdev) {
++			int attach_result = 1;
++
+ 			driver_matched = pdev->dev.can_match;
+ 			driver_bound = device_is_bound(&pdev->dev);
++			if (!driver_bound) {
++				attach_result = device_attach(&pdev->dev);
++				driver_matched = pdev->dev.can_match;
++				driver_bound = device_is_bound(&pdev->dev);
++			}
++			pr_info("mDriver: display probe result %d, matched=%u, bound=%u\n",
++				attach_result, driver_matched, driver_bound);
+ 			pci_dev_put(pdev);
+ 		}
+ 		if (driver_bound)
+@@ -1043,46 +1052,11 @@ static int __init mboot_wait_for_display_backend(void)
+ 	if (!display_present)
+ 		return 0;
+ 
+-	mboot_boot_status("DISPLAY\nMDRIVER GPU WAIT");
+-	for (attempt = 0; attempt < 100; attempt++) {
+-		if (driver_bound && num_registered_fb && registered_fb[0] &&
+-		    registered_fb[0]->var.bits_per_pixel == 32 &&
+-		    registered_fb[0]->fbops &&
+-		    registered_fb[0]->fbops->fb_imageblit) {
+-			mboot_boot_status("DISPLAY\nMDRIVER GPU READY");
+-			return 0;
+-		}
+-		msleep(50);
+-		if (!driver_bound) {
+-			unsigned int index;
+-
+-			for (index = 0; index < mboot_pci_device_count; index++) {
+-				const struct mboot_pci_frontend *device =
+-					&mboot_pci_devices[index];
+-				struct pci_dev *pdev;
+-
+-				if (mboot_control_device_kind(&device->info) !=
+-				    MBOOT_DEVICE_KIND_DISPLAY)
+-					continue;
+-				pdev = pci_get_domain_bus_and_slot(0,
+-						device->info.requester >> 8,
+-						device->info.requester & 0xff);
+-				if (pdev) {
+-					/* Retry once after deferred probes have had time to run. */
+-					if (attempt == 20 && !device_is_bound(&pdev->dev)) {
+-						int attach_result = device_attach(&pdev->dev);
+-
+-						pr_info("mDriver: display probe retry returned %d\n",
+-							attach_result);
+-					}
+-					driver_matched = pdev->dev.can_match;
+-					driver_bound = device_is_bound(&pdev->dev);
+-					pci_dev_put(pdev);
+-				}
+-				if (driver_bound)
+-					break;
+-			}
+-		}
++	if (driver_bound && num_registered_fb && registered_fb[0] &&
++	    registered_fb[0]->var.bits_per_pixel == 32 &&
++	    registered_fb[0]->fbops && registered_fb[0]->fbops->fb_imageblit) {
++		mboot_boot_status("DISPLAY\nMDRIVER GPU READY");
++		return 0;
+ 	}
+ 	if (!driver_bound) {
+ 		char status[64];
+-- 
+2.43.0

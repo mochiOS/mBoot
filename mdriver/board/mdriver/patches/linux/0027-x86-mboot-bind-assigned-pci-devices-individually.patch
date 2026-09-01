@@ -1,0 +1,40 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: bind assigned PCI devices individually
+
+The synthetic root buses contain only functions assigned by mBoot. Register
+those functions one at a time so driver-probe stalls retain the responsible
+requester on the boot display instead of leaving only a bus-wide status.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ arch/x86/kernel/cpu/mboot.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -866,9 +866,20 @@ static int __init mboot_pci_publish_frontend(void)
+ 	pr_info("mDriver: mBoot PCI frontend ready: %u devices, %u resources, %u active\n",
+ 		mboot_pci_device_count, resource_count, active);
+ 	mboot_boot_status("DISPLAY\nMDRIVER PCI BIND");
+-	for (index = 0; index < ARRAY_SIZE(mboot_pci_buses); index++)
+-		if (mboot_pci_buses[index])
+-			pci_bus_add_devices(mboot_pci_buses[index]);
++	for (index = 0; index < mboot_pci_device_count; index++) {
++		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
++		u8 bus = device->info.requester >> 8;
++		u8 devfn = device->info.requester & 0xff;
++		struct pci_dev *pdev;
++
++		mboot_boot_device_error("BIND", device->info.requester);
++		pdev = pci_get_domain_bus_and_slot(0, bus, devfn);
++		if (!pdev)
++			return -ENODEV;
++		pci_bus_add_device(pdev);
++		pci_dev_put(pdev);
++		mboot_boot_device_error("BOUND", device->info.requester);
++	}
+ 	mboot_boot_status("DISPLAY\nMDRIVER PCI READY");
+ 	return 0;
+ }
+-- 
+2.39.5

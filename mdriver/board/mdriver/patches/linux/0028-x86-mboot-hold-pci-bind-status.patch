@@ -1,0 +1,26 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: identify first PCI bind before guest resume
+
+Report the first requester in the same status that marks the start of PCI
+binding. Hold it with a busy wait so the diagnostic does not depend on Linux
+timer interrupts before the assigned device drivers are initialized.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ arch/x86/kernel/cpu/mboot.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -863,7 +863,8 @@ static int __init mboot_pci_publish_frontend(void)
+ 	}
+ 	pr_info("mDriver: mBoot PCI frontend ready: %u devices, %u resources, %u active\n",
+ 		mboot_pci_device_count, resource_count, active);
+-	mboot_boot_status("DISPLAY\nMDRIVER PCI BIND");
++	mboot_boot_device_error("PCI BIND", mboot_pci_devices[0].info.requester);
++	mdelay(1000);
+ 	for (index = 0; index < mboot_pci_device_count; index++) {
+ 		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+ 		u8 bus = device->info.requester >> 8;
+-- 
+2.39.5

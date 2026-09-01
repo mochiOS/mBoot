@@ -1,0 +1,37 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: publish hardware ready before the client session
+
+Report that the hardware backend is ready once PCI devices and the bootstrap
+Event Channels are available.  The System Domain can then establish its
+control-ring session without a later Ready notification overwriting its first
+display update.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -3148,14 +3148,15 @@ static int __init mboot_report_ready(void)
+ 	if (result != MBOOT_CONTROL_IRQ_PORT)
+ 		return -EIO;
+ 	pr_info("mDriver: mBoot control Event Channel ready\n");
+-	if (mboot_control_ring_start())
+-		return -EIO;
+ 	result = mboot_hypercall(MBOOT_HYPERCALL_READY, 0, 0, 0);
+-
+-	if (result)
++	if (result) {
+ 		pr_err("mDriver: mBoot Ready hypercall failed: %lu\n", result);
+-	else
+-		pr_info("mDriver: mBoot control path ready\n");
++		return -EIO;
++	}
++	pr_info("mDriver: hardware backend ready\n");
++	if (mboot_control_ring_start())
++		return -EIO;
++	pr_info("mDriver: mBoot control path ready\n");
+ 	return 0;
+ }
+ late_initcall(mboot_report_ready);
+-- 
+2.39.5

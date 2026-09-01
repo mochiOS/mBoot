@@ -1,0 +1,64 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: report PCI publication progress
+
+The early PCI status covered bus discovery, IRQ allocation, physical device
+activation, and Linux driver registration with one message. Report each stage
+and requester so a hardware-dependent stall can be identified without a
+serial console.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ arch/x86/kernel/cpu/mboot.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -770,10 +770,12 @@ static int __init mboot_pci_publish_frontend(void)
+ 		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+ 		u8 bus = device->info.requester >> 8;
+ 
++		mboot_boot_device_error("SCAN", device->info.requester);
+ 		if (mboot_pci_buses[bus])
+ 			continue;
+ 		if (mboot_pci_scan_bus(bus))
+ 			return -EIO;
++		mboot_boot_device_error("SCANNED", device->info.requester);
+ 	}
+ 	for (index = 0; index < mboot_pci_device_count; index++) {
+ 		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+@@ -786,6 +789,7 @@ static int __init mboot_pci_publish_frontend(void)
+ 		u8 bus = device->info.requester >> 8;
+ 		u8 devfn = device->info.requester & 0xff;
+ 
++		mboot_boot_device_error("IRQ", device->info.requester);
+ 		pdev = pci_get_domain_bus_and_slot(0, bus, devfn);
+ 		if (!pdev)
+ 			return -ENODEV;
+@@ -837,12 +840,14 @@ static int __init mboot_pci_publish_frontend(void)
+ 			if (result)
+ 				return -EIO;
+ 		}
++		mboot_boot_device_error("ACTIVATE", device->info.requester);
+ 		result = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_ACTIVATE,
+ 					 device->info.requester,
+ 					 config_cfg->vector,
+ 					 queue_cfg ? queue_cfg->vector : 0);
+ 		if (result)
+ 			return -EIO;
++		mboot_boot_device_error("ACTIVE", device->info.requester);
+ 		device->info.state = MBOOT_PCI_STATE_ACTIVE;
+ 		if (device->irq_count == 2)
+ 			pr_info("mDriver: PCI requester %04x uses config IRQ %d vector %#x, queue IRQ %d vector %#x\n",
+@@ -858,8 +863,10 @@ static int __init mboot_pci_publish_frontend(void)
+ 	}
+ 	pr_info("mDriver: mBoot PCI frontend ready: %u devices, %u resources, %u active\n",
+ 		mboot_pci_device_count, resource_count, active);
++	mboot_boot_status("DISPLAY\nMDRIVER PCI BIND");
+ 	for (index = 0; index < ARRAY_SIZE(mboot_pci_buses); index++)
+ 		if (mboot_pci_buses[index])
+ 			pci_bus_add_devices(mboot_pci_buses[index]);
++	mboot_boot_status("DISPLAY\nMDRIVER PCI READY");
+ 	return 0;
+ }
+-- 
+2.39.5

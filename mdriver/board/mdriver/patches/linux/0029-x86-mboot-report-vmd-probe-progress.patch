@@ -1,0 +1,128 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: report VMD probe progress
+
+Expose a fixed-string mBoot device status helper and use it around the VMD
+probe operations that synchronously create and populate the child PCI domain.
+This keeps physical boot diagnostics independent of the guest stack while
+identifying the exact VMD operation that has not completed.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ arch/x86/include/asm/hypervisor.h |  4 ++++
+ arch/x86/kernel/cpu/mboot.c       |  4 +++-
+ drivers/pci/controller/vmd.c      | 15 +++++++++++++++
+ 3 files changed, 22 insertions(+), 1 deletion(-)
+
+--- a/arch/x86/include/asm/hypervisor.h
++++ b/arch/x86/include/asm/hypervisor.h
+@@ -68,6 +68,7 @@ extern const struct hypervisor_x86 x86_hyper_mboot;
+ extern struct hypervisor_x86 x86_hyper_xen_hvm;
+ 
+ bool mboot_pci_mmio_valid(u64 address, unsigned long size);
++void mboot_boot_device_status(const char *operation, u16 requester);
+ 
+ extern bool nopv;
+ extern enum x86_hypervisor_type x86_hyper_type;
+@@ -87,5 +88,8 @@ static inline bool mboot_pci_mmio_valid(u64 address, unsigned long size)
+ {
+ 	return false;
+ }
++static inline void mboot_boot_device_status(const char *operation, u16 requester)
++{
++}
+ #endif /* CONFIG_HYPERVISOR_GUEST */
+ #endif /* _ASM_X86_HYPERVISOR_H */
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -310,12 +310,14 @@ static void mboot_boot_status(const char *status)
+ 			virt_to_phys((void *)status), strlen(status), 0);
+ }
+ 
+-static void mboot_boot_device_error(const char *operation, u16 requester)
++void mboot_boot_device_status(const char *operation, u16 requester)
+ {
+ 	mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
+ 			virt_to_phys((void *)operation), strlen(operation),
+ 			(unsigned long)requester + 1);
+ }
+ 
++#define mboot_boot_device_error mboot_boot_device_status
++
+ static void mboot_irq_mask(struct irq_data *data)
+ {
+ 	struct irq_cfg *cfg = irqd_cfg(data);
+--- a/drivers/pci/controller/vmd.c
++++ b/drivers/pci/controller/vmd.c
+@@ -19,6 +19,7 @@
+ #include <xen/xen.h>
+ 
+ #include <asm/irqdomain.h>
++#include <asm/hypervisor.h>
+ 
+ #define VMD_CFGBAR	0
+ #define VMD_MEMBAR1	2
+@@ -786,5 +787,8 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
+ 	struct pci_dev *dev;
+ 	int ret;
++	u16 requester = vmd->dev->bus->number << 8 | vmd->dev->devfn;
++
++	mboot_boot_device_status("VMD DOMAIN", requester);
+ 
+ 	/*
+ 	 * Shadow registers may exist in certain VMD device ids which allow
+@@ -864,5 +868,6 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
+ 	if (!(features & VMD_FEAT_CAN_BYPASS_MSI_REMAP) ||
+ 	    offset[0] || offset[1]) {
++		mboot_boot_device_status("VMD IRQ", requester);
+ 		ret = vmd_alloc_irqs(vmd);
+ 		if (ret)
+ 			return ret;
+@@ -925,7 +930,9 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
+ 
+ 	vmd_acpi_begin();
+ 
++	mboot_boot_device_status("VMD SCAN", requester);
+ 	pci_scan_child_bus(vmd->bus);
++	mboot_boot_device_status("VMD RESET", requester);
+ 	vmd_domain_reset(vmd);
+ 
+ 	/* When Intel VMD is enabled, the OS does not discover the Root Ports
+@@ -945,7 +952,8 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
+ 		}
+ 	}
+ 
+-	pci_assign_unassigned_bus_resources(vmd->bus);
++	mboot_boot_device_status("VMD ASSIGN", requester);
++	pci_assign_unassigned_bus_resources(vmd->bus);
+ 
+ 	pci_walk_bus(vmd->bus, vmd_pm_enable_quirk, &features);
+ 
+@@ -959,7 +967,9 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
+ 	list_for_each_entry(child, &vmd->bus->children, node)
+ 		pcie_bus_configure_settings(child);
+ 
++	mboot_boot_device_status("VMD CHILD BIND", requester);
+ 	pci_bus_add_devices(vmd->bus);
++	mboot_boot_device_status("VMD READY", requester);
+ 
+ 	vmd_acpi_end();
+ 	return 0;
+@@ -971,5 +981,8 @@ static int vmd_probe(struct pci_dev *dev, const struct pci_device_id *id)
+ 	struct vmd_dev *vmd;
+ 	int err;
++	u16 requester = dev->bus->number << 8 | dev->devfn;
++
++	mboot_boot_device_status("VMD PROBE", requester);
+ 
+ 	if (xen_domain()) {
+ 		/*
+@@ -1031,6 +1044,7 @@ static int vmd_probe(struct pci_dev *dev, const struct pci_device_id *id)
+ 
+ 	raw_spin_lock_init(&vmd->cfg_lock);
+ 	pci_set_drvdata(dev, vmd);
++	mboot_boot_device_status("VMD ENABLE", requester);
+ 	err = vmd_enable_domain(vmd, features);
+ 	if (err)
+ 		goto out_release_instance;
+-- 
+2.39.5

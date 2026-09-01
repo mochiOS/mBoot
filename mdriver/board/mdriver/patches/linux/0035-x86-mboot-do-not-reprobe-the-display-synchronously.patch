@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000035 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 20:10:00 +0900
+Subject: [PATCH] x86/mboot: do not reprobe the display synchronously
+
+The PCI publication path already asks the driver core to attach the device.
+Calling device_attach() again while late init is still running can enter a GPU
+probe path which waits for initialization that cannot progress on this vCPU.
+Use the match and bind state left by the first probe instead.
+---
+ arch/x86/kernel/cpu/mboot.c | 11 ++---------
+ 1 file changed, 2 insertions(+), 9 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 7c0974100000..333333333333 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -1033,17 +1033,10 @@ static int __init mboot_wait_for_display_backend(void)
+ 					       device->info.requester >> 8,
+ 					       device->info.requester & 0xff);
+ 		if (pdev) {
+-			int attach_result = 1;
+-
+ 			driver_matched = pdev->dev.can_match;
+ 			driver_bound = device_is_bound(&pdev->dev);
+-			if (!driver_bound) {
+-				attach_result = device_attach(&pdev->dev);
+-				driver_matched = pdev->dev.can_match;
+-				driver_bound = device_is_bound(&pdev->dev);
+-			}
+-			pr_info("mDriver: display probe result %d, matched=%u, bound=%u\n",
+-				attach_result, driver_matched, driver_bound);
++			pr_info("mDriver: display matched=%u, bound=%u\n",
++				driver_matched, driver_bound);
+ 			pci_dev_put(pdev);
+ 		}
+ 		if (driver_bound)
+-- 
+2.43.0

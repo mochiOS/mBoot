@@ -1,7 +1,7 @@
 use core::arch::{asm, x86_64::__cpuid};
 use core::hint::spin_loop;
 use core::ptr::write_volatile;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use mnu_abi::hypervisor::{
     PciDeviceResource, PCI_DEVICE_INTERRUPT_CONFIG, PCI_DEVICE_INTERRUPT_COUNT,
@@ -32,6 +32,9 @@ const MSIX_ENTRY_MASKED: u32 = 1;
 const PCIE_DEVICE_CAP_FLR: u32 = 1 << 28;
 const PCIE_DEVICE_CONTROL_FLR: u16 = 1 << 15;
 const INTEL_VENDOR_ID: u16 = 0x8086;
+const PCI_CLASS_STORAGE_RAID: u16 = 0x0104;
+const VMD_VMCONFIG: u8 = 0x44;
+const VMD_VMCONFIG_MSI_REMAP: u16 = 1 << 1;
 const INTEL_GRAPHICS_REQUESTER: u16 = 0x0010;
 const INTEL_BDSM: u8 = 0xb0;
 const INTEL_BGSM: u8 = 0xb4;
@@ -53,6 +56,96 @@ const MAX_ACTIVE_REQUESTERS: usize = 32;
 const MAX_INVENTORY_FUNCTIONS: usize = 256;
 
 static PENDING_DEVICE_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+static BAR_FAILURE_VALID: AtomicU8 = AtomicU8::new(0);
+static BAR_FAILURE_INDEX: AtomicU8 = AtomicU8::new(0);
+static BAR_FAILURE_REASON: AtomicU8 = AtomicU8::new(0);
+static BAR_FAILURE_LOW: AtomicU32 = AtomicU32::new(0);
+static BAR_FAILURE_HIGH: AtomicU32 = AtomicU32::new(0);
+static BAR_FAILURE_MASK_LOW: AtomicU32 = AtomicU32::new(0);
+static BAR_FAILURE_MASK_HIGH: AtomicU32 = AtomicU32::new(0);
+
+pub const BAR_FAILURE_ADDRESS_ZERO: u8 = 1;
+pub const BAR_FAILURE_ADDRESS_ALIGNMENT: u8 = 2;
+pub const BAR_FAILURE_LENGTH: u8 = 3;
+pub const BAR_FAILURE_RANGE_OVERFLOW: u8 = 4;
+pub const BAR_FAILURE_ADDRESS_WIDTH: u8 = 5;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BarProbeFailure {
+    pub index: u8,
+    pub reason: u8,
+    pub low: u32,
+    pub high: u32,
+    pub mask_low: u32,
+    pub mask_high: u32,
+}
+
+pub fn last_bar_probe_failure() -> Option<BarProbeFailure> {
+    if BAR_FAILURE_VALID.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    Some(BarProbeFailure {
+        index: BAR_FAILURE_INDEX.load(Ordering::Relaxed),
+        reason: BAR_FAILURE_REASON.load(Ordering::Relaxed),
+        low: BAR_FAILURE_LOW.load(Ordering::Relaxed),
+        high: BAR_FAILURE_HIGH.load(Ordering::Relaxed),
+        mask_low: BAR_FAILURE_MASK_LOW.load(Ordering::Relaxed),
+        mask_high: BAR_FAILURE_MASK_HIGH.load(Ordering::Relaxed),
+    })
+}
+
+fn clear_bar_probe_failure() {
+    BAR_FAILURE_VALID.store(0, Ordering::Release);
+}
+
+fn record_bar_probe_failure(
+    index: u8,
+    reason: u8,
+    low: u32,
+    high: u32,
+    mask_low: u32,
+    mask_high: u32,
+) {
+    BAR_FAILURE_INDEX.store(index, Ordering::Relaxed);
+    BAR_FAILURE_REASON.store(reason, Ordering::Relaxed);
+    BAR_FAILURE_LOW.store(low, Ordering::Relaxed);
+    BAR_FAILURE_HIGH.store(high, Ordering::Relaxed);
+    BAR_FAILURE_MASK_LOW.store(mask_low, Ordering::Relaxed);
+    BAR_FAILURE_MASK_HIGH.store(mask_high, Ordering::Relaxed);
+    BAR_FAILURE_VALID.store(1, Ordering::Release);
+}
+
+fn memory_bar_layout(mask: u64) -> Option<(u64, u64)> {
+    if mask == 0 {
+        return None;
+    }
+    let shift = mask.trailing_zeros();
+    if shift < 4 {
+        return None;
+    }
+    let implemented = mask >> shift;
+    if implemented.checked_add(1).is_none_or(|value| !value.is_power_of_two()) {
+        return None;
+    }
+    let length = 1_u64.checked_shl(shift)?;
+    Some((length, mask | (length - 1)))
+}
+
+fn bar_failure_reason(address: u64, length: u64, address_mask: u64) -> Option<u8> {
+    if address == 0 {
+        Some(BAR_FAILURE_ADDRESS_ZERO)
+    } else if length < 16 || !length.is_power_of_two() {
+        Some(BAR_FAILURE_LENGTH)
+    } else if address & (length - 1) != 0 {
+        Some(BAR_FAILURE_ADDRESS_ALIGNMENT)
+    } else if address & !address_mask != 0 {
+        Some(BAR_FAILURE_ADDRESS_WIDTH)
+    } else if address.checked_add(length).is_none() {
+        Some(BAR_FAILURE_RANGE_OVERFLOW)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PciBar {
@@ -60,6 +153,26 @@ pub struct PciBar {
     pub physical_address: u64,
     pub length: u64,
     pub guest_address: u64,
+}
+
+impl PciBar {
+    pub fn host_page_range(self) -> Option<(u64, u64)> {
+        page_range(self.physical_address, self.length)
+    }
+
+    pub fn guest_page_range(self) -> Option<(u64, u64)> {
+        page_range(self.guest_address, self.length)
+    }
+}
+
+fn page_range(address: u64, length: u64) -> Option<(u64, u64)> {
+    const PAGE_MASK: u64 = 4095;
+    let start = address & !PAGE_MASK;
+    let end = address
+        .checked_add(length)?
+        .checked_add(PAGE_MASK)?
+        & !PAGE_MASK;
+    (start != 0 && end > start).then_some((start, end - start))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -71,6 +184,7 @@ pub struct PciDescriptor {
     msi_capability: u8,
     msix_capability: u8,
     pcie_capability: u8,
+    original_vmd_config: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -80,6 +194,7 @@ struct Assignment {
     domain_id: u32,
     guest_vectors: [u8; PCI_DEVICE_INTERRUPT_COUNT],
     interrupt_count: u8,
+    interrupt_mode: Option<PciInterruptMode>,
     descriptor: PciDescriptor,
 }
 
@@ -136,6 +251,7 @@ impl AssignmentTable {
                 domain_id: 0,
                 guest_vectors: [0; PCI_DEVICE_INTERRUPT_COUNT],
                 interrupt_count: 0,
+                interrupt_mode: None,
                 descriptor: PciDescriptor {
                     requester: 0,
                     original_command: 0,
@@ -149,6 +265,7 @@ impl AssignmentTable {
                     msi_capability: 0,
                     msix_capability: 0,
                     pcie_capability: 0,
+                    original_vmd_config: None,
                 },
             }; MAX_ASSIGNMENTS],
         }
@@ -202,6 +319,7 @@ impl AssignmentTable {
             domain_id,
             guest_vectors: [0; PCI_DEVICE_INTERRUPT_COUNT],
             interrupt_count: 0,
+            interrupt_mode: None,
             descriptor,
         };
         Ok(&self.assignments[slot].descriptor.bars[..descriptor.bar_count])
@@ -277,6 +395,7 @@ impl AssignmentTable {
         self.assignments[slot].active = true;
         self.assignments[slot].guest_vectors = guest_vectors;
         self.assignments[slot].interrupt_count = interrupt_count as u8;
+        self.assignments[slot].interrupt_mode = Some(mode);
         Ok(PciActivation {
             physical_vectors,
             mode,
@@ -305,7 +424,45 @@ impl AssignmentTable {
         self.assignments[slot].active = false;
         self.assignments[slot].guest_vectors = [0; PCI_DEVICE_INTERRUPT_COUNT];
         self.assignments[slot].interrupt_count = 0;
+        self.assignments[slot].interrupt_mode = None;
         Ok(assignment.descriptor.bars)
+    }
+
+    /// Keeps the physical MSI source in the same masked state as the guest
+    /// vector. Vectors that do not belong to an assigned PCI function are left
+    /// to the virtual APIC alone.
+    ///
+    /// # Safety
+    /// PCI configuration and the MSI-X table mappings must remain exclusively
+    /// owned by mBoot while the assignment is active.
+    pub unsafe fn set_interrupt_mask(
+        &self,
+        domain_id: u32,
+        guest_vector: u8,
+        masked: bool,
+    ) -> Result<(), PciError> {
+        let Some(assignment) = self.assignments.iter().find(|assignment| {
+            assignment.valid
+                && assignment.active
+                && assignment.domain_id == domain_id
+                && assignment.guest_vectors[..usize::from(assignment.interrupt_count)]
+                    .contains(&guest_vector)
+        }) else {
+            return Ok(());
+        };
+        let vector_index = assignment.guest_vectors
+            [..usize::from(assignment.interrupt_count)]
+            .iter()
+            .position(|vector| *vector == guest_vector)
+            .ok_or(PciError::InvalidState)?;
+        match assignment.interrupt_mode.ok_or(PciError::InvalidState)? {
+            PciInterruptMode::Msi => unsafe {
+                set_msi_mask(&assignment.descriptor, masked)
+            },
+            PciInterruptMode::MsixShared | PciInterruptMode::MsixSplit => unsafe {
+                set_msix_mask(&assignment.descriptor, vector_index, masked)
+            },
+        }
     }
 
     pub fn remove(&mut self, domain_id: u32, requester: u16) -> Result<(), PciError> {
@@ -484,6 +641,7 @@ impl QuarantineReport {
 /// PCI configuration mechanism 1 must be exclusively owned by mBoot, and the
 /// requester must remain stopped for the duration of the probe.
 pub unsafe fn probe_descriptor(requester: u16) -> Result<PciDescriptor, PciError> {
+    clear_bar_probe_failure();
     let (bus, device, function) = requester_parts(requester)?;
     if unsafe { read_u16(bus, device, function, 0) } == 0xffff {
         return Err(PciError::InvalidRequester);
@@ -507,6 +665,10 @@ pub unsafe fn probe_descriptor(requester: u16) -> Result<PciDescriptor, PciError
             original_command,
             ..PciDescriptor::default()
         };
+        if unsafe { read_u16(bus, device, function, 0x0a) } == PCI_CLASS_STORAGE_RAID {
+            descriptor.original_vmd_config =
+                Some(unsafe { read_u16(bus, device, function, VMD_VMCONFIG) });
+        }
         descriptor.msi_capability = unsafe { find_capability(requester, CAPABILITY_MSI)? };
         descriptor.msix_capability = unsafe { find_capability(requester, CAPABILITY_MSIX)? };
         descriptor.pcie_capability = unsafe { find_capability(requester, CAPABILITY_PCIE)? };
@@ -555,17 +717,21 @@ pub unsafe fn probe_descriptor(requester: u16) -> Result<PciDescriptor, PciError
             let mask = if is_64 {
                 (u64::from(mask_high) << 32) | u64::from(mask_low & !0xf)
             } else {
-                u64::from(mask_low & !0xf) | 0xffff_ffff_0000_0000
+                u64::from(mask_low & !0xf)
             };
-            let length = (!mask).wrapping_add(1);
-            if address == 0
-                || address & 0xfff != 0
-                || length < 4096
-                || length & 0xfff != 0
-                || !length.is_power_of_two()
-                || address.checked_add(length).is_none()
-                || address >> 52 != 0
-            {
+            let Some((length, address_mask)) = memory_bar_layout(mask) else {
+                record_bar_probe_failure(
+                    index,
+                    BAR_FAILURE_LENGTH,
+                    low,
+                    high,
+                    mask_low,
+                    mask_high,
+                );
+                return Err(PciError::InvalidBar);
+            };
+            if let Some(reason) = bar_failure_reason(address, length, address_mask) {
+                record_bar_probe_failure(index, reason, low, high, mask_low, mask_high);
                 return Err(PciError::InvalidBar);
             }
             descriptor.bars[descriptor.bar_count] = PciBar {
@@ -672,6 +838,13 @@ unsafe fn activate_descriptor(
     let memory_command = (descriptor.original_command | COMMAND_MEMORY | COMMAND_INTERRUPT_DISABLE)
         & !COMMAND_BUS_MASTER;
     unsafe { write_u16(bus, device, function, 4, memory_command) };
+    if let Some(original) = descriptor.original_vmd_config {
+        let remapping = original & !VMD_VMCONFIG_MSI_REMAP;
+        unsafe { write_u16(bus, device, function, VMD_VMCONFIG, remapping) };
+        if unsafe { read_u16(bus, device, function, VMD_VMCONFIG) } != remapping {
+            return Err(PciError::RegisterWriteFailed);
+        }
+    }
     match mode {
         PciInterruptMode::Msi => unsafe {
             enable_msi(
@@ -754,6 +927,9 @@ unsafe fn disable_descriptor(descriptor: &PciDescriptor, reset: bool) -> Result<
             descriptor.original_command & !COMMAND_BUS_MASTER | COMMAND_INTERRUPT_DISABLE,
         )
     };
+    if let Some(original) = descriptor.original_vmd_config {
+        unsafe { write_u16(bus, device, function, VMD_VMCONFIG, original) };
+    }
     Ok(())
 }
 
@@ -806,9 +982,8 @@ unsafe fn enable_msix(
         }
     }
     asm_fence();
-    for index in 0..vector_count {
-        unsafe { write_volatile(table.add(index * 4 + 3), 0) };
-    }
+    // Entries remain masked until Linux installs an IRQ handler and calls the
+    // virtual irq_chip's unmask callback.
     control = (control | MSIX_ENABLE) & !MSIX_FUNCTION_MASK;
     unsafe { write_u16(bus, device, function, capability + 2, control) };
     let installed = unsafe { read_u16(bus, device, function, capability + 2) };
@@ -850,13 +1025,70 @@ unsafe fn enable_msi(descriptor: &PciDescriptor, address: u64, vector: u8) -> Re
             write_u16(bus, device, function, capability + 8, u16::from(vector));
         }
         asm_fence();
-        write_u16(bus, device, function, capability + 2, control | MSI_ENABLE);
-        if control & MSI_PER_VECTOR_MASK != 0 {
-            write_u32(bus, device, function, capability + mask_offset, !1);
-        }
+        // MSI remains disabled until Linux installs an IRQ handler and calls
+        // the virtual irq_chip's unmask callback.
+        write_u16(bus, device, function, capability + 2, control);
     }
     let installed = unsafe { read_u16(bus, device, function, capability + 2) };
-    if installed & (MSI_ENABLE | 0b111 << 4) != MSI_ENABLE {
+    if installed & (MSI_ENABLE | 0b111 << 4) != 0 {
+        return Err(PciError::RegisterWriteFailed);
+    }
+    Ok(())
+}
+
+unsafe fn set_msi_mask(descriptor: &PciDescriptor, masked: bool) -> Result<(), PciError> {
+    let (bus, device, function) = requester_parts(descriptor.requester)?;
+    let capability = descriptor.msi_capability;
+    if capability == 0 {
+        return Err(PciError::InterruptUnavailable);
+    }
+    let control = unsafe { read_u16(bus, device, function, capability + 2) };
+    let updated = if masked {
+        control & !MSI_ENABLE
+    } else {
+        control | MSI_ENABLE
+    };
+    unsafe { write_u16(bus, device, function, capability + 2, updated) };
+    if unsafe { read_u16(bus, device, function, capability + 2) } & MSI_ENABLE
+        != updated & MSI_ENABLE
+    {
+        return Err(PciError::RegisterWriteFailed);
+    }
+    Ok(())
+}
+
+unsafe fn set_msix_mask(
+    descriptor: &PciDescriptor,
+    vector_index: usize,
+    masked: bool,
+) -> Result<(), PciError> {
+    let (bus, device, function) = requester_parts(descriptor.requester)?;
+    let capability = descriptor.msix_capability;
+    if capability == 0 {
+        return Err(PciError::InterruptUnavailable);
+    }
+    let control = unsafe { read_u16(bus, device, function, capability + 2) };
+    let table_entries = usize::from(control & 0x07ff) + 1;
+    if vector_index >= table_entries {
+        return Err(PciError::InterruptUnavailable);
+    }
+    let table = unsafe { read_u32(bus, device, function, capability + 4) };
+    let bar_index = (table & MSIX_TABLE_BIR) as u8;
+    let table_offset = u64::from(table & MSIX_TABLE_OFFSET);
+    let bar = descriptor.bars[..descriptor.bar_count]
+        .iter()
+        .find(|bar| bar.index == bar_index)
+        .ok_or(PciError::InvalidBar)?;
+    let entry_offset = table_offset
+        .checked_add((vector_index * 16) as u64)
+        .ok_or(PciError::InvalidBar)?;
+    if entry_offset.checked_add(16).is_none_or(|end| end > bar.length) {
+        return Err(PciError::InvalidBar);
+    }
+    let vector_control = (bar.physical_address + entry_offset + 12) as *mut u32;
+    unsafe { write_volatile(vector_control, u32::from(masked)) };
+    asm_fence();
+    if unsafe { vector_control.read_volatile() } & MSIX_ENTRY_MASKED != u32::from(masked) {
         return Err(PciError::RegisterWriteFailed);
     }
     Ok(())
@@ -1114,6 +1346,35 @@ const fn without_bus_master(command: u16) -> u16 {
     command & !COMMAND_BUS_MASTER
 }
 
+const fn firmware_display_command(command: u16) -> u16 {
+    command | COMMAND_MEMORY | COMMAND_BUS_MASTER
+}
+
+/// Restores firmware scanout only after the IOMMU has installed the display's
+/// reserved identity mappings. No caller may use this on an unprotected GPU.
+///
+/// # Safety
+/// PCI configuration access must be serialized and the requester's IOMMU
+/// context must already restrict DMA to the firmware display ranges.
+pub unsafe fn resume_firmware_display(requester: u16) -> Result<(), PciError> {
+    let (bus, device, function) = requester_parts(requester)?;
+    if unsafe { read_u16(bus, device, function, 0) } == 0xffff
+        || unsafe { read_u8(bus, device, function, 0x0b) } != 0x03
+    {
+        return Err(PciError::InvalidRequester);
+    }
+    let command = unsafe { read_u16(bus, device, function, 4) };
+    let resumed = firmware_display_command(command);
+    unsafe { write_u16(bus, device, function, 4, resumed) };
+    if unsafe { read_u16(bus, device, function, 4) }
+        & (COMMAND_MEMORY | COMMAND_BUS_MASTER)
+        != (COMMAND_MEMORY | COMMAND_BUS_MASTER)
+    {
+        return Err(PciError::RegisterWriteFailed);
+    }
+    Ok(())
+}
+
 fn enqueue_bus(bus: u8, queue: &mut [u8; 256], queued: &mut [bool; 256], tail: &mut usize) {
     if !queued[bus as usize] {
         queued[bus as usize] = true;
@@ -1188,9 +1449,52 @@ mod tests {
     }
 
     #[test]
+    fn pci_memory_bars_use_their_native_alignment() {
+        assert_eq!(bar_failure_reason(0x8000_0080, 0x80, u64::MAX), None);
+        assert_eq!(
+            bar_failure_reason(0x8000_0040, 0x80, u64::MAX),
+            Some(BAR_FAILURE_ADDRESS_ALIGNMENT)
+        );
+        assert_eq!(
+            bar_failure_reason(0x8000_0000, 8, u64::MAX),
+            Some(BAR_FAILURE_LENGTH)
+        );
+    }
+
+    #[test]
+    fn finite_width_64_bit_bar_mask_decodes_the_reported_vmd_aperture() {
+        let mask = 0x0000_007f_fe00_0000;
+        let (length, address_mask) = memory_bar_layout(mask).unwrap();
+        assert_eq!(length, 32 * 1024 * 1024);
+        assert_eq!(address_mask, 0x0000_007f_ffff_ffff);
+        assert_eq!(
+            bar_failure_reason(0x0000_0060_0000_0000, length, address_mask),
+            None
+        );
+    }
+
+    #[test]
+    fn subpage_bars_expose_only_the_containing_page_to_nested_translation() {
+        let bar = PciBar {
+            index: 0,
+            physical_address: 0x8000_0180,
+            length: 0x80,
+            guest_address: 0x9000_0180,
+        };
+        assert_eq!(bar.host_page_range(), Some((0x8000_0000, 0x1000)));
+        assert_eq!(bar.guest_page_range(), Some((0x9000_0000, 0x1000)));
+    }
+
+    #[test]
     fn quarantine_changes_only_bus_master_enable() {
         assert_eq!(without_bus_master(0xffff), 0xfffb);
         assert_eq!(without_bus_master(0x0403), 0x0403);
+    }
+
+    #[test]
+    fn firmware_display_resume_enables_memory_and_dma_without_clearing_other_bits() {
+        assert_eq!(firmware_display_command(0x0401), 0x0407);
+        assert_eq!(firmware_display_command(0xffff), 0xffff);
     }
 
     #[test]

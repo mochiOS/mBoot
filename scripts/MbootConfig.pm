@@ -69,8 +69,8 @@ sub read_mboot_config {
             or die "$path: Domain IDs must be nonzero and unique\n";
         role_id($domain->{role});
         ++$system_domains if $domain->{role} eq 'system';
-        $domain->{memory_mib} > 0 && $domain->{memory_mib} <= 256
-            or die "$path: Domain memory_mib range is 1 to 256\n";
+        $domain->{memory_mib} > 0 && $domain->{memory_mib} <= 512
+            or die "$path: Domain memory_mib range is 1 to 512\n";
         $domain->{vcpus} == 1
             or die "$path: current hypervisor supports one vCPU per Domain\n";
         $domain->{path} =~ m{^\\EFI\\MBOOT\\[A-Za-z0-9._-]+$}

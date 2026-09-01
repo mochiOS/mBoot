@@ -1,0 +1,119 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: report NVMe probe progress
+
+Report fixed-string checkpoints around the synchronous NVMe PCI probe. VMD
+publishes its child devices from inside its own probe, so an NVMe controller
+that waits for an unavailable interrupt or DMA completion otherwise leaves
+only the parent VMD bind status visible.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ drivers/nvme/host/pci.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -25,6 +25,7 @@
+ #include <linux/t10-pi.h>
+ #include <linux/types.h>
+ #include <linux/io-64-nonatomic-lo-hi.h>
++#include <asm/hypervisor.h>
+ #include <linux/io-64-nonatomic-hi-lo.h>
+ #include <linux/sed-opal.h>
+ #include <linux/pci-p2pdma.h>
+@@ -2683,12 +2684,14 @@ static int nvme_pci_enable(struct nvme_dev *dev)
+ 	int result = -ENOMEM;
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 	unsigned int flags = PCI_IRQ_ALL_TYPES;
++	u16 requester = pdev->bus->number << 8 | pdev->devfn;
+ 
+ 	if (pci_enable_device_mem(pdev))
+ 		return result;
+ 
+ 	pci_set_master(pdev);
+ 
++	mboot_boot_device_status("NVME MMIO", requester);
+ 	if (readl(dev->bar + NVME_REG_CSTS) == -1) {
+ 		result = -ENODEV;
+ 		goto disable;
+@@ -2701,10 +2704,12 @@ static int nvme_pci_enable(struct nvme_dev *dev)
+ 	 */
+ 	if (dev->ctrl.quirks & NVME_QUIRK_BROKEN_MSI)
+ 		flags &= ~PCI_IRQ_MSI;
++	mboot_boot_device_status("NVME IRQ", requester);
+ 	result = pci_alloc_irq_vectors(pdev, 1, 1, flags);
+ 	if (result < 0)
+ 		goto disable;
+ 
++	mboot_boot_device_status("NVME CAP", requester);
+ 	dev->ctrl.cap = lo_hi_readq(dev->bar + NVME_REG_CAP);
+ 
+ 	dev->q_depth = min_t(u32, NVME_CAP_MQES(dev->ctrl.cap) + 1,
+@@ -2748,9 +2753,11 @@ static int nvme_pci_enable(struct nvme_dev *dev)
+ 
+ 	pci_save_state(pdev);
+ 
++	mboot_boot_device_status("NVME ADMIN", requester);
+ 	result = nvme_pci_configure_admin_queue(dev);
+ 	if (result)
+ 		goto free_irq;
++	mboot_boot_device_status("NVME PCI READY", requester);
+ 	return result;
+ 
+  free_irq:
+@@ -3244,6 +3251,9 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+ 	struct nvme_dev *dev;
+ 	int result = -ENOMEM;
++	u16 requester = pdev->bus->number << 8 | pdev->devfn;
++
++	mboot_boot_device_status("NVME PROBE", requester);
+ 
+ 	dev = nvme_pci_alloc_dev(pdev, id);
+ 	if (IS_ERR(dev))
+@@ -3253,6 +3263,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (result)
+ 		goto out_put_ctrl;
+ 
++	mboot_boot_device_status("NVME MAP", requester);
+ 	result = nvme_dev_map(dev);
+ 	if (result)
+ 		goto out_uninit_ctrl;
+@@ -3268,6 +3279,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	dev_info(dev->ctrl.device, "pci function %s\n", dev_name(&pdev->dev));
+ 
++	mboot_boot_device_status("NVME ENABLE", requester);
+ 	result = nvme_pci_enable(dev);
+ 	if (result)
+ 		goto out_release_iod_mempool;
+@@ -3290,6 +3302,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto out_disable;
+ 	}
+ 
++	mboot_boot_device_status("NVME INIT", requester);
+ 	result = nvme_init_ctrl_finish(&dev->ctrl, false);
+ 	if (result)
+ 		goto out_disable;
+@@ -3303,6 +3316,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (result < 0)
+ 		goto out_disable;
+ 
++	mboot_boot_device_status("NVME IO", requester);
+ 	result = nvme_setup_io_queues(dev);
+ 	if (result)
+ 		goto out_disable;
+@@ -3327,9 +3341,11 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	pci_set_drvdata(pdev, dev);
+ 
++	mboot_boot_device_status("NVME LIVE", requester);
+ 	nvme_start_ctrl(&dev->ctrl);
+ 	nvme_put_ctrl(&dev->ctrl);
+ 	flush_work(&dev->ctrl.scan_work);
++	mboot_boot_device_status("NVME READY", requester);
+ 	return 0;
+ 
+ out_disable:
+-- 
+2.39.5

@@ -1,0 +1,96 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Subject: [PATCH] x86/mboot: preserve VMD parent IRQ routing
+
+mBoot owns the physical MSI-X table and gives the Hardware Domain two virtual
+IRQs for each assigned device. Do not let the VMD driver allocate and program
+a second set of physical parent vectors. Reuse the mBoot IRQs as the VMD
+demultiplexer inputs while leaving the native Linux path unchanged.
+
+Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
+---
+ arch/x86/kernel/cpu/mboot.c  | 12 ++++++++++++
+ drivers/pci/controller/vmd.c | 28 +++++++++++++++++++---------
+ 2 files changed, 31 insertions(+), 9 deletions(-)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -515,6 +515,8 @@ bool mboot_pci_mmio_valid(u64 address, unsigned long size)
+ 	return false;
+ }
+ 
++int mboot_pci_irq_vector(struct pci_dev *pdev, unsigned int index);
++
+ static struct mboot_pci_frontend *mboot_pci_find(unsigned int bus,
+ 						 unsigned int devfn)
+ {
+@@ -527,6 +529,16 @@ static struct mboot_pci_frontend *mboot_pci_find(unsigned int bus,
+ 	return NULL;
+ }
+ 
++int mboot_pci_irq_vector(struct pci_dev *pdev, unsigned int index)
++{
++	struct mboot_pci_frontend *device;
++
++	device = mboot_pci_find(pdev->bus->number, pdev->devfn);
++	if (!device || index >= device->irq_count)
++		return -1;
++	return device->irqs[index];
++}
++
+ static const struct mboot_pci_resource *
+ mboot_pci_resource_for_bar(const struct mboot_pci_frontend *device,
+ 			   unsigned int dword, bool *high)
+--- a/drivers/pci/controller/vmd.c
++++ b/drivers/pci/controller/vmd.c
+@@ -21,6 +21,8 @@
+ #include <asm/irqdomain.h>
+ #include <asm/hypervisor.h>
+ 
++extern int mboot_pci_irq_vector(struct pci_dev *pdev, unsigned int index);
++
+ #define VMD_CFGBAR	0
+ #define VMD_MEMBAR1	2
+ #define VMD_MEMBAR2	4
+@@ -682,15 +684,22 @@ static int vmd_alloc_irqs(struct vmd_dev *vmd)
+ {
+ 	struct pci_dev *dev = vmd->dev;
++	bool mboot = hypervisor_is_type(X86_HYPER_MBOOT);
+ 	int i, err;
+ 
+-	vmd->msix_count = pci_msix_vec_count(dev);
+-	if (vmd->msix_count < 0)
+-		return -ENODEV;
+-
+-	vmd->msix_count = pci_alloc_irq_vectors(dev, vmd->first_vec + 1,
+-						vmd->msix_count, PCI_IRQ_MSIX);
+-	if (vmd->msix_count < 0)
+-		return vmd->msix_count;
++	if (mboot) {
++		vmd->msix_count = mboot_pci_irq_vector(dev, 1) >= 0 ? 2 : 1;
++		if (vmd->msix_count < vmd->first_vec + 1)
++			return -ENODEV;
++	} else {
++		vmd->msix_count = pci_msix_vec_count(dev);
++		if (vmd->msix_count < 0)
++			return -ENODEV;
++
++		vmd->msix_count = pci_alloc_irq_vectors(dev, vmd->first_vec + 1,
++							vmd->msix_count, PCI_IRQ_MSIX);
++		if (vmd->msix_count < 0)
++			return vmd->msix_count;
++	}
+ 
+ 	vmd->irqs = devm_kcalloc(&dev->dev, vmd->msix_count, sizeof(*vmd->irqs),
+ 				 GFP_KERNEL);
+@@ -703,5 +712,6 @@ static int vmd_alloc_irqs(struct vmd_dev *vmd)
+ 			return err;
+ 
+ 		INIT_LIST_HEAD(&vmd->irqs[i].irq_list);
+-		vmd->irqs[i].virq = pci_irq_vector(dev, i);
++		vmd->irqs[i].virq = mboot ? mboot_pci_irq_vector(dev, i) :
++						 pci_irq_vector(dev, i);
+ 		err = devm_request_irq(&dev->dev, vmd->irqs[i].virq,
+ 				       vmd_irq, IRQF_NO_THREAD,
+ 				       vmd->name, &vmd->irqs[i]);
+-- 
+2.39.5

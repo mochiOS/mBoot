@@ -80,6 +80,74 @@ pub fn framebuffer_info() -> Option<FramebufferInfo> {
     })
 }
 
+/// Copies a bounded, tightly packed pixel rectangle into the firmware scanout.
+/// The caller validates that `pixels` belongs to the stopped System Domain.
+pub fn present_firmware_frame(
+    info: FramebufferInfo,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> bool {
+    let Some(right) = x.checked_add(width) else {
+        return false;
+    };
+    let Some(bottom) = y.checked_add(height) else {
+        return false;
+    };
+    let Some(row_bytes) = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+    else {
+        return false;
+    };
+    let Some(expected) = row_bytes.checked_mul(height as usize) else {
+        return false;
+    };
+    if width == 0
+        || height == 0
+        || right > info.width
+        || bottom > info.height
+        || pixels.len() != expected
+    {
+        return false;
+    }
+    let framebuffer = info.address as *mut u8;
+    let destination_row = info.stride as usize * 4;
+    for row in 0..height as usize {
+        let destination = (y as usize + row) * destination_row + x as usize * 4;
+        let source = row * row_bytes;
+        for column in 0..width as usize {
+            let source = source + column * 4;
+            let destination = destination + column * 4;
+            unsafe {
+                if info.format == 2 {
+                    framebuffer
+                        .add(destination)
+                        .cast::<u32>()
+                        .write_volatile(u32::from_ne_bytes([
+                            pixels[source],
+                            pixels[source + 1],
+                            pixels[source + 2],
+                            0,
+                        ]));
+                } else {
+                    framebuffer.add(destination).write_volatile(pixels[source + 2]);
+                    framebuffer
+                        .add(destination + 1)
+                        .write_volatile(pixels[source + 1]);
+                    framebuffer
+                        .add(destination + 2)
+                        .write_volatile(pixels[source]);
+                    framebuffer.add(destination + 3).write_volatile(0);
+                }
+            }
+        }
+    }
+    true
+}
+
 pub fn gpu_dma_transition(requester: u16, stage: &[u8]) {
     show(0x0017_2033, b"MBOOT", stage);
     draw_hex(u64::from(requester), line_y(2));
@@ -91,6 +159,11 @@ pub fn iommu_register_failure(requester: u16, status: u32, fault: u32, root: u64
 
 pub fn iommu_register_state(requester: u16, status: u32, fault: u32, root: u64) {
     iommu_register_report(requester, b"PRE ENABLE", status, fault, root, 0x0017_2033);
+}
+
+pub fn iommu_initialization_failure(detail: &[u8]) {
+    show(0x006B_2028, b"MBOOT", b"IOMMU ERROR");
+    draw_centered(detail, line_y(2));
 }
 
 fn iommu_register_report(
@@ -178,9 +251,38 @@ pub fn mdriver_claim(requester: u16) {
     draw_hex(u64::from(requester), line_y(2));
 }
 
+pub fn mdriver_device_status(requester: u16, stage: &[u8]) {
+    show(0x0017_4F35, b"MDRIVER", stage);
+    draw_hex(u64::from(requester), line_y(2));
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
+
 pub fn mdriver_claim_failure(requester: u16, stage: &[u8]) {
     show(0x006B_2028, b"MDRIVER", stage);
     draw_hex(u64::from(requester), line_y(2));
+}
+
+pub fn mdriver_bar_value_failure(requester: u16, failure: crate::pci::BarProbeFailure) {
+    show(0x006B_2028, b"MDRIVER", b"BAR VALUE ERROR");
+    draw_hex(u64::from(requester), line_y(2));
+    let mut bar = *b"BAR 00 REASON 00";
+    write_hex_u8(&mut bar[4..6], failure.index);
+    write_hex_u8(&mut bar[14..16], failure.reason);
+    draw_centered(&bar, line_y(3));
+    let mut value = *b"VALUE 00000000 00000000";
+    write_hex_u32(&mut value[6..14], failure.high);
+    write_hex_u32(&mut value[15..23], failure.low);
+    draw_centered(&value, line_y(4));
+    let mut mask = *b"MASK  00000000 00000000";
+    write_hex_u32(&mut mask[6..14], failure.mask_high);
+    write_hex_u32(&mut mask[15..23], failure.mask_low);
+    draw_centered(&mask, line_y(5));
+}
+
+pub fn mdriver_dma_map_failure(requester: u16, detail: &[u8]) {
+    show(0x006B_2028, b"MDRIVER", b"DMA MAP ERROR");
+    draw_hex(u64::from(requester), line_y(2));
+    draw_centered(detail, line_y(3));
 }
 
 pub fn failure(code: u8) {
@@ -262,6 +364,9 @@ pub fn console_page(message: &[u8]) -> bool {
         draw_text(line, x, y, scale);
         y += 10 * scale;
     }
+    // The GOP framebuffer may be mapped write-combining. Complete every pixel
+    // store before the Hardware Domain is resumed and can reprogram the GPU.
+    core::sync::atomic::fence(Ordering::SeqCst);
     true
 }
 

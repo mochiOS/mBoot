@@ -9,7 +9,7 @@ payload_guid = "6d426f6f-7400-4b00-8a00-000000000202"
 [[domains]]
 id = 1
 role = "system"
-memory_mib = 256
+memory_mib = 512
 vcpus = 1
 capabilities = 0
 format = "native-elf"
@@ -63,15 +63,10 @@ required = true
 restart = "never"
 max_restarts = 0
 
-# mBoot discovers every PCI display controller and assigns it to mDriver. The
-# signed policy selects a device class, so installing mochiOS on another machine
-# never requires copying PCI bus addresses into this file.
-[[devices]]
-segment = 0
-requester = "auto"
-kind = "display"
-domain = 2
-required = true
+# Keep the firmware display active while the native mDriver GPU backend is
+# being completed. mBoot maps only the GOP framebuffer into mochiOS; the GPU
+# itself remains outside the Hardware Domain and behind its firmware IOMMU
+# mapping, so a failed native probe no longer blocks the desktop.
 
 # mDriver is a trusted hardware Domain. It receives every matching controller
 # so Installer.app can show the machine's actual disks without a per-machine BDF.

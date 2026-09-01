@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000037 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 00:20:00 +0900
+Subject: [PATCH] x86/mboot: stop firmware display writes after GPU bind
+
+Once the native GPU driver has been attached, the firmware framebuffer is no
+longer owned by the mBoot diagnostics path.  Do not issue another DISPLAY
+ConsoleWrite from PCI publication or from the successful backend check.  The
+next visible frame must come through the mDriver display backend.
+---
+ arch/x86/kernel/cpu/mboot.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 4e76e4500000..555555555555 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -893,7 +893,6 @@ static int __init mboot_pci_publish_frontend(void)
+ 		pci_dev_put(pdev);
+ 		mboot_boot_device_error("BOUND", device->info.requester);
+ 	}
+-	mboot_boot_status("DISPLAY\nMDRIVER PCI READY");
+ 	return 0;
+ }
+ 
+@@ -1045,7 +1044,6 @@ static int __init mboot_wait_for_display_backend(void)
+ 	if (driver_bound && num_registered_fb && registered_fb[0] &&
+ 	    registered_fb[0]->var.bits_per_pixel == 32 &&
+ 	    registered_fb[0]->fbops && registered_fb[0]->fbops->fb_imageblit) {
+-		mboot_boot_status("DISPLAY\nMDRIVER GPU READY");
+ 		return 0;
+ 	}
+ 	if (!driver_bound) {
+-- 
+2.43.0

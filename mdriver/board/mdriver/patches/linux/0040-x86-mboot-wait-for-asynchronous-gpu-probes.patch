@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000040 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 02:10:00 +0900
+Subject: [PATCH] x86/mboot: wait for asynchronous GPU probes
+
+PCI device publication permits drivers such as i915 to probe asynchronously.
+Reading device_is_bound() immediately after pci_bus_add_device() therefore
+mistakes a pending probe for a failed one.  Use the driver core completion
+point, then refresh the display binding state before reporting failure or
+waiting for framebuffer registration.
+---
+ arch/x86/kernel/cpu/mboot.c | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 777777777777..888888888888 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -904,11 +904,31 @@
+ 			pci_dev_put(pdev);
+ 			if (!display)
+ 				mboot_boot_device_error("BOUND", device->info.requester);
+-			else if (!device->driver_bound)
+-				mboot_boot_device_error("GPU UNBOUND",
+-							device->info.requester);
+ 		}
+ 	}
++	/*
++	 * GPU drivers prefer asynchronous probing.  Wait for the driver core's
++	 * completion point before deciding whether the display is unbound.
++	 */
++	wait_for_device_probe();
++	for (index = 0; index < mboot_pci_device_count; index++) {
++		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
++		struct pci_dev *pdev;
++
++		if (device->info.class != PCI_BASE_CLASS_DISPLAY)
++			continue;
++		pdev = pci_get_domain_bus_and_slot(0,
++					       device->info.requester >> 8,
++					       device->info.requester & 0xff);
++		if (!pdev)
++			return -ENODEV;
++		device->driver_matched = pdev->dev.can_match;
++		device->driver_bound = device_is_bound(&pdev->dev);
++		pci_dev_put(pdev);
++		if (!device->driver_bound)
++			mboot_boot_device_error("GPU UNBOUND",
++						device->info.requester);
++	}
+ 	return 0;
+ }
+ 
+-- 
+2.43.0

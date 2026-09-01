@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000038 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 01:05:00 +0900
+Subject: [PATCH] x86/mboot: resume after framebuffer registration
+
+DRM fbdev setup can finish from a workqueue after late initcalls return.  Do
+not reject a bound GPU merely because its framebuffer is not registered at
+the instant PCI publication completes.  Subscribe to the framebuffer core and
+finish the Hardware Domain handshake from workqueue context once a usable
+32-bit framebuffer exists.  This also avoids timer polling and leaves the
+kernel init thread free to complete asynchronous DRM setup.
+---
+ arch/x86/Kconfig                 |  8 ++++
+ arch/x86/kernel/cpu/Makefile     |  2 +-
+ arch/x86/kernel/cpu/mboot.c      | 78 ++++++++++++++++++++++++--------
+ drivers/video/fbdev/core/fbmem.c |  4 +-
+ include/linux/fb.h               |  3 +-
+ 5 files changed, 61 insertions(+), 32 deletions(-)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 111111111111..222222222222 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -851,6 +851,14 @@ config PVH
+ 	  This option enables the PVH entry point for guest virtual machines
+ 	  as specified in the x86/HVM direct boot ABI.
+ 
++config X86_MBOOT_GUEST
++	bool "mBoot guest support"
++	depends on X86_64 && PCI
++	select FB_NOTIFY
++	help
++	  Enable the paravirtual platform and device frontend used by the
++	  mochiOS mDriver Hardware Domain under mBoot.
++
+ config PARAVIRT_TIME_ACCOUNTING
+ 	bool "Paravirtual steal time accounting"
+ 	depends on PARAVIRT
+diff --git a/arch/x86/kernel/cpu/Makefile b/arch/x86/kernel/cpu/Makefile
+index 333333333333..444444444444 100644
+--- a/arch/x86/kernel/cpu/Makefile
++++ b/arch/x86/kernel/cpu/Makefile
+@@ -55,7 +55,7 @@
+ obj-$(CONFIG_X86_LOCAL_APIC)		+= perfctr-watchdog.o
+ 
+ obj-$(CONFIG_HYPERVISOR_GUEST)		+= vmware.o hypervisor.o mshyperv.o
+-obj-$(CONFIG_HYPERVISOR_GUEST)		+= mboot.o
++obj-$(CONFIG_X86_MBOOT_GUEST)		+= mboot.o
+ obj-$(CONFIG_ACRN_GUEST)		+= acrn.o
+ 
+ obj-$(CONFIG_DEBUG_FS)			+= debugfs.o
+
+diff --git a/drivers/video/fbdev/core/fbmem.c b/drivers/video/fbdev/core/fbmem.c
+index 777777777777..888888888888 100644
+--- a/drivers/video/fbdev/core/fbmem.c
++++ b/drivers/video/fbdev/core/fbmem.c
+@@ -446,7 +446,7 @@ static int do_register_framebuffer(struct fb_info *fb_info)
+ 	num_registered_fb++;
+ 	registered_fb[i] = fb_info;
+ 
+-#ifdef CONFIG_GUMSTIX_AM200EPD
++#ifdef CONFIG_FB_NOTIFY
+ 	{
+ 		struct fb_event event;
+ 		event.info = fb_info;
+@@ -496,7 +496,7 @@ static void do_unregister_framebuffer(struct fb_info *fb_info)
+ 	fb_destroy_modelist(&fb_info->modelist);
+ 	registered_fb[fb_info->node] = NULL;
+ 	num_registered_fb--;
+-#ifdef CONFIG_GUMSTIX_AM200EPD
++#ifdef CONFIG_FB_NOTIFY
+ 	{
+ 		struct fb_event event;
+ 		event.info = fb_info;
+diff --git a/include/linux/fb.h b/include/linux/fb.h
+index 999999999999..aaaaaaaaaaaa 100644
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@ -131,8 +131,7 @@ struct fb_cursor_user {
+ /*	The resolution of the passed in fb_info about to change */
+ #define FB_EVENT_MODE_CHANGE		0x01
+ 
+-#ifdef CONFIG_GUMSTIX_AM200EPD
+-/* only used by mach-pxa/am200epd.c */
++#ifdef CONFIG_FB_NOTIFY
+ #define FB_EVENT_FB_REGISTERED          0x05
+ #define FB_EVENT_FB_UNREGISTERED        0x06
+ #endif
+ 
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 555555555555..666666666666 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -23,6 +23,7 @@
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/unaligned.h>
++#include <linux/workqueue.h>
+ #include <crypto/hash.h>
+ 
+ #include <asm/apic.h>
+@@ -1012,14 +1013,12 @@
+ static struct fb_info *mboot_display_info;
+ static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info);
+ 
+-static int __init mboot_wait_for_display_backend(void)
++static bool mboot_display_backend_ready(void)
+ {
+ 	unsigned int index;
+ 	bool display_present = false;
+ 	bool driver_bound = false;
+ 	bool driver_matched = false;
+-	u16 display_vendor = 0;
+-	u16 display_device = 0;
+ 
+ 	for (index = 0; index < mboot_pci_device_count; index++) {
+ 		const struct mboot_pci_frontend *device =
+@@ -1029,8 +1028,6 @@
+ 			    MBOOT_DEVICE_KIND_DISPLAY)
+ 			continue;
+ 		display_present = true;
+-		display_vendor = device->config[PCI_VENDOR_ID / 4] & 0xffff;
+-		display_device = device->config[PCI_VENDOR_ID / 4] >> 16;
+ 		driver_matched = device->driver_matched;
+ 		driver_bound = device->driver_bound;
+ 		pr_info("mDriver: display matched=%u, bound=%u\n",
+@@ -1039,25 +1036,14 @@
+ 			break;
+ 	}
+ 	if (!display_present)
+-		return 0;
++		return true;
+ 
+-	if (driver_bound && num_registered_fb && registered_fb[0] &&
++	if (num_registered_fb && registered_fb[0] &&
+ 	    registered_fb[0]->var.bits_per_pixel == 32 &&
+ 	    registered_fb[0]->fbops && registered_fb[0]->fbops->fb_imageblit) {
+-		return 0;
++		return true;
+ 	}
+-	if (!driver_bound) {
+-		char status[64];
+-
+-		scnprintf(status, sizeof(status),
+-			  "DISPLAY\nMDRIVER GPU %s\n%04X %04X",
+-			  driver_matched ? "PROBE ERROR" : "NO MATCH",
+-			  display_vendor, display_device);
+-		mboot_boot_status(status);
+-	} else {
+-		mboot_boot_status("DISPLAY\nMDRIVER GPU NO FB");
+-	}
+-	return -ENODEV;
++	return false;
+ }
+ 
+ static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info)
+@@ -3109,7 +3095,7 @@
+ 	return -EIO;
+ }
+ 
+-static int __init mboot_control_ring_start(void)
++static int mboot_control_ring_start(void)
+ {
+ 	struct task_struct *worker;
+ 	unsigned long grant_ref;
+@@ -3173,20 +3159,10 @@
+ 	return -EIO;
+ }
+ 
+-static int __init mboot_report_ready(void)
++static int mboot_finish_ready(void)
+ {
+ 	unsigned long result;
+ 
+-	mboot_boot_status("DISPLAY\nMDRIVER DEVICES");
+-	if (mboot_query_and_claim_devices())
+-		return -EIO;
+-	mboot_boot_status("DISPLAY\nMDRIVER PCI");
+-	if (mboot_pci_device_count && mboot_pci_publish_frontend()) {
+-		mboot_boot_status("DISPLAY\nMDRIVER PCI ERROR");
+-		return -EIO;
+-	}
+-	if (mboot_wait_for_display_backend())
+-		return -EIO;
+ 	result = mboot_hypercall(MBOOT_HYPERCALL_EVENT_SEND,
+ 				 MBOOT_CONTROL_PORT, 0, 0);
+ 	if (result)
+@@ -3213,6 +3189,49 @@
+ 	pr_info("mDriver: mBoot control path ready\n");
+ 	return 0;
+ }
++
++static void mboot_ready_workfn(struct work_struct *work);
++static DECLARE_DELAYED_WORK(mboot_ready_work, mboot_ready_workfn);
++static atomic_t mboot_ready_started = ATOMIC_INIT(0);
++static struct notifier_block mboot_fb_notifier;
++
++static void mboot_ready_workfn(struct work_struct *work)
++{
++	if (!mboot_display_backend_ready() ||
++	    atomic_cmpxchg(&mboot_ready_started, 0, 1))
++		return;
++	fb_unregister_client(&mboot_fb_notifier);
++	if (mboot_finish_ready())
++		pr_err("mDriver: hardware backend startup failed\n");
++}
++
++static int mboot_fb_event(struct notifier_block *notifier,
++			  unsigned long event, void *data)
++{
++	if (event == FB_EVENT_FB_REGISTERED)
++		mod_delayed_work(system_wq, &mboot_ready_work, 0);
++	return NOTIFY_OK;
++}
++
++static struct notifier_block mboot_fb_notifier = {
++	.notifier_call = mboot_fb_event,
++};
++
++static int __init mboot_report_ready(void)
++{
++	mboot_boot_status("DISPLAY\nMDRIVER DEVICES");
++	if (mboot_query_and_claim_devices())
++		return -EIO;
++	mboot_boot_status("DISPLAY\nMDRIVER PCI");
++	if (mboot_pci_device_count && mboot_pci_publish_frontend()) {
++		mboot_boot_status("DISPLAY\nMDRIVER PCI ERROR");
++		return -EIO;
++	}
++	if (fb_register_client(&mboot_fb_notifier))
++		return -EIO;
++	mod_delayed_work(system_wq, &mboot_ready_work, 0);
++	return 0;
++}
+ late_initcall(mboot_report_ready);
+ 
+ static void __init mboot_init_platform(void)
+-- 
+2.43.0
