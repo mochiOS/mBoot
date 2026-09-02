@@ -109,8 +109,7 @@ my %domain_images = (
         path => "$mnu_dir/target/x86_64-unknown-none/release/ring-bootstrap",
     },
     mochios => {
-        bin => 'domain-probe',
-        path => "$mnu_dir/target/x86_64-unknown-none/release/domain-probe",
+        path => "$system_dir/target/x86_64-unknown-none/release/mdriver-probe",
     },
     'mochios-system' => {
         path => "$system_dir/target/x86_64-unknown-none/release/mochios-system",
@@ -179,6 +178,15 @@ if ($required_images{'mochios-system'}) {
         '--target', 'x86_64-unknown-none', '--manifest-path', $system_manifest,
         '--no-default-features', '--features', 'system-domain', '--bin', 'mochios-system',
         '--config', qq{patch."https://github.com/mochiOS/mnu".mnu.path="$mnu_dir"},
+        '--config', qq{patch."https://github.com/mochiOS/mnu".mnu-abi.path="$mnu_abi"},
+    );
+}
+if ($required_images{'mochios'}) {
+    run_env(
+        { RUSTFLAGS => '-C relocation-model=static -C link-arg=-no-pie --cfg curve25519_dalek_backend="serial"' },
+        $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc', '--release',
+        '--target', 'x86_64-unknown-none', '--manifest-path', $system_manifest,
+        '--no-default-features', '--features', 'mdriver-probe', '--bin', 'mdriver-probe',
         '--config', qq{patch."https://github.com/mochiOS/mnu".mnu-abi.path="$mnu_abi"},
     );
 }
