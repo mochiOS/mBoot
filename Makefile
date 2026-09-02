@@ -1,6 +1,7 @@
 OUTPUT_DIR ?= $(CURDIR)/output
 CONFIG ?= $(CURDIR)/config/qemu.toml
 MNU_DIR ?= $(abspath $(CURDIR)/../mnu)
+MOCHIOS_SYSTEM_DIR ?=
 IMAGE ?= $(OUTPUT_DIR)/mochiOS.img
 PXE_DIR ?= $(OUTPUT_DIR)/pxe
 UEFI_NET_DIR ?= $(OUTPUT_DIR)/uefi-net
@@ -17,7 +18,9 @@ MBOOT_INPUTS := $(shell find $(CURDIR)/src $(CURDIR)/scripts -type f -print 2>/d
 MNU_INPUTS := $(shell find $(MNU_DIR)/src $(MNU_DIR)/crates/abi/src \
 	-type f -print 2>/dev/null) \
 	$(wildcard $(MNU_DIR)/Cargo.toml $(MNU_DIR)/crates/abi/Cargo.toml)
-IMAGE_INPUTS := $(MBOOT_INPUTS) $(MNU_INPUTS) $(CONFIG) \
+MOCHIOS_SYSTEM_INPUTS := $(shell find $(MOCHIOS_SYSTEM_DIR)/src -type f -print 2>/dev/null) \
+	$(wildcard $(MOCHIOS_SYSTEM_DIR)/Cargo.toml $(MOCHIOS_SYSTEM_DIR)/Cargo.lock)
+IMAGE_INPUTS := $(MBOOT_INPUTS) $(MNU_INPUTS) $(MOCHIOS_SYSTEM_INPUTS) $(CONFIG) \
 	$(wildcard $(MDRIVER_KERNEL) $(MDRIVER_INITRAMFS) $(MOCHIOS_INITFS) $(MOCHIOS_ROOTFS))
 
 .PHONY: all build clean device-io-test mdriver-test help image image-test qemu-test setup test
@@ -46,6 +49,9 @@ $(IMAGE): $(SETUP_STAMP) $(IMAGE_INPUTS)
 	@test -f "$(MNU_DIR)/Cargo.toml" || { \
 		echo 'mnu repository was not found; set MNU_DIR=/path/to/mnu' >&2; exit 1; \
 	}
+	@test -f "$(MOCHIOS_SYSTEM_DIR)/Cargo.toml" || { \
+		echo 'mochiOS system repository was not found; set MOCHIOS_SYSTEM_DIR=/path/to/mochiOS' >&2; exit 1; \
+	}
 	MBOOT_HOST_CARGO="$(CARGO)" \
 	MBOOT_OUTPUT_DIR="$(OUTPUT_DIR)" \
 	MBOOT_MDRIVER_KERNEL="$(MDRIVER_KERNEL)" \
@@ -55,6 +61,7 @@ $(IMAGE): $(SETUP_STAMP) $(IMAGE_INPUTS)
 		scripts/build-image.pl \
 		--config "$(CONFIG)" \
 		--mnu-dir "$(MNU_DIR)" \
+		--system-dir "$(MOCHIOS_SYSTEM_DIR)" \
 		--output "$(IMAGE)" \
 		--pxe-output "$(PXE_DIR)" \
 		--uefi-net-output "$(UEFI_NET_DIR)"

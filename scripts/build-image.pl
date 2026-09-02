@@ -11,7 +11,7 @@ use FindBin;
 use lib $FindBin::Bin;
 use MbootConfig qw(read_mboot_config);
 
-my ($config_file, $mnu_dir, $output_file, $pxe_output, $uefi_net_output);
+my ($config_file, $mnu_dir, $system_dir, $output_file, $pxe_output, $uefi_net_output);
 while (@ARGV) {
     my $argument = shift @ARGV;
     if ($argument eq '--config') {
@@ -19,6 +19,9 @@ while (@ARGV) {
     }
     elsif ($argument eq '--mnu-dir') {
         $mnu_dir = shift @ARGV;
+    }
+    elsif ($argument eq '--system-dir') {
+        $system_dir = shift @ARGV;
     }
     elsif ($argument eq '--output') {
         $output_file = shift @ARGV;
@@ -33,11 +36,12 @@ while (@ARGV) {
         die "unknown argument: $argument\n";
     }
 }
-defined $config_file && defined $mnu_dir && defined $output_file
-    or die "usage: $0 --config FILE --mnu-dir DIR --output FILE [--pxe-output DIR] [--uefi-net-output DIR]\n";
+defined $config_file && defined $mnu_dir && defined $system_dir && defined $output_file
+    or die "usage: $0 --config FILE --mnu-dir DIR --system-dir DIR --output FILE [--pxe-output DIR] [--uefi-net-output DIR]\n";
 
 $config_file = absolute_existing($config_file);
 $mnu_dir = absolute_existing($mnu_dir);
+$system_dir = absolute_existing($system_dir);
 my $mboot_dir = abs_path("$FindBin::Bin/..");
 $output_file = absolute_output($output_file);
 $pxe_output = absolute_output($pxe_output) if defined $pxe_output;
@@ -86,6 +90,7 @@ if (defined $uefi_net_output) {
 my $toolchain = "+$config->{toolchain}";
 my $mnu_manifest = "$mnu_dir/Cargo.toml";
 my $mnu_abi = "$mnu_dir/crates/abi";
+my $system_manifest = "$system_dir/Cargo.toml";
 my %domain_images = (
     bootstrap => {
         bin => 'domain-bootstrap',
@@ -108,8 +113,7 @@ my %domain_images = (
         path => "$mnu_dir/target/x86_64-unknown-none/release/domain-probe",
     },
     'mochios-system' => {
-        bin => 'domain-kernel',
-        path => "$mnu_dir/target/x86_64-unknown-none/release/domain-kernel",
+        path => "$system_dir/target/x86_64-unknown-none/release/mochios-system",
     },
     'hardware-bootstrap' => {
         bin => 'hardware-bootstrap',
@@ -172,8 +176,10 @@ if ($required_images{'mochios-system'}) {
     run_env(
         { RUSTFLAGS => '-C relocation-model=static -C link-arg=-no-pie --cfg curve25519_dalek_backend="serial"' },
         $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc', '--release',
-        '--target', 'x86_64-unknown-none', '--manifest-path', $mnu_manifest,
-        '--no-default-features', '--features', 'system-domain', '--bin', 'domain-kernel',
+        '--target', 'x86_64-unknown-none', '--manifest-path', $system_manifest,
+        '--no-default-features', '--features', 'system-domain', '--bin', 'mochios-system',
+        '--config', qq{patch."https://github.com/mochiOS/mnu".mnu.path="$mnu_dir"},
+        '--config', qq{patch."https://github.com/mochiOS/mnu".mnu-abi.path="$mnu_abi"},
     );
 }
 for my $name (keys %required_images) {
