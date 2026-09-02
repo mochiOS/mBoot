@@ -104,12 +104,12 @@ my %domain_images = (
         path => "$mnu_dir/target/x86_64-unknown-none/release/ring-bootstrap",
     },
     mochios => {
-        bin => 'mochios-domain',
-        path => "$mnu_dir/target/x86_64-unknown-none/release/mochios-domain",
+        bin => 'domain-probe',
+        path => "$mnu_dir/target/x86_64-unknown-none/release/domain-probe",
     },
     'mochios-system' => {
-        bin => 'mochios-system',
-        path => "$mnu_dir/target/x86_64-unknown-none/release/mochios-system",
+        bin => 'domain-kernel',
+        path => "$mnu_dir/target/x86_64-unknown-none/release/domain-kernel",
     },
     'hardware-bootstrap' => {
         bin => 'hardware-bootstrap',
@@ -173,7 +173,7 @@ if ($required_images{'mochios-system'}) {
         { RUSTFLAGS => '-C relocation-model=static -C link-arg=-no-pie --cfg curve25519_dalek_backend="serial"' },
         $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc', '--release',
         '--target', 'x86_64-unknown-none', '--manifest-path', $mnu_manifest,
-        '--no-default-features', '--features', 'system-domain', '--bin', 'mochios-system',
+        '--no-default-features', '--features', 'system-domain', '--bin', 'domain-kernel',
     );
 }
 for my $name (keys %required_images) {
