@@ -11,7 +11,7 @@ EXPECT_IOMMU=${HV_EXPECT_IOMMU:-}
 IOMMU_DEVICE=${HV_IOMMU_DEVICE:-}
 IOMMU_PROBE_ONLY=${HV_IOMMU_PROBE_ONLY:-0}
 EFI="$ROOT/output/target/x86_64-unknown-uefi/release/mboot.efi"
-RING_BOOTSTRAP_DOMAIN_ELF=${RING_BOOTSTRAP_DOMAIN_ELF:-"$ROOT/../core/target/x86_64-unknown-none/release/ring-bootstrap"}
+RING_BOOTSTRAP_DOMAIN_ELF=${RING_BOOTSTRAP_DOMAIN_ELF:-"$ROOT/../boot/target/x86_64-unknown-none/release/ring-bootstrap"}
 MBOOT_LAUNCH_MANIFEST=${MBOOT_LAUNCH_MANIFEST:-${HV_LAUNCH_MANIFEST:-"$ROOT/output/launch.manifest"}}
 OVMF_CODE="$ROOT/firmware/OVMF_CODE_4M.fd"
 OVMF_VARS="$ROOT/firmware/OVMF_VARS_4M.fd"
@@ -127,7 +127,7 @@ if [[ $BOOTSTRAPPED -ne 1 ]]; then
     echo 'test-qemu: hypervisor did not complete bootstrap' >&2
     exit 1
 fi
-grep -Fq 'Domain 3 crashed and was isolated: exit=0x400 gpa=0x40000000' "$SERIAL" || {
+grep -Fq 'Domain 3 crashed and was isolated: exit=0x400 address=0x40000000' "$SERIAL" || {
     sed -n '1,200p' "$SERIAL" >&2
     echo 'test-qemu: nested-page fault did not remain isolated to Application Domain 3' >&2
     exit 1

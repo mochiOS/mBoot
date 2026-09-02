@@ -1,7 +1,7 @@
 OUTPUT_DIR ?= $(CURDIR)/output
 CONFIG ?= $(CURDIR)/config/qemu.toml
 MNU_DIR ?= $(abspath $(CURDIR)/../mnu)
-MOCHIOS_SYSTEM_DIR ?=
+MOCHIOS_SYSTEM_DIR ?= $(abspath $(CURDIR)/../boot)
 IMAGE ?= $(OUTPUT_DIR)/mochiOS.img
 PXE_DIR ?= $(OUTPUT_DIR)/pxe
 UEFI_NET_DIR ?= $(OUTPUT_DIR)/uefi-net
@@ -18,7 +18,8 @@ MBOOT_INPUTS := $(shell find $(CURDIR)/src $(CURDIR)/scripts -type f -print 2>/d
 MNU_INPUTS := $(shell find $(MNU_DIR)/src $(MNU_DIR)/crates/abi/src \
 	-type f -print 2>/dev/null) \
 	$(wildcard $(MNU_DIR)/Cargo.toml $(MNU_DIR)/crates/abi/Cargo.toml)
-MOCHIOS_SYSTEM_INPUTS := $(shell find $(MOCHIOS_SYSTEM_DIR)/src -type f -print 2>/dev/null) \
+MOCHIOS_SYSTEM_INPUTS := $(shell find $(MOCHIOS_SYSTEM_DIR)/src $(MOCHIOS_SYSTEM_DIR)/crates \
+	-type f -print 2>/dev/null) \
 	$(wildcard $(MOCHIOS_SYSTEM_DIR)/Cargo.toml $(MOCHIOS_SYSTEM_DIR)/Cargo.lock)
 IMAGE_INPUTS := $(MBOOT_INPUTS) $(MNU_INPUTS) $(MOCHIOS_SYSTEM_INPUTS) $(CONFIG) \
 	$(wildcard $(MDRIVER_KERNEL) $(MDRIVER_INITRAMFS) $(MOCHIOS_INITFS) $(MOCHIOS_ROOTFS))
@@ -94,7 +95,7 @@ mdriver-test:
 
 qemu-test:
 	$(MAKE) image CONFIG="$(CURDIR)/config/qemu.toml" IMAGE="$(OUTPUT_DIR)/qemu.img"
-	RING_BOOTSTRAP_DOMAIN_ELF="$(MNU_DIR)/target/x86_64-unknown-none/release/ring-bootstrap" \
+	RING_BOOTSTRAP_DOMAIN_ELF="$(MOCHIOS_SYSTEM_DIR)/target/x86_64-unknown-none/release/ring-bootstrap" \
 	MBOOT_LAUNCH_MANIFEST="$(OUTPUT_DIR)/launch.manifest" scripts/test-qemu.sh
 
 clean:

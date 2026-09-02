@@ -88,25 +88,24 @@ if (defined $uefi_net_output) {
 }
 
 my $toolchain = "+$config->{toolchain}";
-my $mnu_manifest = "$mnu_dir/Cargo.toml";
 my $mnu_abi = "$mnu_dir/crates/abi";
 my $system_manifest = "$system_dir/Cargo.toml";
 my %domain_images = (
     bootstrap => {
         bin => 'domain-bootstrap',
-        path => "$mnu_dir/target/x86_64-unknown-none/release/domain-bootstrap",
+        path => "$system_dir/target/x86_64-unknown-none/release/domain-bootstrap",
     },
     'event-bootstrap' => {
         bin => 'event-bootstrap',
-        path => "$mnu_dir/target/x86_64-unknown-none/release/event-bootstrap",
+        path => "$system_dir/target/x86_64-unknown-none/release/event-bootstrap",
     },
     'grant-bootstrap' => {
         bin => 'grant-bootstrap',
-        path => "$mnu_dir/target/x86_64-unknown-none/release/grant-bootstrap",
+        path => "$system_dir/target/x86_64-unknown-none/release/grant-bootstrap",
     },
     'ring-bootstrap' => {
         bin => 'ring-bootstrap',
-        path => "$mnu_dir/target/x86_64-unknown-none/release/ring-bootstrap",
+        path => "$system_dir/target/x86_64-unknown-none/release/ring-bootstrap",
     },
     mochios => {
         path => "$system_dir/target/x86_64-unknown-none/release/mdriver-probe",
@@ -116,7 +115,7 @@ my %domain_images = (
     },
     'hardware-bootstrap' => {
         bin => 'hardware-bootstrap',
-        path => "$mnu_dir/target/x86_64-unknown-none/release/hardware-bootstrap",
+        path => "$system_dir/target/x86_64-unknown-none/release/hardware-bootstrap",
     },
     'mdriver' => { path => $ENV{MBOOT_MDRIVER_KERNEL} },
 );
@@ -167,8 +166,9 @@ if (@native_images) {
     run_env(
         { RUSTFLAGS => '-C relocation-model=static -C link-arg=-no-pie --cfg curve25519_dalek_backend="serial"' },
         $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc', '--release',
-        '--target', 'x86_64-unknown-none', '--manifest-path', $mnu_manifest,
-        '--no-default-features', '--features', 'domain-guest', @bins,
+        '--target', 'x86_64-unknown-none', '--manifest-path', $system_manifest,
+        '--no-default-features', '--features', 'domain-probes', @bins,
+        '--config', qq{patch."https://github.com/mochiOS/mnu".mnu-abi.path="$mnu_abi"},
     );
 }
 if ($required_images{'mochios-system'}) {
