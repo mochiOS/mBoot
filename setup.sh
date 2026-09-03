@@ -23,7 +23,12 @@ toolchain=$(perl "$root_dir/scripts/config-value.pl" "$config_file" toolchain)
 make -C "$mdriver_dir" defconfig
 make -C "$mdriver_dir" source
 
-rustup toolchain install "$toolchain" --profile minimal --component rust-src
+if ! rustup run "$toolchain" rustc --version >/dev/null 2>&1; then
+    rustup toolchain install "$toolchain" --profile minimal --component rust-src
+elif ! rustup component list --toolchain "$toolchain" --installed \
+        | grep -Fxq rust-src; then
+    rustup component add --toolchain "$toolchain" rust-src
+fi
 cargo "+$toolchain" fetch --manifest-path "$root_dir/Cargo.toml"
 if [[ -f "$mnu_dir/Cargo.toml" ]]; then
     cargo "+$toolchain" fetch --manifest-path "$mnu_dir/Cargo.toml"

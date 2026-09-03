@@ -59,7 +59,7 @@ use uefi::CString16;
 
 const MAX_MEMORY_REGIONS: usize = 256;
 const MAX_GUEST_MEMORY_PAGES: usize = 131_072;
-const GRANT_WINDOW_PAGES: usize = 16;
+const GRANT_WINDOW_PAGES: usize = 64;
 const DEVICE_WINDOW_PAGES: usize = 64;
 const DOMAIN_STACK_BYTES: u64 = 1024 * 1024;
 const DEVICE_WINDOW_START: u64 = 0x1000_0000;

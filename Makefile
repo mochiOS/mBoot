@@ -31,7 +31,7 @@ all: image
 
 SETUP_STAMP := $(CURDIR)/mdriver/.cache/setup-complete
 
-$(SETUP_STAMP): setup.sh mdriver/Makefile mdriver/configs/mdriver_x86_64_defconfig \
+$(SETUP_STAMP): setup.sh mdriver/configs/mdriver_x86_64_defconfig \
 		mdriver/board/mdriver/linux.config
 	@MNU_DIR="$(MNU_DIR)" MBOOT_CONFIG="$(CONFIG)" ./setup.sh
 

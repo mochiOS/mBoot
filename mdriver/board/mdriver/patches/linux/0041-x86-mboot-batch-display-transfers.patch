@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000041 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 00:00:00 +0900
+Subject: [PATCH] x86/mboot: batch display transfers
+
+Map a bounded set of display Grant pages as one contiguous buffer. This lets
+the System Domain submit several scanlines per control transaction while the
+single-page display protocol remains available for older guests.
+---
+ arch/x86/kernel/cpu/mboot.c | 105 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 94 insertions(+), 11 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -104,6 +104,7 @@
+ #define MBOOT_CONTROL_CLOSE_DISPLAY 21
+ #define MBOOT_CONTROL_INSTALL_PARTITION 22
+ #define MBOOT_CONTROL_OPEN_PARTITION 23
++#define MBOOT_CONTROL_REGISTER_DISPLAY_BUFFER 24
+ #define MBOOT_CONTROL_STATUS_OK 0
+ #define MBOOT_CONTROL_STATUS_UNSUPPORTED_VERSION 1
+ #define MBOOT_CONTROL_STATUS_INVALID_REQUEST 2
+@@ -144,9 +145,14 @@
+ #define MBOOT_DEVICE_FEATURE_BLOCK_FLUSH BIT_ULL(10)
+ #define MBOOT_DEVICE_FEATURE_BLOCK_ASYNC_QUEUE BIT_ULL(11)
+ #define MBOOT_DEVICE_FEATURE_DISPLAY_TILE BIT_ULL(12)
++#define MBOOT_DEVICE_FEATURE_DISPLAY_BULK BIT_ULL(13)
+ #define MBOOT_DEVICE_FEATURES_BASE GENMASK_ULL(2, 0)
+ #define MBOOT_DISPLAY_BUFFER_PAGE 7
+ #define MBOOT_DISPLAY_MAX_TRANSFER PAGE_SIZE
++#define MBOOT_DISPLAY_BULK_FIRST_PAGE 9
++#define MBOOT_DISPLAY_BULK_PAGE_COUNT 55
++#define MBOOT_DISPLAY_BULK_MAX_TRANSFER \
++	(MBOOT_DISPLAY_BULK_PAGE_COUNT * PAGE_SIZE)
+ #define MBOOT_DISPLAY_PIXEL_BYTES 4
+ #define MBOOT_BLOCK_DATA_PAGE 1
+ #define MBOOT_BLOCK_RING_PAGE 2
+@@ -1033,6 +1039,7 @@
+ static u64 mboot_block_first_sector;
+ static u64 mboot_block_sector_count;
+ static u64 mboot_grant_window_start;
++static u64 mboot_grant_window_size;
+ static bool mboot_block_io_verified;
+ static struct mboot_ring_page *mboot_block_ring;
+ static void *mboot_block_buffers[MBOOT_BLOCK_BUFFER_COUNT];
+@@ -1044,6 +1051,9 @@
+ extern int num_registered_fb;
+ static void *mboot_display_buffer;
+ static unsigned long mboot_display_grant_ref;
++static unsigned long mboot_display_bulk_refs[MBOOT_DISPLAY_BULK_PAGE_COUNT];
++static unsigned int mboot_display_bulk_count;
++static size_t mboot_display_buffer_size;
+ static u32 mboot_display_device_id;
+ static struct fb_info *mboot_display_info;
+ static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info);
+@@ -1117,13 +1127,19 @@
+ 	    !(info->flags & MBOOT_PCI_FLAG_READ_ONLY))
+ 		features |= MBOOT_DEVICE_FEATURE_BLOCK_WRITE |
+ 			    MBOOT_DEVICE_FEATURE_BLOCK_FLUSH;
+-	if (mboot_control_device_kind(info) == MBOOT_DEVICE_KIND_DISPLAY)
++	if (mboot_control_device_kind(info) == MBOOT_DEVICE_KIND_DISPLAY) {
+ 		features |= MBOOT_DEVICE_FEATURE_DISPLAY_TILE;
++		if (mboot_grant_window_size >= MBOOT_DISPLAY_BULK_MAX_TRANSFER +
++					       MBOOT_DISPLAY_BULK_FIRST_PAGE * PAGE_SIZE)
++			features |= MBOOT_DEVICE_FEATURE_DISPLAY_BULK;
++	}
+ 	return features;
+ }
+ 
+ static void mboot_display_close(void)
+ {
++	unsigned int index;
++
+ 	if (mboot_display_buffer) {
+ 		memunmap(mboot_display_buffer);
+ 		mboot_display_buffer = NULL;
+@@ -1133,17 +1149,54 @@
+ 				mboot_display_grant_ref, 0, 0);
+ 		mboot_display_grant_ref = 0;
+ 	}
++	for (index = 0; index < mboot_display_bulk_count; index++) {
++		mboot_hypercall(MBOOT_HYPERCALL_GRANT_UNMAP,
++				mboot_display_bulk_refs[index], 0, 0);
++		mboot_display_bulk_refs[index] = 0;
++	}
++	mboot_display_bulk_count = 0;
++	mboot_display_buffer_size = 0;
+ 	mboot_display_device_id = 0;
+ 	mboot_display_info = NULL;
+ }
+ 
+-static int mboot_display_open(u32 device_id, unsigned long grant_ref)
++static int mboot_display_register(u32 device_id, u64 index,
++				  unsigned long grant_ref)
++{
++	const struct mboot_pci_frontend *device;
++	unsigned long result;
++	u64 address;
++
++	if (!device_id || device_id > mboot_pci_device_count ||
++	    index != mboot_display_bulk_count ||
++	    index >= MBOOT_DISPLAY_BULK_PAGE_COUNT || !grant_ref ||
++	    mboot_grant_window_size < MBOOT_DISPLAY_BULK_MAX_TRANSFER +
++				      MBOOT_DISPLAY_BULK_FIRST_PAGE * PAGE_SIZE ||
++	    mboot_display_buffer || mboot_display_device_id)
++		return -EINVAL;
++	device = &mboot_pci_devices[device_id - 1];
++	if (mboot_control_device_kind(&device->info) != MBOOT_DEVICE_KIND_DISPLAY)
++		return -ENODEV;
++	address = mboot_grant_window_start +
++		(MBOOT_DISPLAY_BULK_FIRST_PAGE + index) * PAGE_SIZE;
++	result = mboot_hypercall(MBOOT_HYPERCALL_GRANT_MAP, grant_ref, address, 0);
++	if (result)
++		return -EINVAL;
++	mboot_display_bulk_refs[index] = grant_ref;
++	mboot_display_bulk_count++;
++	return 0;
++}
++
++static int mboot_display_open(u32 device_id, unsigned long grant_ref,
++			      u64 page_count, u64 max_transfer)
+ {
+ 	const struct mboot_pci_frontend *device;
+ 	unsigned long result;
+ 	u64 address;
+ 
+-	if (!device_id || device_id > mboot_pci_device_count || !grant_ref ||
++	bool bulk = !grant_ref;
++
++	if (!device_id || device_id > mboot_pci_device_count ||
+ 	    mboot_display_buffer || mboot_display_grant_ref)
+ 		return -EINVAL;
+ 	device = &mboot_pci_devices[device_id - 1];
+@@ -1153,12 +1206,28 @@
+ 	    registered_fb[0]->var.bits_per_pixel != 32 ||
+ 	    !registered_fb[0]->fbops || !registered_fb[0]->fbops->fb_imageblit)
+ 		return -EAGAIN;
+-	address = mboot_grant_window_start + MBOOT_DISPLAY_BUFFER_PAGE * PAGE_SIZE;
+-	result = mboot_hypercall(MBOOT_HYPERCALL_GRANT_MAP, grant_ref, address, 0);
+-	if (result)
+-		return -EINVAL;
+-	mboot_display_grant_ref = grant_ref;
+-	mboot_display_buffer = memremap(address, PAGE_SIZE, MEMREMAP_WB);
++	if (bulk) {
++		if (page_count != MBOOT_DISPLAY_BULK_PAGE_COUNT ||
++		    max_transfer != MBOOT_DISPLAY_BULK_MAX_TRANSFER ||
++		    mboot_display_bulk_count != MBOOT_DISPLAY_BULK_PAGE_COUNT)
++			return -EINVAL;
++		address = mboot_grant_window_start +
++			MBOOT_DISPLAY_BULK_FIRST_PAGE * PAGE_SIZE;
++		mboot_display_buffer_size = MBOOT_DISPLAY_BULK_MAX_TRANSFER;
++	} else {
++		if (page_count || max_transfer || mboot_display_bulk_count)
++			return -EINVAL;
++		address = mboot_grant_window_start +
++			MBOOT_DISPLAY_BUFFER_PAGE * PAGE_SIZE;
++		result = mboot_hypercall(MBOOT_HYPERCALL_GRANT_MAP,
++					 grant_ref, address, 0);
++		if (result)
++			return -EINVAL;
++		mboot_display_grant_ref = grant_ref;
++		mboot_display_buffer_size = MBOOT_DISPLAY_MAX_TRANSFER;
++	}
++	mboot_display_buffer = memremap(address, mboot_display_buffer_size,
++					MEMREMAP_WB);
+ 	if (!mboot_display_buffer) {
+ 		mboot_display_close();
+ 		return -EIO;
+@@ -1182,7 +1251,7 @@
+ 	    request->arguments[2] > U32_MAX || request->arguments[3] > U32_MAX ||
+ 	    check_mul_overflow(request->arguments[2], request->arguments[3], &pixels) ||
+ 	    check_mul_overflow(pixels, (u64)MBOOT_DISPLAY_PIXEL_BYTES, &bytes) ||
+-	    bytes > MBOOT_DISPLAY_MAX_TRANSFER ||
++	    bytes > mboot_display_buffer_size ||
+ 	    request->arguments[0] + request->arguments[2] > info->var.xres ||
+ 	    request->arguments[1] + request->arguments[3] > info->var.yres)
+ 		return -EINVAL;
+@@ -2839,18 +2908,31 @@
+ 		return;
+ 	case MBOOT_CONTROL_OPEN_DISPLAY:
+ 		if (!mboot_control_active || !request->device_id ||
+-		    !request->arguments[0] || request->arguments[0] > U32_MAX ||
+-		    request->arguments[1] || request->arguments[2] ||
+-		    request->arguments[3])
++		    request->arguments[0] > U32_MAX || request->arguments[3])
+ 			return;
+-		if (mboot_display_open(request->device_id, request->arguments[0])) {
++		if (mboot_display_open(request->device_id, request->arguments[0],
++				       request->arguments[1], request->arguments[2])) {
+ 			response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
+ 			return;
+ 		}
+ 		response->status = MBOOT_CONTROL_STATUS_OK;
+-		response->values[0] = MBOOT_DISPLAY_MAX_TRANSFER;
++		response->values[0] = mboot_display_buffer_size;
+ 		response->values[1] = MBOOT_DISPLAY_PIXEL_BYTES;
+ 		return;
++	case MBOOT_CONTROL_REGISTER_DISPLAY_BUFFER:
++		if (!mboot_control_active || !request->device_id ||
++		    !request->arguments[1] || request->arguments[1] > U32_MAX ||
++		    request->arguments[2] || request->arguments[3])
++			return;
++		if (mboot_display_register(request->device_id,
++					   request->arguments[0],
++					   request->arguments[1])) {
++			response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
++			return;
++		}
++		response->status = MBOOT_CONTROL_STATUS_OK;
++		response->values[0] = request->arguments[0];
++		return;
+ 	case MBOOT_CONTROL_DISPLAY_INFO:
+ 		if (!mboot_control_active ||
+ 		    request->device_id != mboot_display_device_id ||
+@@ -3158,6 +3240,7 @@
+ 	    grant_window_size <
+ 		(MBOOT_BLOCK_BUFFER_FIRST_PAGE + MBOOT_BLOCK_BUFFER_COUNT) * PAGE_SIZE)
+ 		return -EIO;
++	mboot_grant_window_size = grant_window_size;
+ 	grant_ref = mboot_hypercall(MBOOT_HYPERCALL_GRANT_QUERY, 0, 0, 0);
+ 	if (grant_ref == MBOOT_HYPERCALL_INVALID_ARGUMENT || grant_ref > U32_MAX)
+ 		return -EIO;
+-- 
+2.43.0
