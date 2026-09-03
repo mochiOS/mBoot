@@ -20,7 +20,7 @@ Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
  #define MBOOT_HYPERCALL_READY 3
  #define MBOOT_HYPERCALL_EVENT_SEND 5
  #define MBOOT_HYPERCALL_EVENT_WAIT 6
-@@ -306,6 +307,14 @@ static unsigned long mboot_hypercall(unsigned long number,
+@@ -306,6 +307,12 @@ static unsigned long mboot_hypercall(unsigned long number,
  				     unsigned long arg0, unsigned long arg1,
  				     unsigned long arg2);
  
@@ -33,7 +33,7 @@ Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
  static void mboot_irq_mask(struct irq_data *data)
  {
  	struct irq_cfg *cfg = irqd_cfg(data);
-@@ -3067,11 +3076,20 @@ static int __init mboot_report_ready(void)
+@@ -3067,10 +3076,16 @@ static int __init mboot_report_ready(void)
  {
  	unsigned long result;
  

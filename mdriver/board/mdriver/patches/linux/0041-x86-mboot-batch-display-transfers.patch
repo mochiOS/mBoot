@@ -44,7 +44,7 @@ diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
  static bool mboot_block_io_verified;
  static struct mboot_ring_page *mboot_block_ring;
  static void *mboot_block_buffers[MBOOT_BLOCK_BUFFER_COUNT];
-@@ -1044,6 +1051,9 @@
+@@ -1044,7 +1051,10 @@
  extern int num_registered_fb;
  static void *mboot_display_buffer;
  static unsigned long mboot_display_grant_ref;
@@ -53,6 +53,7 @@ diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
 +static size_t mboot_display_buffer_size;
  static u32 mboot_display_device_id;
  static struct fb_info *mboot_display_info;
+ static bool mboot_block_queue_verified;
  static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info);
 @@ -1117,13 +1127,19 @@
  	    !(info->flags & MBOOT_PCI_FLAG_READ_ONLY))

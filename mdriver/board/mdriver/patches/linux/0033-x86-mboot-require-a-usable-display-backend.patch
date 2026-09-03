@@ -16,10 +16,10 @@ diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
 index 111111111111..222222222222 100644
 --- a/arch/x86/kernel/cpu/mboot.c
 +++ b/arch/x86/kernel/cpu/mboot.c
-@@ -1007,6 +1007,96 @@ static void *mboot_display_buffer;
- static unsigned long mboot_display_grant_ref;
+@@ -1005,6 +1005,96 @@ static unsigned long mboot_display_grant_ref;
  static u32 mboot_display_device_id;
  static struct fb_info *mboot_display_info;
+ static bool mboot_block_queue_verified;
 +static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info);
 +
 +static int __init mboot_wait_for_display_backend(void)

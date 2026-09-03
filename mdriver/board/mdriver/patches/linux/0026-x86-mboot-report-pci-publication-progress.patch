@@ -49,16 +49,5 @@ Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
  		device->info.state = MBOOT_PCI_STATE_ACTIVE;
  		if (device->irq_count == 2)
  			pr_info("mDriver: PCI requester %04x uses config IRQ %d vector %#x, queue IRQ %d vector %#x\n",
-@@ -858,8 +863,10 @@ static int __init mboot_pci_publish_frontend(void)
- 	}
- 	pr_info("mDriver: mBoot PCI frontend ready: %u devices, %u resources, %u active\n",
- 		mboot_pci_device_count, resource_count, active);
-+	mboot_boot_status("DISPLAY\nMDRIVER PCI BIND");
- 	for (index = 0; index < ARRAY_SIZE(mboot_pci_buses); index++)
- 		if (mboot_pci_buses[index])
- 			pci_bus_add_devices(mboot_pci_buses[index]);
-+	mboot_boot_status("DISPLAY\nMDRIVER PCI READY");
- 	return 0;
- }
 -- 
 2.39.5

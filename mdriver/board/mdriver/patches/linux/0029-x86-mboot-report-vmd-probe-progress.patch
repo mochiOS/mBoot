@@ -34,10 +34,7 @@ Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
  #endif /* _ASM_X86_HYPERVISOR_H */
 --- a/arch/x86/kernel/cpu/mboot.c
 +++ b/arch/x86/kernel/cpu/mboot.c
-@@ -310,12 +310,14 @@ static void mboot_boot_status(const char *status)
- 			virt_to_phys((void *)status), strlen(status), 0);
- }
- 
+@@ -317,6 +317,8 @@ static void mboot_boot_status(const char *status)
 -static void mboot_boot_device_error(const char *operation, u16 requester)
 +void mboot_boot_device_status(const char *operation, u16 requester)
  {
@@ -45,12 +42,8 @@ Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
  			virt_to_phys((void *)operation), strlen(operation),
  			(unsigned long)requester + 1);
  }
- 
 +#define mboot_boot_device_error mboot_boot_device_status
 +
- static void mboot_irq_mask(struct irq_data *data)
- {
- 	struct irq_cfg *cfg = irqd_cfg(data);
 --- a/drivers/pci/controller/vmd.c
 +++ b/drivers/pci/controller/vmd.c
 @@ -19,6 +19,7 @@

@@ -13,7 +13,7 @@ Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 
 --- a/arch/x86/kernel/cpu/mboot.c
 +++ b/arch/x86/kernel/cpu/mboot.c
-@@ -750,14 +750,16 @@ static int __init mboot_pci_publish_frontend(void)
+@@ -750,15 +750,15 @@ static int __init mboot_pci_publish_frontend(void)
  	unsigned int active = 0;
  	unsigned int resource_count = 0;
  	unsigned int index;

@@ -8,22 +8,13 @@ demultiplexer inputs while leaving the native Linux path unchanged.
 
 Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
- arch/x86/kernel/cpu/mboot.c  | 12 ++++++++++++
+ arch/x86/kernel/cpu/mboot.c  | 10 ++++++++++
  drivers/pci/controller/vmd.c | 28 +++++++++++++++++++---------
- 2 files changed, 31 insertions(+), 9 deletions(-)
+ 2 files changed, 29 insertions(+), 9 deletions(-)
 
 --- a/arch/x86/kernel/cpu/mboot.c
 +++ b/arch/x86/kernel/cpu/mboot.c
-@@ -515,6 +515,8 @@ bool mboot_pci_mmio_valid(u64 address, unsigned long size)
- 	return false;
- }
- 
-+int mboot_pci_irq_vector(struct pci_dev *pdev, unsigned int index);
-+
- static struct mboot_pci_frontend *mboot_pci_find(unsigned int bus,
- 						 unsigned int devfn)
- {
-@@ -527,6 +529,16 @@ static struct mboot_pci_frontend *mboot_pci_find(unsigned int bus,
+@@ -527,6 +527,16 @@ static struct mboot_pci_frontend *mboot_pci_find(unsigned int bus,
  	return NULL;
  }
  
@@ -82,15 +73,11 @@ Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
  
  	vmd->irqs = devm_kcalloc(&dev->dev, vmd->msix_count, sizeof(*vmd->irqs),
  				 GFP_KERNEL);
-@@ -703,5 +712,6 @@ static int vmd_alloc_irqs(struct vmd_dev *vmd)
- 			return err;
- 
+@@ -715,3 +724,4 @@ static int vmd_alloc_irqs(struct vmd_dev *vmd)
  		INIT_LIST_HEAD(&vmd->irqs[i].irq_list);
 -		vmd->irqs[i].virq = pci_irq_vector(dev, i);
 +		vmd->irqs[i].virq = mboot ? mboot_pci_irq_vector(dev, i) :
 +						 pci_irq_vector(dev, i);
  		err = devm_request_irq(&dev->dev, vmd->irqs[i].virq,
- 				       vmd_irq, IRQF_NO_THREAD,
- 				       vmd->name, &vmd->irqs[i]);
 -- 
 2.39.5

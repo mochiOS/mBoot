@@ -7,15 +7,15 @@ requester on the boot display instead of leaving only a bus-wide status.
 
 Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 ---
- arch/x86/kernel/cpu/mboot.c | 17 ++++++++++++++---
- 1 file changed, 14 insertions(+), 3 deletions(-)
+ arch/x86/kernel/cpu/mboot.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
 
 --- a/arch/x86/kernel/cpu/mboot.c
 +++ b/arch/x86/kernel/cpu/mboot.c
-@@ -866,9 +866,20 @@ static int __init mboot_pci_publish_frontend(void)
+@@ -866,7 +866,20 @@ static int __init mboot_pci_publish_frontend(void)
  	pr_info("mDriver: mBoot PCI frontend ready: %u devices, %u resources, %u active\n",
  		mboot_pci_device_count, resource_count, active);
- 	mboot_boot_status("DISPLAY\nMDRIVER PCI BIND");
++	mboot_boot_status("DISPLAY\nMDRIVER PCI BIND");
 -	for (index = 0; index < ARRAY_SIZE(mboot_pci_buses); index++)
 -		if (mboot_pci_buses[index])
 -			pci_bus_add_devices(mboot_pci_buses[index]);
@@ -33,7 +33,7 @@ Signed-off-by: tas0dev <156896971+tas0dev@users.noreply.github.com>
 +		pci_dev_put(pdev);
 +		mboot_boot_device_error("BOUND", device->info.requester);
 +	}
- 	mboot_boot_status("DISPLAY\nMDRIVER PCI READY");
++	mboot_boot_status("DISPLAY\nMDRIVER PCI READY");
  	return 0;
  }
 -- 

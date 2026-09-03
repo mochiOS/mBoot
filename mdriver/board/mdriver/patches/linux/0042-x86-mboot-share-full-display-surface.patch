@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000042 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 00:00:00 +0900
+Subject: [PATCH] x86/mboot: share a persistent display surface
+
+Accept a range Grant containing the complete System Domain surface. Damage
+requests then carry coordinates only; pixels remain in the mapped surface.
+Keep the tile and bulk protocols as compatibility fallbacks.
+---
+ arch/x86/kernel/cpu/mboot.c | 66 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 60 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -147,13 +147,17 @@
+ #define MBOOT_DEVICE_FEATURE_BLOCK_ASYNC_QUEUE BIT_ULL(11)
+ #define MBOOT_DEVICE_FEATURE_DISPLAY_TILE BIT_ULL(12)
+ #define MBOOT_DEVICE_FEATURE_DISPLAY_BULK BIT_ULL(13)
++#define MBOOT_DEVICE_FEATURE_DISPLAY_SHARED_SURFACE BIT_ULL(14)
+ #define MBOOT_DEVICE_FEATURES_BASE GENMASK_ULL(2, 0)
+ #define MBOOT_DISPLAY_BUFFER_PAGE 7
+ #define MBOOT_DISPLAY_MAX_TRANSFER PAGE_SIZE
+ #define MBOOT_DISPLAY_BULK_FIRST_PAGE 9
+ #define MBOOT_DISPLAY_BULK_PAGE_COUNT 55
+ #define MBOOT_DISPLAY_BULK_MAX_TRANSFER \
+ 	(MBOOT_DISPLAY_BULK_PAGE_COUNT * PAGE_SIZE)
++#define MBOOT_DISPLAY_SURFACE_FIRST_PAGE 9
++#define MBOOT_DISPLAY_SURFACE_MIN_PAGE_COUNT 64
++#define MBOOT_DISPLAY_OPEN_SHARED_SURFACE 1
+ #define MBOOT_DISPLAY_PIXEL_BYTES 4
+ #define MBOOT_BLOCK_DATA_PAGE 1
+ #define MBOOT_BLOCK_RING_PAGE 2
+@@ -1054,7 +1058,8 @@
+ static unsigned long mboot_display_bulk_refs[MBOOT_DISPLAY_BULK_PAGE_COUNT];
+ static unsigned int mboot_display_bulk_count;
+ static size_t mboot_display_buffer_size;
++static bool mboot_display_shared_surface;
+ static u32 mboot_display_device_id;
+ static struct fb_info *mboot_display_info;
+ static bool mboot_block_queue_verified;
+ static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info);
+@@ -1132,5 +1137,9 @@
+ 					       MBOOT_DISPLAY_BULK_FIRST_PAGE * PAGE_SIZE)
+ 			features |= MBOOT_DEVICE_FEATURE_DISPLAY_BULK;
++		if (mboot_grant_window_size >=
++		    (MBOOT_DISPLAY_SURFACE_FIRST_PAGE +
++		     MBOOT_DISPLAY_SURFACE_MIN_PAGE_COUNT) * PAGE_SIZE)
++			features |= MBOOT_DEVICE_FEATURE_DISPLAY_SHARED_SURFACE;
+ 	}
+ 	return features;
+ }
+@@ -1154,6 +1164,7 @@
+ 	}
+ 	mboot_display_bulk_count = 0;
+ 	mboot_display_buffer_size = 0;
++	mboot_display_shared_surface = false;
+ 	mboot_display_device_id = 0;
+ 	mboot_display_info = NULL;
+ }
+@@ -1189,5 +1200,6 @@ static int mboot_display_open(u32 device_id, unsigned long grant_ref,
+-			      u64 page_count, u64 max_transfer)
++			      u64 page_count, u64 max_transfer, u64 mode)
+ {
+ 	const struct mboot_pci_frontend *device;
+ 	unsigned long result;
+ 	u64 address;
++	u64 surface_bytes;
+@@ -1197,1 +1209,2 @@ static int mboot_display_open(u32 device_id, unsigned long grant_ref,
++	bool shared = mode == MBOOT_DISPLAY_OPEN_SHARED_SURFACE;
+ 	bool bulk = !grant_ref;
+@@ -1208,7 +1222,30 @@
+ 	    registered_fb[0]->var.bits_per_pixel != 32 ||
+ 	    !registered_fb[0]->fbops || !registered_fb[0]->fbops->fb_imageblit)
+ 		return -EAGAIN;
+-	if (bulk) {
++	if (shared) {
++		if (!grant_ref || page_count < MBOOT_DISPLAY_SURFACE_MIN_PAGE_COUNT ||
++		    page_count > U32_MAX ||
++		    mboot_grant_window_size <
++			MBOOT_DISPLAY_SURFACE_FIRST_PAGE * PAGE_SIZE ||
++		    check_mul_overflow(page_count, (u64)PAGE_SIZE,
++				       &surface_bytes) ||
++		    max_transfer != surface_bytes ||
++		    surface_bytes > mboot_grant_window_size -
++				   MBOOT_DISPLAY_SURFACE_FIRST_PAGE * PAGE_SIZE)
++			return -EINVAL;
++		if ((u64)registered_fb[0]->fix.line_length *
++		    registered_fb[0]->var.yres > surface_bytes)
++			return -ENOSPC;
++		address = mboot_grant_window_start +
++			MBOOT_DISPLAY_SURFACE_FIRST_PAGE * PAGE_SIZE;
++		result = mboot_hypercall(MBOOT_HYPERCALL_GRANT_MAP,
++					 grant_ref, address, 0);
++		if (result)
++			return -EINVAL;
++		mboot_display_grant_ref = grant_ref;
++		mboot_display_buffer_size = surface_bytes;
++		mboot_display_shared_surface = true;
++	} else if (bulk) {
+ 		if (page_count != MBOOT_DISPLAY_BULK_PAGE_COUNT ||
+ 		    max_transfer != MBOOT_DISPLAY_BULK_MAX_TRANSFER ||
+ 		    mboot_display_bulk_count != MBOOT_DISPLAY_BULK_PAGE_COUNT)
+@@ -1260,13 +1297,30 @@
+ 	image.width = request->arguments[2];
+ 	image.height = request->arguments[3];
+ 	image.depth = info->var.bits_per_pixel;
+-	image.data = mboot_display_buffer;
+ 	lock_fb_info(info);
+ 	if (info->state != FBINFO_STATE_RUNNING || !info->fbops->fb_imageblit) {
+ 		unlock_fb_info(info);
+ 		return -EIO;
+ 	}
+-	info->fbops->fb_imageblit(info, &image);
++	if (mboot_display_shared_surface &&
++	    (request->arguments[0] ||
++	     request->arguments[2] * MBOOT_DISPLAY_PIXEL_BYTES !=
++		info->fix.line_length)) {
++		image.height = 1;
++		for (u32 row = 0; row < request->arguments[3]; row++) {
++			image.dy = request->arguments[1] + row;
++			image.data = mboot_display_buffer +
++				(image.dy * info->fix.line_length) +
++				(request->arguments[0] * MBOOT_DISPLAY_PIXEL_BYTES);
++			info->fbops->fb_imageblit(info, &image);
++		}
++	} else {
++		image.data = mboot_display_shared_surface ?
++			mboot_display_buffer +
++			(request->arguments[1] * info->fix.line_length) :
++			mboot_display_buffer;
++		info->fbops->fb_imageblit(info, &image);
++	}
+ 	if (info->fbops->fb_sync)
+ 		info->fbops->fb_sync(info);
+ 	unlock_fb_info(info);
+@@ -2910,9 +2965,11 @@
+ 	case MBOOT_CONTROL_OPEN_DISPLAY:
+ 		if (!mboot_control_active || !request->device_id ||
+-		    request->arguments[0] > U32_MAX || request->arguments[3])
++		    request->arguments[0] > U32_MAX ||
++		    request->arguments[3] > MBOOT_DISPLAY_OPEN_SHARED_SURFACE)
+ 			return;
+ 		if (mboot_display_open(request->device_id, request->arguments[0],
+-				       request->arguments[1], request->arguments[2])) {
++				       request->arguments[1], request->arguments[2],
++				       request->arguments[3])) {
+ 			response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
+ 			return;
+ 		}
+-- 
+2.43.0

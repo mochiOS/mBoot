@@ -236,6 +236,35 @@ impl NestedPageTable {
         Ok(())
     }
 
+    /// Replaces a contiguous stopped-Domain range with pages owned by another
+    /// Domain. Both ranges must be page aligned and equally sized.
+    ///
+    /// # Safety
+    /// No vCPU may use this nested page table until its translation cache has
+    /// been invalidated.
+    pub unsafe fn map_shared_range(
+        &self,
+        guest_page: u64,
+        host_page: u64,
+        page_count: u32,
+        writable: bool,
+    ) -> Result<(), Error> {
+        if page_count == 0 {
+            return Err(Error::InvalidPage);
+        }
+        for index in 0..u64::from(page_count) {
+            let offset = index.checked_mul(PAGE_SIZE).ok_or(Error::InvalidPage)?;
+            unsafe {
+                self.map_shared_page(
+                    guest_page.checked_add(offset).ok_or(Error::InvalidPage)?,
+                    host_page.checked_add(offset).ok_or(Error::InvalidPage)?,
+                    writable,
+                )?
+            };
+        }
+        Ok(())
+    }
+
     /// Restores a shared guest page to the Domain's own backing page.
     ///
     /// # Safety
@@ -251,6 +280,30 @@ impl NestedPageTable {
             BackendKind::AmdSvm => NPT_PRESENT_WRITE_USER,
         };
         unsafe { write_entry(table, index, host_page | flags) };
+        Ok(())
+    }
+
+    /// Restores a contiguous shared range to the Domain's original backing.
+    ///
+    /// # Safety
+    /// No vCPU may use this nested page table until its translation cache has
+    /// been invalidated.
+    pub unsafe fn restore_owned_range(
+        &self,
+        guest_page: u64,
+        page_count: u32,
+    ) -> Result<(), Error> {
+        if page_count == 0 {
+            return Err(Error::InvalidPage);
+        }
+        for index in 0..u64::from(page_count) {
+            let offset = index.checked_mul(PAGE_SIZE).ok_or(Error::InvalidPage)?;
+            unsafe {
+                self.restore_owned_page(
+                    guest_page.checked_add(offset).ok_or(Error::InvalidPage)?,
+                )?
+            };
+        }
         Ok(())
     }
 

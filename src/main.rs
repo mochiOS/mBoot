@@ -36,7 +36,8 @@ use mnu_abi::hypervisor::{
     DOMAIN_CAPABILITY_DEVICE_CLAIM, DOMAIN_CAPABILITY_DEVICE_QUERY, DOMAIN_CRASH_STATUS_CRASHED,
     DOMAIN_CRASH_STATUS_RESTARTED, DOMAIN_MANAGEMENT_VECTOR, DOMAIN_ROLE_APPLICATION,
     DOMAIN_ROLE_HARDWARE, DOMAIN_ROLE_SYSTEM, EVENT_CHANNEL_NO_EVENT, EVENT_CHANNEL_VECTOR,
-    GRANT_FLAG_WRITABLE, HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED,
+    GRANT_FLAG_WRITABLE, GRANT_RANGE_FLAGS_MASK, GRANT_RANGE_PAGE_COUNT_SHIFT,
+    HYPERCALL_INVALID_ARGUMENT, HYPERCALL_SUCCESS, HYPERCALL_UNSUPPORTED,
     HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
 };
 use sha2::{Digest, Sha256};
@@ -59,7 +60,8 @@ use uefi::CString16;
 
 const MAX_MEMORY_REGIONS: usize = 256;
 const MAX_GUEST_MEMORY_PAGES: usize = 131_072;
-const GRANT_WINDOW_PAGES: usize = 64;
+const MIN_GRANT_WINDOW_PAGES: usize = 64;
+const MAX_GRANT_WINDOW_PAGES: usize = 8192;
 const DEVICE_WINDOW_PAGES: usize = 64;
 const DOMAIN_STACK_BYTES: u64 = 1024 * 1024;
 const DEVICE_WINDOW_START: u64 = 0x1000_0000;
@@ -389,7 +391,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         let guest_pages = (config.memory_size / 4096) as usize;
         if !config.auto_starts()
             || config.vcpu_count != 1
-            || !(GRANT_WINDOW_PAGES + DEVICE_WINDOW_PAGES + 16..=MAX_GUEST_MEMORY_PAGES)
+            || !(MIN_GRANT_WINDOW_PAGES + DEVICE_WINDOW_PAGES + 16..=MAX_GUEST_MEMORY_PAGES)
                 .contains(&guest_pages)
         {
             log!("unsupported configuration for Domain {}", config.id);
@@ -895,7 +897,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             boot_module_start,
             boot_module_size,
             grant_window_start(domain.nested_pages()),
-            GRANT_WINDOW_PAGES as u64 * 4096,
+            grant_window_size(domain.nested_pages()),
             external_device_window_start,
             DEVICE_WINDOW_LIMIT - external_device_window_start,
             0,
@@ -1230,7 +1232,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     BackendKind::AmdSvm => HYPERVISOR_BACKEND_AMD_SVM,
                 },
                 grant_window_start(runtime.domain.nested_pages()),
-                GRANT_WINDOW_PAGES as u64 * 4096,
+                grant_window_size(runtime.domain.nested_pages()),
             );
             runtime.resume_kind = ResumeKind::Cpuid(result);
             continue;
@@ -1562,7 +1564,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             }
             continue;
         }
-        if vm_exit.hypercall_number == HypercallNumber::GrantCreate as u64 {
+        if matches!(
+            vm_exit.hypercall_number,
+            value if value == HypercallNumber::GrantCreate as u64
+                || value == HypercallNumber::GrantCreateRange as u64
+        ) {
             let owner = runtime_domains[index].domain.id();
             let target = u32::try_from(vm_exit.arg1).ok().map(DomainId::new);
             let target_is_running = target.is_some_and(|target| {
@@ -1571,11 +1577,25 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 })
             });
             let source_page = vm_exit.arg0;
-            let writable = vm_exit.arg2 & GRANT_FLAG_WRITABLE != 0;
-            let valid_flags = vm_exit.arg2 & !GRANT_FLAG_WRITABLE == 0;
+            let range = vm_exit.hypercall_number == HypercallNumber::GrantCreateRange as u64;
+            let flags = if range {
+                vm_exit.arg2 & GRANT_RANGE_FLAGS_MASK
+            } else {
+                vm_exit.arg2
+            };
+            let page_count = if range {
+                u32::try_from(vm_exit.arg2 >> GRANT_RANGE_PAGE_COUNT_SHIFT).unwrap_or(0)
+            } else {
+                1
+            };
+            let writable = flags & GRANT_FLAG_WRITABLE != 0;
+            let valid_flags = flags & !GRANT_FLAG_WRITABLE == 0;
             let host_page =
-                if grant_window_contains(runtime_domains[index].domain.nested_pages(), source_page)
-                    && !grants.target_page_is_mapped(owner, source_page)
+                if grant_window_contains_range(
+                    runtime_domains[index].domain.nested_pages(),
+                    source_page,
+                    page_count,
+                ) && !grants.target_range_is_mapped(owner, source_page, page_count)
                 {
                     runtime_domains[index]
                         .domain
@@ -1586,13 +1606,14 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 };
             runtime_domains[index].pending_result = match (target, host_page) {
                 (Some(target), Some(host_page)) if target_is_running && valid_flags => grants
-                    .create(owner, target, host_page, writable)
+                    .create_range(owner, target, host_page, page_count, writable)
                     .map_or(HYPERCALL_INVALID_ARGUMENT, |reference| {
                         log!(
-                            "Grant {} created: {}:{:#x} -> {} writable={}",
+                            "Grant {} created: {}:{:#x}+{} pages -> {} writable={}",
                             reference.get(),
                             owner.get(),
                             source_page,
+                            page_count,
                             target.get(),
                             writable
                         );
@@ -1621,7 +1642,17 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             let reference = u32::try_from(vm_exit.arg0).ok().and_then(GrantRef::new);
             let target_page = vm_exit.arg1;
             let mapping = if vm_exit.arg2 == 0
-                && grant_window_contains(runtime_domains[index].domain.nested_pages(), target_page)
+                && reference.is_some_and(|reference| {
+                    grants
+                        .mapping_page_count(target, reference)
+                        .is_some_and(|page_count| {
+                            grant_window_contains_range(
+                                runtime_domains[index].domain.nested_pages(),
+                                target_page,
+                                page_count,
+                            )
+                        })
+                })
             {
                 reference.and_then(|reference| grants.map(target, reference, target_page).ok())
             } else {
@@ -1631,9 +1662,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 let runtime = &mut runtime_domains[index];
                 let nested_root = runtime.domain.nested_pages().hardware_root();
                 if unsafe {
-                    runtime.domain.nested_pages().map_shared_page(
+                    runtime.domain.nested_pages().map_shared_range(
                         mapping.target_page,
                         mapping.host_page,
+                        mapping.page_count,
                         mapping.writable,
                     )
                 }
@@ -1673,7 +1705,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     runtime
                         .domain
                         .nested_pages()
-                        .restore_owned_page(mapping.target_page)
+                        .restore_owned_range(mapping.target_page, mapping.page_count)
                 } {
                     halt_with_error("Grant unmap", error)
                 }
@@ -2196,7 +2228,7 @@ fn cleanup_domain_resources(
             target
                 .domain
                 .nested_pages()
-                .restore_owned_page(mapping.target_page)
+                .restore_owned_range(mapping.target_page, mapping.page_count)
         } {
             halt_with_error("Grant cleanup", error)
         }
@@ -2204,9 +2236,10 @@ fn cleanup_domain_resources(
             halt_with_error("Grant translation flush", error)
         }
         log!(
-            "Grant mapping at Domain {} GPA {:#x} cleaned up",
+            "Grant mapping at Domain {} GPA {:#x}+{} pages cleaned up",
             mapping.target.get(),
-            mapping.target_page
+            mapping.target_page,
+            mapping.page_count
         );
     }
     let disconnected = event_channels.disconnect_domain(domain_id);
@@ -2285,7 +2318,7 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
         boot_module_start,
         boot_module_size,
         grant_window_start(runtime.domain.nested_pages()),
-        GRANT_WINDOW_PAGES as u64 * 4096,
+        grant_window_size(runtime.domain.nested_pages()),
         external_device_window_start,
         DEVICE_WINDOW_LIMIT - external_device_window_start,
         runtime.restart_count,
@@ -2780,7 +2813,17 @@ fn abi_domain_role(role: DomainRole) -> u32 {
 }
 
 fn grant_window_start(memory: &NestedPageTable) -> u64 {
-    memory.guest_memory_size() - GRANT_WINDOW_PAGES as u64 * 4096
+    memory.guest_memory_size() - grant_window_size(memory)
+}
+
+fn grant_window_size(memory: &NestedPageTable) -> u64 {
+    let guest_pages = memory.guest_memory_size() / 4096;
+    let reserved = (DEVICE_WINDOW_PAGES + 16) as u64;
+    let available = guest_pages.saturating_sub(reserved);
+    available
+        .min(MAX_GRANT_WINDOW_PAGES as u64)
+        .max(MIN_GRANT_WINDOW_PAGES as u64)
+        * 4096
 }
 
 fn external_device_window_start(memory: &NestedPageTable) -> u64 {
@@ -2803,11 +2846,17 @@ fn domain_stack_pointer(memory: &NestedPageTable) -> u64 {
     device_window_start(memory) - 16
 }
 
-fn grant_window_contains(memory: &NestedPageTable, guest_page: u64) -> bool {
+fn grant_window_contains_range(
+    memory: &NestedPageTable,
+    guest_page: u64,
+    page_count: u32,
+) -> bool {
     guest_page & 0xfff == 0
+        && page_count != 0
         && guest_page >= grant_window_start(memory)
-        && guest_page
-            .checked_add(4096)
+        && u64::from(page_count)
+            .checked_mul(4096)
+            .and_then(|length| guest_page.checked_add(length))
             .is_some_and(|end| end <= memory.guest_memory_size())
 }
 

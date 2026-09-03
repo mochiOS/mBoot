@@ -99,31 +99,15 @@ index 555555555555..666666666666 100644
  #include <crypto/hash.h>
  
  #include <asm/apic.h>
-@@ -1012,14 +1013,12 @@
- static struct fb_info *mboot_display_info;
- static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info);
- 
+@@ -1014 +1015 @@
 -static int __init mboot_wait_for_display_backend(void)
 +static bool mboot_display_backend_ready(void)
- {
- 	unsigned int index;
- 	bool display_present = false;
- 	bool driver_bound = false;
- 	bool driver_matched = false;
+@@ -1020,2 +1021,0 @@
 -	u16 display_vendor = 0;
 -	u16 display_device = 0;
- 
- 	for (index = 0; index < mboot_pci_device_count; index++) {
- 		const struct mboot_pci_frontend *device =
-@@ -1029,8 +1028,6 @@
- 			    MBOOT_DEVICE_KIND_DISPLAY)
- 			continue;
- 		display_present = true;
+@@ -1031,2 +1030,0 @@
 -		display_vendor = device->config[PCI_VENDOR_ID / 4] & 0xffff;
 -		display_device = device->config[PCI_VENDOR_ID / 4] >> 16;
- 		driver_matched = device->driver_matched;
- 		driver_bound = device->driver_bound;
- 		pr_info("mDriver: display matched=%u, bound=%u\n",
 @@ -1039,25 +1036,14 @@
  			break;
  	}

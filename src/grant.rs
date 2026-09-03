@@ -45,6 +45,7 @@ struct Grant {
     owner: DomainId,
     target: DomainId,
     host_page: u64,
+    page_count: u32,
     writable: bool,
     target_page: Option<u64>,
 }
@@ -68,6 +69,7 @@ pub struct GrantMapping {
     pub target: DomainId,
     pub host_page: u64,
     pub target_page: u64,
+    pub page_count: u32,
     pub writable: bool,
 }
 
@@ -89,10 +91,28 @@ impl GrantTable {
         host_page: u64,
         writable: bool,
     ) -> Result<GrantRef, GrantError> {
+        self.create_range(owner, target, host_page, 1, writable)
+    }
+
+    pub fn create_range(
+        &mut self,
+        owner: DomainId,
+        target: DomainId,
+        host_page: u64,
+        page_count: u32,
+        writable: bool,
+    ) -> Result<GrantRef, GrantError> {
         if owner == target {
             return Err(GrantError::InvalidTarget);
         }
-        if host_page == 0 || host_page & 0xfff != 0 {
+        if host_page == 0
+            || host_page & 0xfff != 0
+            || page_count == 0
+            || u64::from(page_count)
+                .checked_mul(4096)
+                .and_then(|length| host_page.checked_add(length))
+                .is_none()
+        {
             return Err(GrantError::InvalidPage);
         }
         let Some(index) = self.grants.iter().position(|slot| slot.grant.is_none()) else {
@@ -104,6 +124,7 @@ impl GrantTable {
             owner,
             target,
             host_page,
+            page_count,
             writable,
             target_page: None,
         });
@@ -121,22 +142,24 @@ impl GrantTable {
         if target_page & 0xfff != 0 {
             return Err(GrantError::InvalidPage);
         }
-        if self.target_page_is_mapped(target, target_page) {
-            return Err(GrantError::AlreadyMapped);
-        }
-        let grant = self.grant_mut(reference)?;
+        let grant = *self.grant(reference)?;
         if grant.target != target {
             return Err(GrantError::AccessDenied);
         }
         if grant.target_page.is_some() {
             return Err(GrantError::AlreadyMapped);
         }
+        if self.target_range_is_mapped(target, target_page, grant.page_count) {
+            return Err(GrantError::AlreadyMapped);
+        }
+        let grant = self.grant_mut(reference)?;
         grant.target_page = Some(target_page);
         Ok(GrantMapping {
             owner: grant.owner,
             target,
             host_page: grant.host_page,
             target_page,
+            page_count: grant.page_count,
             writable: grant.writable,
         })
     }
@@ -156,6 +179,7 @@ impl GrantTable {
             target,
             host_page: grant.host_page,
             target_page,
+            page_count: grant.page_count,
             writable: grant.writable,
         })
     }
@@ -186,6 +210,11 @@ impl GrantTable {
             .filter(|(_, slot)| slot.grant.is_some_and(|grant| grant.target == target))
             .nth(ordinal)
             .map(|(index, slot)| GrantRef((slot.generation << 8) | (index + 1) as u32))
+    }
+
+    pub fn mapping_page_count(&self, target: DomainId, reference: GrantRef) -> Option<u32> {
+        let grant = self.grant(reference).ok()?;
+        (grant.target == target).then_some(grant.page_count)
     }
 
     pub fn cleanup_domain(&mut self, domain: DomainId) -> [Option<GrantMapping>; MAX_GRANTS] {
@@ -222,6 +251,7 @@ impl GrantTable {
                     target: grant.target,
                     host_page: grant.host_page,
                     target_page,
+                    page_count: grant.page_count,
                     writable: grant.writable,
                 });
                 mapping_count += 1;
@@ -232,10 +262,31 @@ impl GrantTable {
     }
 
     pub fn target_page_is_mapped(&self, target: DomainId, target_page: u64) -> bool {
+        self.target_range_is_mapped(target, target_page, 1)
+    }
+
+    pub fn target_range_is_mapped(
+        &self,
+        target: DomainId,
+        target_page: u64,
+        page_count: u32,
+    ) -> bool {
+        let Some(length) = u64::from(page_count).checked_mul(4096) else {
+            return true;
+        };
+        let Some(end) = target_page.checked_add(length) else {
+            return true;
+        };
         self.grants
             .iter()
             .filter_map(|slot| slot.grant.as_ref())
-            .any(|grant| grant.target == target && grant.target_page == Some(target_page))
+            .filter(|grant| grant.target == target)
+            .filter_map(|grant| {
+                let start = grant.target_page?;
+                let length = u64::from(grant.page_count).checked_mul(4096)?;
+                Some((start, start.checked_add(length)?))
+            })
+            .any(|(start, mapped_end)| target_page < mapped_end && start < end)
     }
 
     fn grant(&self, reference: GrantRef) -> Result<&Grant, GrantError> {
@@ -281,6 +332,27 @@ mod tests {
         assert_eq!(table.revoke(owner, reference), Err(GrantError::Busy));
         assert_eq!(table.unmap(target, reference), Ok(mapping));
         assert_eq!(table.revoke(owner, reference), Ok(()));
+    }
+
+    #[test]
+    fn range_grant_maps_and_detects_overlapping_targets() {
+        let mut table = GrantTable::new();
+        let owner = DomainId::new(1);
+        let target = DomainId::new(2);
+        let reference = table
+            .create_range(owner, target, 0x8000, 3, true)
+            .unwrap();
+        let mapping = table.map(target, reference, 0x20_000).unwrap();
+        assert_eq!(mapping.page_count, 3);
+        assert!(table.target_page_is_mapped(target, 0x21_000));
+        let overlap = table
+            .create_range(owner, target, 0x40_000, 2, false)
+            .unwrap();
+        assert_eq!(
+            table.map(target, overlap, 0x22_000),
+            Err(GrantError::AlreadyMapped)
+        );
+        assert_eq!(table.unmap(target, reference), Ok(mapping));
     }
 
     #[test]
