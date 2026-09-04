@@ -10,6 +10,7 @@ LINUX_INPUT_STATE := $(MDRIVER_DIR)/.cache/linux-inputs.sha256
 MDRIVER_INPUTS := $(shell find \
 	$(MDRIVER_DIR)/board \
 	$(MDRIVER_DIR)/configs \
+	$(MDRIVER_DIR)/gpu \
 	$(MDRIVER_DIR)/package \
 	$(MDRIVER_DIR)/scripts \
 	-type f -print 2>/dev/null)

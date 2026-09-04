@@ -1,7 +1,7 @@
 version = 6
 toolchain = "nightly-2026-05-14"
-disk_size_mib = 1056
-esp_size_mib = 192
+disk_size_mib = 1120
+esp_size_mib = 256
 disk_guid = "6d426f6f-7400-4b00-8a00-000000000200"
 esp_guid = "6d426f6f-7400-4b00-8a00-000000000201"
 payload_guid = "6d426f6f-7400-4b00-8a00-000000000202"
@@ -49,7 +49,7 @@ port_b = 4
 [[domains]]
 id = 2
 role = "hardware"
-memory_mib = 128
+memory_mib = 512
 vcpus = 1
 capabilities = 0x3
 format = "linux-pvh"
@@ -63,10 +63,16 @@ required = true
 restart = "never"
 max_restarts = 0
 
-# Keep the firmware display active while the native mDriver GPU backend is
-# being completed. mBoot maps only the GOP framebuffer into mochiOS; the GPU
-# itself remains outside the Hardware Domain and behind its firmware IOMMU
-# mapping, so a failed native probe no longer blocks the desktop.
+# Select display-class PCI functions automatically. This is machine-independent:
+# mBoot discovers the actual requester and mDriver chooses the connected output.
+# When no IOMMU is available, mBoot drops this optional policy and keeps the
+# firmware framebuffer so the desktop can still start without GPU acceleration.
+[[devices]]
+segment = 0
+requester = "auto"
+kind = "display"
+domain = 2
+required = false
 
 # mDriver is a trusted hardware Domain. It receives every matching controller
 # so Installer.app can show the machine's actual disks without a per-machine BDF.

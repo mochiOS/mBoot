@@ -609,9 +609,15 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             );
         }
     }
+    // VT-d can retain only the firmware-declared GOP and stolen-memory ranges
+    // while scanout remains active. AMD-Vi does not use that temporary Intel
+    // context: quarantine its display until the Hardware Domain owns it.
     let deferred_display = quarantine.display_requester.filter(|requester| {
         !quarantine.active_requesters().contains(requester)
-            && iommu_topology.is_some_and(|topology| topology.covers_requester(0, *requester))
+            && iommu_topology.is_some_and(|topology| {
+                topology.kind() == IommuKind::IntelVtd
+                    && topology.covers_requester(0, *requester)
+            })
     });
     if let Some(requester) = deferred_display {
         log!(

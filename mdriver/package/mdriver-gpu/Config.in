@@ -1,0 +1,8 @@
+config BR2_PACKAGE_MDRIVER_GPU
+	bool "mDriver GPU renderer"
+	depends on BR2_PACKAGE_MESA3D_OPENGL_EGL
+	depends on BR2_PACKAGE_MESA3D_OPENGL_ES
+	select BR2_PACKAGE_LIBDRM
+	help
+	  Render ViewKit compositor scenes on the physical GPU through EGL,
+	  GBM and DRM/KMS.

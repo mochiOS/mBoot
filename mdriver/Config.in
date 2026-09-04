@@ -1,3 +1,4 @@
 menu "mDriver"
 source "$BR2_EXTERNAL_MDRIVER_PATH/package/mdriver-init/Config.in"
+source "$BR2_EXTERNAL_MDRIVER_PATH/package/mdriver-gpu/Config.in"
 endmenu

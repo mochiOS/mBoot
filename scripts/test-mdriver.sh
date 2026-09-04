@@ -124,7 +124,8 @@ for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
         echo 'test-mdriver: read-only GPT inspection without writes: PASS'
         exit 0
     fi
-    if grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null \
+    if [[ $STORAGE_INSPECT != 1 ]] \
+        && grep -Fq 'mDriver OK' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver: block data I/O completed' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver: mBoot control Event Channel ready' "$WORK/serial.log" 2>/dev/null \
         && grep -Fq 'mDriver control Event Channel verified' "$WORK/serial.log" 2>/dev/null \

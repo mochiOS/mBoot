@@ -12,12 +12,12 @@ const MAX_IOMMU_UNITS: usize = 16;
 const MAX_UNIT_SCOPES: usize = 8;
 const MAX_RESERVED_MAPPINGS: usize = 32;
 // The same arena holds the root/context tables, the temporary firmware-display
-// address space, and the Hardware Domain address space. 256 pages also leaves
-// enough room for the configured 128 MiB Hardware Domain when CAP.SLLPS does
-// not permit 2 MiB leaves.
-const INTEL_TABLE_PAGES: usize = 256;
+// address space, and Hardware Domain address spaces. The 512 MiB mDriver Domain
+// needs 259 pages when an IOMMU cannot use 2 MiB leaves; the remaining pages
+// cover firmware ranges and a second mapping without weakening isolation.
+const INTEL_TABLE_PAGES: usize = 544;
 const AMD_DEVICE_TABLE_PAGES: usize = 512;
-const DOMAIN_TABLE_PAGES: usize = 96;
+const DOMAIN_TABLE_PAGES: usize = 288;
 const AMD_COMMAND_BUFFER_PAGES: usize = 2;
 const MAX_DOMAIN_MAPPINGS: usize = 8;
 const INTEL_VERSION: u64 = 0x00;
@@ -2238,8 +2238,19 @@ mod tests {
         }
     }
 
+    fn domain_test_tables() -> Box<DomainTablesForTest> {
+        let mut tables = Box::<DomainTablesForTest>::new_uninit();
+        unsafe {
+            tables.as_mut_ptr().write_bytes(0, 1);
+            tables.assume_init()
+        }
+    }
+
     #[repr(align(4096))]
     struct TablesForTest([u8; INTEL_TABLE_PAGES * 4096]);
+
+    #[repr(align(4096))]
+    struct DomainTablesForTest([u8; DOMAIN_TABLE_PAGES * 4096]);
 
     fn finish_table(table: &mut [u8], signature: &[u8; 4]) {
         table[..4].copy_from_slice(signature);
@@ -2522,9 +2533,7 @@ mod tests {
 
     #[test]
     fn intel_domain_tables_translate_iova_to_domain_ram() {
-        #[repr(align(4096))]
-        struct Tables([u8; DOMAIN_TABLE_PAGES * 4096]);
-        let mut tables = Tables([0; DOMAIN_TABLE_PAGES * 4096]);
+        let mut tables = domain_test_tables();
         let base = tables.0.as_mut_ptr() as u64;
         let mut arena = TableArena {
             base,
@@ -2680,7 +2689,7 @@ mod tests {
             &mut runtime,
             2,
             0x4000_1000,
-            128 * 1024 * 1024,
+            512 * 1024 * 1024,
         )
         .unwrap();
         unsafe {
@@ -2698,9 +2707,7 @@ mod tests {
 
     #[test]
     fn amd_domain_tables_encode_levels_and_permissions() {
-        #[repr(align(4096))]
-        struct Tables([u8; DOMAIN_TABLE_PAGES * 4096]);
-        let mut tables = Tables([0; DOMAIN_TABLE_PAGES * 4096]);
+        let mut tables = domain_test_tables();
         let base = tables.0.as_mut_ptr() as u64;
         let mut arena = TableArena {
             base,

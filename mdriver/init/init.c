@@ -3,6 +3,9 @@
 #define SYS_WRITE 1
 #define SYS_OPEN 2
 #define SYS_PAUSE 34
+#define SYS_FORK 57
+#define SYS_EXECVE 59
+#define SYS_EXIT 60
 #define SYS_MOUNT 165
 
 static long syscall5(long number, long arg0, long arg1, long arg2, long arg3, long arg4)
@@ -44,6 +47,18 @@ __attribute__((noreturn)) void _start(void)
     write_message(log, starting, sizeof(starting) - 1);
     mount_filesystem("proc", "/proc", "proc");
     mount_filesystem("sysfs", "/sys", "sysfs");
+    if (syscall5(SYS_FORK, 0, 0, 0, 0, 0) == 0) {
+        static char *const argv[] = { "/usr/bin/mdriver-gpu", 0 };
+        static char *const envp[] = {
+            "EGL_PLATFORM=gbm",
+            "LIBGL_DRIVERS_PATH=/usr/lib/dri",
+            0,
+        };
+        syscall5(SYS_EXECVE, (long)argv[0], (long)argv, (long)envp, 0, 0);
+        syscall5(SYS_EXIT, 127, 0, 0, 0, 0);
+        for (;;)
+            ;
+    }
     write_message(log, ready, sizeof(ready) - 1);
 
     for (;;)

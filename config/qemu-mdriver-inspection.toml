@@ -1,7 +1,7 @@
 version = 6
 toolchain = "nightly-2026-05-14"
-disk_size_mib = 128
-esp_size_mib = 96
+disk_size_mib = 224
+esp_size_mib = 192
 disk_guid = "6d426f6f-7400-4b00-8a00-000000000520"
 esp_guid = "6d426f6f-7400-4b00-8a00-000000000521"
 
@@ -54,7 +54,7 @@ read_only = true
 [[domains]]
 id = 2
 role = "hardware"
-memory_mib = 64
+memory_mib = 512
 vcpus = 1
 capabilities = 0x3
 format = "linux-pvh"
@@ -67,4 +67,3 @@ autostart = true
 required = true
 restart = "never"
 max_restarts = 0
-

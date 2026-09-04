@@ -1,0 +1,286 @@
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 18:20:00 +0900
+Subject: [PATCH] x86/mboot: bridge ViewKit scenes to the GPU renderer
+
+Expose the shared display surface to a single privileged mDriver renderer and
+synchronously forward validated scene submissions. The userspace renderer owns
+Mesa and DRM policy; the hypervisor transport remains device independent.
+---
+ arch/x86/kernel/cpu/mboot.c | 184 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 184 insertions(+)
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -16,6 +16,8 @@
+ #include <linux/irqdomain.h>
+ #include <linux/ioport.h>
+ #include <linux/kthread.h>
++#include <linux/miscdevice.h>
++#include <linux/mm.h>
+ #include <linux/numa.h>
+ #include <linux/overflow.h>
+ #include <linux/pci.h>
+@@ -24,6 +26,7 @@
+ #include <linux/string.h>
+ #include <linux/unaligned.h>
+ #include <linux/workqueue.h>
++#include <linux/wait.h>
+ #include <crypto/hash.h>
+ 
+ #include <asm/apic.h>
+@@ -105,6 +108,7 @@
+ #define MBOOT_CONTROL_INSTALL_PARTITION 22
+ #define MBOOT_CONTROL_OPEN_PARTITION 23
+ #define MBOOT_CONTROL_REGISTER_DISPLAY_BUFFER 24
++#define MBOOT_CONTROL_PRESENT_GPU_SCENE 25
+ #define MBOOT_CONTROL_STATUS_OK 0
+ #define MBOOT_CONTROL_STATUS_UNSUPPORTED_VERSION 1
+ #define MBOOT_CONTROL_STATUS_INVALID_REQUEST 2
+@@ -147,6 +151,7 @@
+ #define MBOOT_DEVICE_FEATURE_DISPLAY_TILE BIT_ULL(12)
+ #define MBOOT_DEVICE_FEATURE_DISPLAY_BULK BIT_ULL(13)
+ #define MBOOT_DEVICE_FEATURE_DISPLAY_SHARED_SURFACE BIT_ULL(14)
++#define MBOOT_DEVICE_FEATURE_DISPLAY_GPU_SCENE BIT_ULL(15)
+ #define MBOOT_DEVICE_FEATURES_BASE GENMASK_ULL(2, 0)
+ #define MBOOT_DISPLAY_BUFFER_PAGE 7
+ #define MBOOT_DISPLAY_MAX_TRANSFER PAGE_SIZE
+@@ -230,6 +235,19 @@
+ 	u64 values[4];
+ };
+ 
++struct mboot_gpu_request {
++	u64 generation;
++	u64 buffer_size;
++	u32 scene_length;
++	u32 reserved;
++};
++
++struct mboot_gpu_response {
++	u64 generation;
++	s32 status;
++	u32 reserved;
++};
++
+ struct mboot_block_request {
+ 	u16 version;
+ 	u16 operation;
+@@ -1058,6 +1076,17 @@
+ static bool mboot_display_shared_surface;
+ static u32 mboot_display_device_id;
+ static struct fb_info *mboot_display_info;
++static phys_addr_t mboot_display_buffer_phys;
++static DECLARE_WAIT_QUEUE_HEAD(mboot_gpu_request_wait);
++static DECLARE_WAIT_QUEUE_HEAD(mboot_gpu_response_wait);
++static DEFINE_MUTEX(mboot_gpu_lock);
++static u64 mboot_gpu_generation;
++static u32 mboot_gpu_scene_length;
++static int mboot_gpu_response_status;
++static bool mboot_gpu_open;
++static bool mboot_gpu_pending;
++static bool mboot_gpu_delivered;
++static bool mboot_gpu_responded;
+ static bool mboot_block_queue_verified;
+ static u64 mboot_control_device_kind(const struct mboot_pci_device_info *info);
+ 
+@@ -1139,6 +1168,7 @@
+ 		    (MBOOT_DISPLAY_SURFACE_FIRST_PAGE +
+ 		     MBOOT_DISPLAY_SURFACE_MIN_PAGE_COUNT) * PAGE_SIZE)
+ 			features |= MBOOT_DEVICE_FEATURE_DISPLAY_SHARED_SURFACE;
++		features |= MBOOT_DEVICE_FEATURE_DISPLAY_GPU_SCENE;
+ 	}
+ 	return features;
+ }
+@@ -1163,6 +1193,7 @@
+ 	}
+ 	mboot_display_bulk_count = 0;
+ 	mboot_display_buffer_size = 0;
++	mboot_display_buffer_phys = 0;
+ 	mboot_display_shared_surface = false;
+ 	mboot_display_device_id = 0;
+ 	mboot_display_info = NULL;
+@@ -1265,6 +1296,7 @@
+ 		mboot_display_close();
+ 		return -EIO;
+ 	}
++	mboot_display_buffer_phys = address;
+ 	mboot_display_device_id = device_id;
+ 	mboot_display_info = registered_fb[0];
+ 	return 0;
+@@ -1334,6 +1366,146 @@
+ 	return 0;
+ }
+ 
++static int mboot_gpu_submit(const struct mboot_control_request *request)
++{
++	long waited;
++	int status;
++
++	if (!mboot_display_shared_surface || !mboot_display_buffer ||
++	    request->device_id != mboot_display_device_id ||
++	    !request->arguments[0] ||
++	    request->arguments[0] > mboot_display_buffer_size ||
++	    request->arguments[1] || request->arguments[2] || request->arguments[3])
++		return -EINVAL;
++	waited = wait_event_interruptible_timeout(mboot_gpu_request_wait,
++		READ_ONCE(mboot_gpu_open), msecs_to_jiffies(60000));
++	if (waited <= 0)
++		return waited ? waited : -ETIMEDOUT;
++	mutex_lock(&mboot_gpu_lock);
++	if (!mboot_gpu_open || mboot_gpu_pending) {
++		mutex_unlock(&mboot_gpu_lock);
++		return -ENODEV;
++	}
++	mboot_gpu_generation++;
++	if (!mboot_gpu_generation)
++		mboot_gpu_generation++;
++	mboot_gpu_scene_length = request->arguments[0];
++	mboot_gpu_response_status = -EIO;
++	mboot_gpu_pending = true;
++	mboot_gpu_delivered = false;
++	mboot_gpu_responded = false;
++	wake_up_interruptible(&mboot_gpu_request_wait);
++	mutex_unlock(&mboot_gpu_lock);
++
++	waited = wait_event_interruptible_timeout(mboot_gpu_response_wait,
++		READ_ONCE(mboot_gpu_responded), msecs_to_jiffies(5000));
++	mutex_lock(&mboot_gpu_lock);
++	status = waited > 0 && mboot_gpu_responded ?
++		mboot_gpu_response_status : -ETIMEDOUT;
++	mboot_gpu_pending = false;
++	mboot_gpu_delivered = false;
++	mboot_gpu_responded = false;
++	mutex_unlock(&mboot_gpu_lock);
++	return status;
++}
++
++static int mboot_gpu_open_device(struct inode *inode, struct file *file)
++{
++	mutex_lock(&mboot_gpu_lock);
++	if (mboot_gpu_open) {
++		mutex_unlock(&mboot_gpu_lock);
++		return -EBUSY;
++	}
++	mboot_gpu_open = true;
++	wake_up_interruptible(&mboot_gpu_request_wait);
++	mutex_unlock(&mboot_gpu_lock);
++	return 0;
++}
++
++static int mboot_gpu_release_device(struct inode *inode, struct file *file)
++{
++	mutex_lock(&mboot_gpu_lock);
++	mboot_gpu_open = false;
++	if (mboot_gpu_pending) {
++		mboot_gpu_response_status = -ENODEV;
++		mboot_gpu_responded = true;
++		wake_up_interruptible(&mboot_gpu_response_wait);
++	}
++	mutex_unlock(&mboot_gpu_lock);
++	return 0;
++}
++
++static ssize_t mboot_gpu_read(struct file *file, char __user *buffer,
++			      size_t length, loff_t *offset)
++{
++	struct mboot_gpu_request request;
++	int result;
++
++	if (length < sizeof(request))
++		return -EINVAL;
++	result = wait_event_interruptible(mboot_gpu_request_wait,
++		READ_ONCE(mboot_gpu_pending) && !READ_ONCE(mboot_gpu_delivered));
++	if (result)
++		return result;
++	mutex_lock(&mboot_gpu_lock);
++	if (!mboot_gpu_pending || mboot_gpu_delivered) {
++		mutex_unlock(&mboot_gpu_lock);
++		return -EAGAIN;
++	}
++	request.generation = mboot_gpu_generation;
++	request.buffer_size = mboot_display_buffer_size;
++	request.scene_length = mboot_gpu_scene_length;
++	request.reserved = 0;
++	mboot_gpu_delivered = true;
++	mutex_unlock(&mboot_gpu_lock);
++	if (copy_to_user(buffer, &request, sizeof(request)))
++		return -EFAULT;
++	return sizeof(request);
++}
++
++static ssize_t mboot_gpu_write(struct file *file, const char __user *buffer,
++			       size_t length, loff_t *offset)
++{
++	struct mboot_gpu_response response;
++
++	if (length != sizeof(response) || copy_from_user(&response, buffer, sizeof(response)))
++		return length == sizeof(response) ? -EFAULT : -EINVAL;
++	mutex_lock(&mboot_gpu_lock);
++	if (!mboot_gpu_pending || !mboot_gpu_delivered || mboot_gpu_responded ||
++	    response.generation != mboot_gpu_generation || response.reserved) {
++		mutex_unlock(&mboot_gpu_lock);
++		return -EINVAL;
++	}
++	mboot_gpu_response_status = response.status;
++	mboot_gpu_responded = true;
++	wake_up_interruptible(&mboot_gpu_response_wait);
++	mutex_unlock(&mboot_gpu_lock);
++	return sizeof(response);
++}
++
++static int mboot_gpu_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	unsigned long size = vma->vm_end - vma->vm_start;
++
++	if (!mboot_display_buffer_phys || !mboot_display_buffer_size ||
++	    vma->vm_pgoff || size > PAGE_ALIGN(mboot_display_buffer_size))
++		return -ENODEV;
++	return remap_pfn_range(vma, vma->vm_start,
++		mboot_display_buffer_phys >> PAGE_SHIFT, size, vma->vm_page_prot);
++}
++
++static const struct file_operations mboot_gpu_fops = {
++	.owner = THIS_MODULE,
++	.open = mboot_gpu_open_device,
++	.release = mboot_gpu_release_device,
++	.read = mboot_gpu_read,
++	.write = mboot_gpu_write,
++	.mmap = mboot_gpu_mmap,
++	.llseek = noop_llseek,
++};
++
++static struct miscdevice mboot_gpu_device = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "mboot-gpu",
++	.fops = &mboot_gpu_fops,
++	.mode = 0600,
++};
++
+ static bool mboot_device_descends_from(struct device *device,
+ 				       const struct device *ancestor)
+ {
+@@ -3018,6 +3190,12 @@
+ 		response->status = mboot_display_present(request) ?
+ 			MBOOT_CONTROL_STATUS_IO_ERROR : MBOOT_CONTROL_STATUS_OK;
+ 		return;
++	case MBOOT_CONTROL_PRESENT_GPU_SCENE:
++		if (!mboot_control_active)
++			return;
++		response->status = mboot_gpu_submit(request) ?
++			MBOOT_CONTROL_STATUS_IO_ERROR : MBOOT_CONTROL_STATUS_OK;
++		return;
+ 	case MBOOT_CONTROL_CLOSE_DISPLAY:
+ 		if (!mboot_control_active ||
+ 		    request->device_id != mboot_display_device_id ||
+@@ -3340,6 +3518,12 @@
+ 	return -EIO;
+ }
+ 
++static int __init mboot_gpu_device_init(void)
++{
++	return misc_register(&mboot_gpu_device);
++}
++device_initcall(mboot_gpu_device_init);
++
+ static int mboot_finish_ready(void)
+ {
+ 	unsigned long result;
