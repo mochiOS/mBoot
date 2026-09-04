@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000048 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 22:15:00 +0900
+Subject: [PATCH] x86/mboot: preserve failed display diagnostics
+
+Do not retry a display whose initial driver probe reported an error. A second
+probe can disable the firmware scanout and erase the only visible diagnostic.
+Also require the display driver to be bound before declaring the backend ready;
+an unrelated firmware framebuffer is not a replacement GPU backend.
+---
+ arch/x86/kernel/cpu/mboot.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index dddddddddddd..eeeeeeeeeeee 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -1129,6 +1129,8 @@
+ 	}
+ 	if (!display_present)
+ 		return true;
++	if (!driver_bound)
++		return false;
+ 
+ 	if (num_registered_fb && registered_fb[0] &&
+ 	    registered_fb[0]->var.bits_per_pixel == 32 &&
+@@ -3589,6 +3591,10 @@
+ 		return;
+ 	mboot_display_reprobe_done = true;
+ 	wait_for_device_probe();
++	if (mboot_display_probe_error) {
++		pr_err("mDriver: display probe failed; preserving boot diagnostics\n");
++		return;
++	}
+ 	for (index = 0; index < mboot_pci_device_count; index++) {
+ 		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+ 		struct pci_dev *pdev;
+@@ -3604,7 +3610,6 @@
+ 		if (!device_is_bound(&pdev->dev)) {
+ 			mboot_boot_device_error("GPU RETRY",
+ 						device->info.requester);
+-			mboot_display_probe_error = false;
+ 			result = device_attach(&pdev->dev);
+ 			pr_info("mDriver: display %04x reprobe result=%d\n",
+ 				device->info.requester, result);
+-- 
+2.43.0
