@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000044 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 12:00:00 +0900
+Subject: [PATCH] x86/mboot: reprobe the display after init
+
+Publishing the assigned display from a late initcall can run its first probe
+before the remaining initcalls have returned.  A synchronous retry there can
+deadlock a single-vCPU Hardware Domain, while treating that first result as
+final leaves a deferred GPU unbound.
+
+Move the completion check to delayed work.  The work runs after late init has
+returned, waits for outstanding asynchronous probes, and performs one safe
+driver-core reprobe before deciding whether the display is unavailable.
+---
+ arch/x86/kernel/cpu/mboot.c | 63 +++++++++++++++++++++++++-------------
+ 1 file changed, 39 insertions(+), 24 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 888888888888..999999999999 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -923,28 +923,5 @@ static int __init mboot_pci_publish_frontend(void)
+ 		}
+ 	}
+-	/*
+-	 * GPU drivers prefer asynchronous probing.  Wait for the driver core's
+-	 * completion point before deciding whether the display is unbound.
+-	 */
+-	wait_for_device_probe();
+-	for (index = 0; index < mboot_pci_device_count; index++) {
+-		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+-		struct pci_dev *pdev;
+-
+-		if (device->info.class != PCI_BASE_CLASS_DISPLAY)
+-			continue;
+-		pdev = pci_get_domain_bus_and_slot(0,
+-					       device->info.requester >> 8,
+-					       device->info.requester & 0xff);
+-		if (!pdev)
+-			return -ENODEV;
+-		device->driver_matched = pdev->dev.can_match;
+-		device->driver_bound = device_is_bound(&pdev->dev);
+-		pci_dev_put(pdev);
+-		if (!device->driver_bound)
+-			mboot_boot_device_error("GPU UNBOUND",
+-						device->info.requester);
+-	}
+ 	return 0;
+ }
+ 
+@@ -3563,9 +3539,47 @@ static void mboot_ready_workfn(struct work_struct *work);
+ static DECLARE_DELAYED_WORK(mboot_ready_work, mboot_ready_workfn);
+ static atomic_t mboot_ready_started = ATOMIC_INIT(0);
+ static struct notifier_block mboot_fb_notifier;
++static bool mboot_display_reprobe_done;
++
++static void mboot_reprobe_display(void)
++{
++	unsigned int index;
++
++	if (mboot_display_reprobe_done)
++		return;
++	mboot_display_reprobe_done = true;
++	wait_for_device_probe();
++	for (index = 0; index < mboot_pci_device_count; index++) {
++		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
++		struct pci_dev *pdev;
++		int result;
++
++		if (device->info.class != PCI_BASE_CLASS_DISPLAY)
++			continue;
++		pdev = pci_get_domain_bus_and_slot(0,
++					       device->info.requester >> 8,
++					       device->info.requester & 0xff);
++		if (!pdev)
++			continue;
++		if (!device_is_bound(&pdev->dev)) {
++			mboot_boot_device_error("GPU RETRY",
++						device->info.requester);
++			result = device_attach(&pdev->dev);
++			pr_info("mDriver: display %04x reprobe result=%d\n",
++				device->info.requester, result);
++		}
++		device->driver_matched = pdev->dev.can_match;
++		device->driver_bound = device_is_bound(&pdev->dev);
++		pci_dev_put(pdev);
++		if (!device->driver_bound)
++			mboot_boot_device_error("GPU UNBOUND",
++						device->info.requester);
++	}
++}
+ 
+ static void mboot_ready_workfn(struct work_struct *work)
+ {
++	mboot_reprobe_display();
+ 	if (!mboot_display_backend_ready() ||
+ 	    atomic_cmpxchg(&mboot_ready_started, 0, 1))
+ 		return;
+@@ -3599,6 +3613,7 @@ static int __init mboot_report_ready(void)
+ 	if (fb_register_client(&mboot_fb_notifier))
+ 		return -EIO;
+-	mod_delayed_work(system_wq, &mboot_ready_work, 0);
++	/* Run after late init returns so a GPU probe cannot block initcalls. */
++	mod_delayed_work(system_wq, &mboot_ready_work, msecs_to_jiffies(100));
+ 	return 0;
+ }
+ late_initcall(mboot_report_ready);
+-- 
+2.43.0
