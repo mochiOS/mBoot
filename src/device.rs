@@ -178,7 +178,19 @@ impl DeviceTable {
         {
             info.flags |= PCI_DEVICE_FLAG_CLAIMABLE;
         }
+        if self.is_config_dependency(domain_id, info.requester) {
+            info.flags |= PCI_DEVICE_FLAG_READ_ONLY;
+        }
         Some(info).filter(PciDeviceInfo::validate)
+    }
+
+    /// Allows a hardware domain to inspect the host bridge configuration needed
+    /// by its assigned display controller without assigning the bridge itself.
+    pub fn can_read_config(&self, domain_id: u32, requester: u16) -> bool {
+        self.record(requester).is_ok_and(|record| {
+            record.info.owner_domain == domain_id
+                || self.is_config_dependency(domain_id, requester)
+        })
     }
 
     pub fn claim(&mut self, domain_id: u32, requester: u16) -> Result<(), DeviceError> {
@@ -305,6 +317,16 @@ impl DeviceTable {
 
     pub const fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    fn is_config_dependency(&self, domain_id: u32, requester: u16) -> bool {
+        requester == 0
+            && self.record(requester).is_ok_and(|record| {
+                record.info.class == 0x06 && record.info.subclass == 0x00
+            })
+            && self.devices[..self.count].iter().any(|record| {
+                record.allowed_domain == domain_id && record.info.class == 0x03
+            })
     }
 }
 
@@ -532,6 +554,36 @@ mod tests {
             0
         );
         assert_eq!(table.query(2, 2).unwrap().flags, 0);
+    }
+
+    #[test]
+    fn display_domain_gets_read_only_host_bridge_configuration() {
+        let functions = [
+            PciFunction {
+                requester: 0,
+                class: 0x06,
+                subclass: 0x00,
+                ..PciFunction::default()
+            },
+            PciFunction {
+                requester: 0x0010,
+                class: 0x03,
+                subclass: 0x00,
+                ..PciFunction::default()
+            },
+        ];
+        let table = DeviceTable::from_pci(
+            &functions,
+            None,
+            &[policy(0x0010, ManifestDeviceKind::Display)],
+        )
+        .unwrap();
+
+        let host = table.query(2, 0).unwrap();
+        assert_eq!(host.flags, PCI_DEVICE_FLAG_READ_ONLY);
+        assert!(table.can_read_config(2, 0));
+        assert!(!table.can_read_config(3, 0));
+        assert!(!table.can_read_config(2, 0x0010));
     }
 
     #[test]

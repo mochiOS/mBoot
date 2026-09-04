@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000047 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 21:30:00 +0900
+Subject: [PATCH] x86/mboot: publish display host bridge configuration
+
+Expose the host bridge as a read-only PCI configuration dependency when a
+display controller is assigned. i915 requires the 00:00.0 pci_dev during its
+MMIO setup, but the host bridge must not become a DMA-capable assigned device.
+
+Keep progress reports on the serial console, mark only driver failures for the
+firmware display, and remove the one-second PCI publication delay.
+---
+ arch/x86/kernel/cpu/mboot.c | 36 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 32 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index aaaaaaaaaaaa..dddddddddddd 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -183,6 +183,7 @@
+ #define MBOOT_BLOCK_STATUS_OUT_OF_RANGE 3
+ #define MBOOT_BLOCK_STATUS_BAD_STATE 4
+ #define MBOOT_BLOCK_STATUS_READ_ONLY 5
++#define MBOOT_CONSOLE_ERROR (1UL << (BITS_PER_LONG - 1))
+ #define MBOOT_GPT_SIGNATURE 0x5452415020494645ULL
+ #define MBOOT_GPT_REVISION 0x00010000
+ #define MBOOT_GPT_HEADER_MIN_SIZE 92
+@@ -358,7 +359,9 @@
+ void mboot_boot_driver_error(const char *operation, u16 error)
+ {
+ 	mboot_display_probe_error = true;
+-	mboot_boot_device_status(operation, error);
++	mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
++			virt_to_phys((void *)operation), strlen(operation),
++			MBOOT_CONSOLE_ERROR | ((unsigned long)error + 1));
+ }
+ 
+ 
+@@ -574,6 +577,14 @@
+ 	return NULL;
+ }
+ 
++static bool mboot_pci_config_only(const struct mboot_pci_frontend *device)
++{
++	return device->info.requester == 0 &&
++	       device->info.class == PCI_BASE_CLASS_BRIDGE &&
++	       device->info.subclass == 0 &&
++	       device->info.flags & MBOOT_PCI_FLAG_READ_ONLY;
++}
++
+ int mboot_pci_irq_vector(struct pci_dev *pdev, unsigned int index)
+ {
+ 	struct mboot_pci_frontend *device;
+@@ -836,6 +847,8 @@
+ 		u8 bus = device->info.requester >> 8;
+ 		u8 devfn = device->info.requester & 0xff;
+ 
++		if (mboot_pci_config_only(device))
++			continue;
+ 		mboot_boot_device_error("IRQ", device->info.requester);
+ 		pdev = pci_get_domain_bus_and_slot(0, bus, devfn);
+ 		if (!pdev)
+@@ -912,7 +925,6 @@
+ 	pr_info("mDriver: mBoot PCI frontend ready: %u devices, %u resources, %u active\n",
+ 		mboot_pci_device_count, resource_count, active);
+ 	mboot_boot_device_error("PCI BIND", mboot_pci_devices[0].info.requester);
+-	mdelay(1000);
+ 	/*
+ 	 * Publish display controllers last.  Once a native GPU driver binds,
+ 	 * the firmware framebuffer no longer belongs to this diagnostic path.
+@@ -925,7 +937,8 @@
+ 			u8 devfn = device->info.requester & 0xff;
+ 			struct pci_dev *pdev;
+ 
+-			if (display != (pass == 1))
++			if (mboot_pci_config_only(device) ||
++			    display != (pass == 1))
+ 				continue;
+ 			mboot_boot_device_error(display ? "GPU PROBE" : "BIND",
+ 						device->info.requester);
+@@ -974,8 +987,25 @@
+ 			info->requester >> 8, (info->requester >> 3) & 0x1f,
+ 			info->requester & 0x7, info->class, info->subclass, info->state,
+ 			info->flags & MBOOT_PCI_FLAG_CLAIMABLE ? " claimable" : "");
+-		if (!(info->flags & MBOOT_PCI_FLAG_CLAIMABLE))
++		if (!(info->flags & MBOOT_PCI_FLAG_CLAIMABLE)) {
++			if (info->requester == 0 &&
++			    info->class == PCI_BASE_CLASS_BRIDGE &&
++			    info->subclass == 0 &&
++			    info->flags & MBOOT_PCI_FLAG_READ_ONLY) {
++				if (mboot_pci_device_count == MBOOT_MAX_ASSIGNED_DEVICES) {
++					kfree(info);
++					return -ENOSPC;
++				}
++				mboot_pci_devices[mboot_pci_device_count].info = *info;
++				if (mboot_pci_load_config(
++					    &mboot_pci_devices[mboot_pci_device_count])) {
++					kfree(info);
++					return -EIO;
++				}
++				mboot_pci_device_count++;
++			}
+ 			continue;
++		}
+ 
+ 		result = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_CLAIM,
+ 					 info->requester, 0, 0);
+-- 
+2.43.0

@@ -148,18 +148,13 @@ pub fn present_firmware_frame(
     true
 }
 
-pub fn gpu_dma_transition(requester: u16, stage: &[u8]) {
-    show(0x0017_2033, b"MBOOT", stage);
-    draw_hex(u64::from(requester), line_y(2));
-}
+pub fn gpu_dma_transition(_requester: u16, _stage: &[u8]) {}
 
 pub fn iommu_register_failure(requester: u16, status: u32, fault: u32, root: u64) {
     iommu_register_report(requester, b"ENABLE ERROR", status, fault, root, 0x006B_2028);
 }
 
-pub fn iommu_register_state(requester: u16, status: u32, fault: u32, root: u64) {
-    iommu_register_report(requester, b"PRE ENABLE", status, fault, root, 0x0017_2033);
-}
+pub fn iommu_register_state(_requester: u16, _status: u32, _fault: u32, _root: u64) {}
 
 pub fn iommu_initialization_failure(detail: &[u8]) {
     show(0x006B_2028, b"MBOOT", b"IOMMU ERROR");
@@ -234,28 +229,9 @@ pub fn hardware_ready() {
     show(0x0017_4F35, b"MBOOT", b"HARDWARE OK");
 }
 
-pub fn mdriver_query(index: u16, requester: Option<u16>) {
-    show(0x0017_4F35, b"MDRIVER", b"QUERY");
-    let mut entry = *b"INDEX 0000";
-    write_hex_u16(&mut entry[6..10], index);
-    draw_centered(&entry, line_y(2));
-    if let Some(requester) = requester {
-        let mut device = *b"BDF   0000";
-        write_hex_u16(&mut device[6..10], requester);
-        draw_centered(&device, line_y(3));
-    }
-}
+pub fn mdriver_query(_index: u16, _requester: Option<u16>) {}
 
-pub fn mdriver_claim(requester: u16) {
-    show(0x0017_4F35, b"MDRIVER", b"CLAIM");
-    draw_hex(u64::from(requester), line_y(2));
-}
-
-pub fn mdriver_device_status(requester: u16, stage: &[u8]) {
-    show(0x0017_4F35, b"MDRIVER", stage);
-    draw_hex(u64::from(requester), line_y(2));
-    core::sync::atomic::fence(Ordering::SeqCst);
-}
+pub fn mdriver_claim(_requester: u16) {}
 
 pub fn mdriver_claim_failure(requester: u16, stage: &[u8]) {
     show(0x006B_2028, b"MDRIVER", stage);

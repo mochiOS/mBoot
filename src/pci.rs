@@ -94,6 +94,16 @@ pub fn last_bar_probe_failure() -> Option<BarProbeFailure> {
     })
 }
 
+pub unsafe fn config_read(requester: u16, offset: u16) -> Result<u32, PciError> {
+    if offset > 0xfc || offset & 3 != 0 {
+        return Err(PciError::InvalidState);
+    }
+    let bus = (requester >> 8) as u8;
+    let device = (requester >> 3 & 0x1f) as u8;
+    let function = (requester & 7) as u8;
+    Ok(unsafe { read_u32(bus, device, function, offset as u8) })
+}
+
 fn clear_bar_probe_failure() {
     BAR_FAILURE_VALID.store(0, Ordering::Release);
 }

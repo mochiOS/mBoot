@@ -1371,9 +1371,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             let offset = u16::try_from(vm_exit.arg1).ok();
             runtime_domains[index].pending_result = match (requester, offset) {
                 (Some(requester), Some(offset))
-                    if runtime_domains[index].domain.role() == DomainRole::Hardware =>
+                    if runtime_domains[index].domain.role() == DomainRole::Hardware
+                        && devices.can_read_config(domain_id, requester) =>
                 {
-                    unsafe { pci_assignments.config_read(domain_id, requester, offset) }
+                    unsafe { pci::config_read(requester, offset) }
                         .map_or(HYPERCALL_INVALID_ARGUMENT, u64::from)
                 }
                 _ => HYPERCALL_INVALID_ARGUMENT,
@@ -2469,10 +2470,16 @@ fn handle_console_write(
     };
     crate::serial::print(format_args!("[Domain {}] {}", domain_id.get(), message));
     if allow_display {
-        if let Some(report) = bytes.strip_prefix(b"DISPLAY\n") {
+        if let Some(report) = bytes
+            .strip_prefix(b"DISPLAY\n")
+            .filter(|_| !allow_device_status)
+        {
             let _ = crate::display::console_page(report);
-        } else if allow_device_status && (1..=u64::from(u16::MAX) + 1).contains(&detail) {
-            crate::display::mdriver_device_status((detail - 1) as u16, bytes);
+        } else if allow_device_status && detail & (1_u64 << 63) != 0 {
+            let error = detail & !(1_u64 << 63);
+            if (1..=u64::from(u16::MAX) + 1).contains(&error) {
+                crate::display::mdriver_claim_failure((error - 1) as u16, bytes);
+            }
         }
     }
     HYPERCALL_SUCCESS
