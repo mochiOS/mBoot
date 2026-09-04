@@ -7,8 +7,8 @@ Accept a range Grant containing the complete System Domain surface. Damage
 requests then carry coordinates only; pixels remain in the mapped surface.
 Keep the tile and bulk protocols as compatibility fallbacks.
 ---
- arch/x86/kernel/cpu/mboot.c | 66 ++++++++++++++++++++++++++++++++++----
- 1 file changed, 60 insertions(+), 6 deletions(-)
+ arch/x86/kernel/cpu/mboot.c | 77 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 71 insertions(+), 6 deletions(-)
 
 diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
 --- a/arch/x86/kernel/cpu/mboot.c
@@ -101,7 +101,7 @@ diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
  		if (page_count != MBOOT_DISPLAY_BULK_PAGE_COUNT ||
  		    max_transfer != MBOOT_DISPLAY_BULK_MAX_TRANSFER ||
  		    mboot_display_bulk_count != MBOOT_DISPLAY_BULK_PAGE_COUNT)
-@@ -1260,13 +1297,30 @@
+@@ -1260,13 +1297,41 @@
  	image.width = request->arguments[2];
  	image.height = request->arguments[3];
  	image.depth = info->var.bits_per_pixel;
@@ -113,9 +113,20 @@ diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
  	}
 -	info->fbops->fb_imageblit(info, &image);
 +	if (mboot_display_shared_surface &&
-+	    (request->arguments[0] ||
-+	     request->arguments[2] * MBOOT_DISPLAY_PIXEL_BYTES !=
-+		info->fix.line_length)) {
++	    info->fix.line_length ==
++		(u64)info->var.xres * MBOOT_DISPLAY_PIXEL_BYTES) {
++		/*
++		 * The shared surface already contains the complete scanlines.  Expand
++		 * horizontal damage and submit the affected rows in one operation;
++		 * calling fb_imageblit once per row dominates desktop rendering time.
++		 */
++		image.dx = 0;
++		image.width = info->var.xres;
++		image.data = mboot_display_buffer +
++			(image.dy * info->fix.line_length);
++		info->fbops->fb_imageblit(info, &image);
++	} else if (mboot_display_shared_surface) {
++		/* A padded framebuffer pitch cannot be represented by fb_image. */
 +		image.height = 1;
 +		for (u32 row = 0; row < request->arguments[3]; row++) {
 +			image.dy = request->arguments[1] + row;
@@ -134,7 +145,7 @@ diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
  	if (info->fbops->fb_sync)
  		info->fbops->fb_sync(info);
  	unlock_fb_info(info);
-@@ -2910,9 +2965,11 @@
+@@ -2910,9 +2976,11 @@
  	case MBOOT_CONTROL_OPEN_DISPLAY:
  		if (!mboot_control_active || !request->device_id ||
 -		    request->arguments[0] > U32_MAX || request->arguments[3])
