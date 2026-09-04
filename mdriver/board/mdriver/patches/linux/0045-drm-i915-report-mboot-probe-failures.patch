@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000045 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 20:20:00 +0900
+Subject: [PATCH] drm/i915: report mBoot probe failures
+
+The Hardware Domain has no interactive console during early boot.  Report the
+failing i915 probe phase and errno through mBoot's existing boot display so a
+physical-machine failure can be diagnosed without weakening isolation or
+guessing at PCI resource changes.
+---
+ drivers/gpu/drm/i915/i915_driver.c | 26 +++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_pci.c    | 20 +++++++++++++++-----
+ 2 files changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -106,6 +106,15 @@
+ #include "intel_region_ttm.h"
+ #include "vlv_suspend.h"
+ 
++extern void mboot_boot_device_status(const char *operation, u16 requester);
++
++static void i915_mboot_probe_error(const char *stage, int error)
++{
++	unsigned int code = error < 0 ? -error : error;
++
++	mboot_boot_device_status(stage, min(code, 0xffffU));
++}
++
+ static const struct drm_driver i915_drm_driver;
+ 
+ static int i915_workqueues_init(struct drm_i915_private *dev_priv)
+@@ -750,19 +759,25 @@ int i915_driver_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ {
+ 	struct drm_i915_private *i915;
++	const char *stage = "I915 ENABLE";
+ 	int ret;
+ 
+ 	ret = pci_enable_device(pdev);
+ 	if (ret) {
+ 		pr_err("Failed to enable graphics device: %pe\n", ERR_PTR(ret));
++		i915_mboot_probe_error(stage, ret);
+ 		return ret;
+ 	}
+ 
++	stage = "I915 CREATE";
+ 	i915 = i915_driver_create(pdev, ent);
+ 	if (IS_ERR(i915)) {
++		ret = PTR_ERR(i915);
+ 		pci_disable_device(pdev);
+-		return PTR_ERR(i915);
++		i915_mboot_probe_error(stage, ret);
++		return ret;
+ 	}
+ 
++	stage = "I915 EARLY";
+ 	ret = i915_driver_early_probe(i915);
+ 	if (ret < 0)
+ 		goto out_pci_disable;
+@@ -772,30 +787,37 @@ int i915_driver_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+ 	intel_vgpu_detect(i915);
+ 
++	stage = "I915 GT";
+ 	ret = intel_gt_probe_all(i915);
+ 	if (ret < 0)
+ 		goto out_runtime_pm_put;
+ 
++	stage = "I915 MMIO";
+ 	ret = i915_driver_mmio_probe(i915);
+ 	if (ret < 0)
+ 		goto out_runtime_pm_put;
+ 
++	stage = "I915 HW";
+ 	ret = i915_driver_hw_probe(i915);
+ 	if (ret < 0)
+ 		goto out_cleanup_mmio;
+ 
++	stage = "I915 DISPLAY NOIRQ";
+ 	ret = intel_display_driver_probe_noirq(i915);
+ 	if (ret < 0)
+ 		goto out_cleanup_hw;
+ 
++	stage = "I915 IRQ";
+ 	ret = intel_irq_install(i915);
+ 	if (ret)
+ 		goto out_cleanup_modeset;
+ 
++	stage = "I915 DISPLAY NOGEM";
+ 	ret = intel_display_driver_probe_nogem(i915);
+ 	if (ret)
+ 		goto out_cleanup_irq;
+ 
++	stage = "I915 GEM";
+ 	ret = i915_gem_init(i915);
+ 	if (ret)
+ 		goto out_cleanup_modeset2;
+@@ -804,6 +826,7 @@ int i915_driver_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	if (ret && ret != -ENODEV)
+ 		drm_dbg(&i915->drm, "pxp init failed with %d\n", ret);
+ 
++	stage = "I915 DISPLAY";
+ 	ret = intel_display_driver_probe(i915);
+ 	if (ret)
+ 		goto out_cleanup_gem;
+@@ -846,5 +869,6 @@ out_pci_disable:
+ 	pci_disable_device(pdev);
+ 	i915_probe_error(i915, "Device initialization failed (%d)\n", ret);
++	i915_mboot_probe_error(stage, ret);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_pci.c b/drivers/gpu/drm/i915/i915_pci.c
+index 333333333333..444444444444 100644
+--- a/drivers/gpu/drm/i915/i915_pci.c
++++ b/drivers/gpu/drm/i915/i915_pci.c
+@@ -37,6 +37,16 @@
+ #include "i915_reg.h"
+ #include "intel_pci_config.h"
+ 
++extern void mboot_boot_device_status(const char *operation, u16 requester);
++
++static int i915_mboot_reject(const char *stage, int error)
++{
++	unsigned int code = error < 0 ? -error : error;
++
++	mboot_boot_device_status(stage, min(code, 0xffffU));
++	return error;
++}
++
+ __diag_push();
+ __diag_ignore_all("-Woverride-init", "Allow field initialization overrides for device info");
+ 
+@@ -968,13 +978,13 @@ static int i915_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 			 "module parameter or CONFIG_DRM_I915_FORCE_PROBE=%04x configuration option,\n"
+ 			 "or (recommended) check for kernel updates.\n",
+ 			 pdev->device, pdev->device, pdev->device);
+-		return -ENODEV;
++		return i915_mboot_reject("I915 UNSUPPORTED", -ENODEV);
+ 	}
+ 
+ 	if (id_blocked(pdev->device)) {
+ 		dev_info(&pdev->dev, "I915 probe blocked for Device ID %04x.\n",
+ 			 pdev->device);
+-		return -ENODEV;
++		return i915_mboot_reject("I915 BLOCKED", -ENODEV);
+ 	}
+ 
+ 	if (intel_info->require_force_probe) {
+@@ -989,14 +999,14 @@ static int i915_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	 * functions have the same PCI-ID!
+ 	 */
+ 	if (PCI_FUNC(pdev->devfn))
+-		return -ENODEV;
++		return i915_mboot_reject("I915 FUNCTION", -ENODEV);
+ 
+ 	if (!intel_mmio_bar_valid(pdev, intel_info))
+-		return -ENXIO;
++		return i915_mboot_reject("I915 BAR", -ENXIO);
+ 
+ 	/* Detect if we need to wait for other drivers early on */
+ 	if (intel_display_driver_probe_defer(pdev))
+-		return -EPROBE_DEFER;
++		return i915_mboot_reject("I915 DEFER", -EPROBE_DEFER);
+ 
+ 	err = i915_driver_probe(pdev, ent);
+ 	if (err)
+-- 
+2.43.0
