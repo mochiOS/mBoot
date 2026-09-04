@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000046 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 20:30:00 +0900
+Subject: [PATCH] x86/mboot: preserve GPU probe error
+
+Keep the i915 phase and errno visible after a failed retry instead of replacing
+them immediately with the less useful generic unbound status.
+---
+ arch/x86/kernel/cpu/mboot.c         | 11 ++++++++++-
+ drivers/gpu/drm/i915/i915_driver.c  |  4 ++--
+ drivers/gpu/drm/i915/i915_pci.c     |  4 ++--
+ 3 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 999999999999..aaaaaaaaaaaa 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -350,6 +350,14 @@ void mboot_boot_device_status(const char *operation, u16 requester)
+ 			(unsigned long)requester + 1);
+ }
+ #define mboot_boot_device_error mboot_boot_device_status
++
++static bool mboot_display_probe_error;
++
++void mboot_boot_driver_error(const char *operation, u16 error)
++{
++	mboot_display_probe_error = true;
++	mboot_boot_device_status(operation, error);
++}
+ 
+ 
+ static void mboot_irq_mask(struct irq_data *data)
+@@ -3568,6 +3576,7 @@ static void mboot_reprobe_display(void)
+ 		if (!device_is_bound(&pdev->dev)) {
+ 			mboot_boot_device_error("GPU RETRY",
+ 						device->info.requester);
++			mboot_display_probe_error = false;
+ 			result = device_attach(&pdev->dev);
+ 			pr_info("mDriver: display %04x reprobe result=%d\n",
+ 				device->info.requester, result);
+@@ -3576,7 +3585,7 @@ static void mboot_reprobe_display(void)
+ 		device->driver_matched = pdev->dev.can_match;
+ 		device->driver_bound = device_is_bound(&pdev->dev);
+ 		pci_dev_put(pdev);
+-		if (!device->driver_bound)
++		if (!device->driver_bound && !mboot_display_probe_error)
+ 			mboot_boot_device_error("GPU UNBOUND",
+ 						device->info.requester);
+ 	}
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 222222222222..bbbbbbbbbbbb 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -106,13 +106,13 @@
+ #include "intel_region_ttm.h"
+ #include "vlv_suspend.h"
+ 
+-extern void mboot_boot_device_status(const char *operation, u16 requester);
++extern void mboot_boot_driver_error(const char *operation, u16 error);
+ 
+ static void i915_mboot_probe_error(const char *stage, int error)
+ {
+ 	unsigned int code = error < 0 ? -error : error;
+ 
+-	mboot_boot_device_status(stage, min(code, 0xffffU));
++	mboot_boot_driver_error(stage, min(code, 0xffffU));
+ }
+ 
+ static const struct drm_driver i915_drm_driver;
+diff --git a/drivers/gpu/drm/i915/i915_pci.c b/drivers/gpu/drm/i915/i915_pci.c
+index 444444444444..cccccccccccc 100644
+--- a/drivers/gpu/drm/i915/i915_pci.c
++++ b/drivers/gpu/drm/i915/i915_pci.c
+@@ -37,13 +37,13 @@
+ #include "i915_reg.h"
+ #include "intel_pci_config.h"
+ 
+-extern void mboot_boot_device_status(const char *operation, u16 requester);
++extern void mboot_boot_driver_error(const char *operation, u16 error);
+ 
+ static int i915_mboot_reject(const char *stage, int error)
+ {
+ 	unsigned int code = error < 0 ? -error : error;
+ 
+-	mboot_boot_device_status(stage, min(code, 0xffffU));
++	mboot_boot_driver_error(stage, min(code, 0xffffU));
+ 	return error;
+ }
+ 
+-- 
+2.43.0
