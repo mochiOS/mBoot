@@ -50,6 +50,11 @@ struct texture {
     int active;
 };
 
+struct drm_framebuffer {
+    int fd;
+    uint32_t id;
+};
+
 struct renderer {
     int drm_fd;
     uint32_t connector_id;
@@ -75,7 +80,6 @@ struct renderer {
     GLint copy_sampler;
     struct texture textures[MAX_TEXTURES];
     struct gbm_bo *front_bo;
-    uint32_t front_fb;
     uint32_t width;
     uint32_t height;
 };
@@ -304,7 +308,8 @@ static int initialize_gl(struct renderer *renderer)
         return -1;
     renderer->width = renderer->mode.hdisplay;
     renderer->height = renderer->mode.vdisplay;
-    eglSwapInterval(renderer->egl_display, 1);
+    /* KMS page flips below provide the single frame-rate boundary. */
+    eglSwapInterval(renderer->egl_display, 0);
     return 0;
 }
 
@@ -413,6 +418,35 @@ static int wait_for_page_flip(int fd, int *waiting)
     return 0;
 }
 
+static void destroy_drm_framebuffer(struct gbm_bo *bo, void *data)
+{
+    (void)bo;
+    struct drm_framebuffer *framebuffer = data;
+    if (!framebuffer)
+        return;
+    drmModeRmFB(framebuffer->fd, framebuffer->id);
+    free(framebuffer);
+}
+
+static uint32_t framebuffer_for_bo(struct renderer *renderer, struct gbm_bo *bo)
+{
+    struct drm_framebuffer *framebuffer = gbm_bo_get_user_data(bo);
+    if (framebuffer)
+        return framebuffer->id;
+    framebuffer = calloc(1, sizeof(*framebuffer));
+    if (!framebuffer)
+        return 0;
+    union gbm_bo_handle handle = gbm_bo_get_handle(bo);
+    framebuffer->fd = renderer->drm_fd;
+    if (drmModeAddFB(renderer->drm_fd, renderer->width, renderer->height, 24, 32,
+                     gbm_bo_get_stride(bo), handle.u32, &framebuffer->id)) {
+        free(framebuffer);
+        return 0;
+    }
+    gbm_bo_set_user_data(bo, framebuffer, destroy_drm_framebuffer);
+    return framebuffer->id;
+}
+
 static int show_frame(struct renderer *renderer)
 {
     if (!eglSwapBuffers(renderer->egl_display, renderer->egl_surface))
@@ -420,12 +454,10 @@ static int show_frame(struct renderer *renderer)
     struct gbm_bo *bo = gbm_surface_lock_front_buffer(renderer->surface);
     if (!bo)
         return -EIO;
-    union gbm_bo_handle handle = gbm_bo_get_handle(bo);
-    uint32_t fb = 0;
-    if (drmModeAddFB(renderer->drm_fd, renderer->width, renderer->height, 24, 32,
-                     gbm_bo_get_stride(bo), handle.u32, &fb)) {
+    uint32_t fb = framebuffer_for_bo(renderer, bo);
+    if (!fb) {
         gbm_surface_release_buffer(renderer->surface, bo);
-        return -errno;
+        return errno ? -errno : -EIO;
     }
     int result;
     if (!renderer->front_bo) {
@@ -442,16 +474,13 @@ static int show_frame(struct renderer *renderer)
                                     &renderer->connector_id, 1, &renderer->mode);
     }
     if (result) {
-        drmModeRmFB(renderer->drm_fd, fb);
         gbm_surface_release_buffer(renderer->surface, bo);
         return -errno;
     }
     if (renderer->front_bo) {
-        drmModeRmFB(renderer->drm_fd, renderer->front_fb);
         gbm_surface_release_buffer(renderer->surface, renderer->front_bo);
     }
     renderer->front_bo = bo;
-    renderer->front_fb = fb;
     return 0;
 }
 
