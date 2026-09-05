@@ -204,6 +204,38 @@ static int write_response(int fd, uint64_t generation, int status)
     return write(fd, &response, sizeof(response)) == sizeof(response) ? 0 : -1;
 }
 
+/*
+ * Keep /dev/mboot-gpu owned without touching DRM while mochiOS uses the
+ * kernel framebuffer transport.  The old startup path performed a KMS
+ * modeset before mochiOS had any proof that EGL scanout worked; a failure
+ * therefore replaced the working fbdev console with a black buffer.  This
+ * compatibility mode remains in place until the control protocol has an
+ * explicit GPU-renderer-ready transition.
+ */
+static int preserve_cpu_framebuffer(void)
+{
+    int control;
+
+    do {
+        control = open("/dev/mboot-gpu", O_RDWR | O_CLOEXEC);
+        if (control < 0)
+            poll(NULL, 0, 100);
+    } while (control < 0);
+
+    for (;;) {
+        struct gpu_request request;
+        ssize_t received = read(control, &request, sizeof(request));
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received != sizeof(request))
+            break;
+        if (write_response(control, request.generation, -ENOTSUP))
+            break;
+    }
+    close(control);
+    return 1;
+}
+
 static int choose_output(int fd, struct renderer *renderer)
 {
     drmModeRes *resources = drmModeGetResources(fd);
@@ -866,6 +898,10 @@ static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t 
 
 int main(void)
 {
+    const char *mode = getenv("MDRIVER_GPU_MODE");
+    if (mode && !strcmp(mode, "cpu-framebuffer"))
+        return preserve_cpu_framebuffer();
+
     struct renderer renderer = { .drm_fd = -1 };
     unsigned int failure_stage = 0x01;
     unsigned int wait_cycles = 0;

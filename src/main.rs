@@ -2064,10 +2064,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     } else {
                         log!("Hardware Domain {} ready", runtime.domain.id().get());
                         if deferred_display.is_some() {
-                            // Keep the firmware framebuffer available while
-                            // mDriver enumerates and probes the transferred GPU.
-                            // Its Ready notification is the first point where a
-                            // replacement display backend is known to exist.
+                            // Ready means that mDriver has registered a usable
+                            // framebuffer backend.  GPU scene rendering has a
+                            // separate lifecycle and must not be inferred here.
                             display::handoff();
                             log!("boot display diagnostics handed off to the Hardware Domain");
                         } else {
