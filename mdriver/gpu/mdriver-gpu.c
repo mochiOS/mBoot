@@ -332,6 +332,11 @@ static void show_dumb_failure(struct renderer *renderer, unsigned int stage)
     dumb_hex_digit(renderer, x, y, scale, stage >> 4, 0x00ffffff);
     dumb_hex_digit(renderer, x + scale * 7, y, scale, stage, 0x00ffffff);
     msync(renderer->fallback.pixels, renderer->fallback.size, MS_SYNC);
+    /* The GPU may already be scanning out a GBM buffer.  Merely updating the
+     * dumb buffer would then leave the monitor black and hide the failure. */
+    drmModeSetCrtc(renderer->drm_fd, renderer->crtc_id,
+                   renderer->fallback.id, 0, 0,
+                   &renderer->connector_id, 1, &renderer->mode);
 }
 
 static int initialize_dumb_scanout(struct renderer *renderer)
@@ -459,9 +464,18 @@ static int initialize_gl(struct renderer *renderer)
     renderer->gbm = gbm_create_device(renderer->drm_fd);
     if (!renderer->gbm)
         return 0x03;
-    renderer->surface = gbm_surface_create(renderer->gbm, renderer->mode.hdisplay,
-        renderer->mode.vdisplay, GBM_FORMAT_XRGB8888,
-        GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+    /* An explicit linear scanout avoids relying on implicit modifier state
+     * when a GBM buffer is handed to legacy KMS.  Keep the generic path for
+     * drivers which cannot render to a linear scanout buffer. */
+    static const uint64_t scanout_modifiers[] = { DRM_FORMAT_MOD_LINEAR };
+    renderer->surface = gbm_surface_create_with_modifiers(
+        renderer->gbm, renderer->mode.hdisplay, renderer->mode.vdisplay,
+        GBM_FORMAT_XRGB8888, scanout_modifiers,
+        ARRAY_LEN(scanout_modifiers));
+    if (!renderer->surface)
+        renderer->surface = gbm_surface_create(
+            renderer->gbm, renderer->mode.hdisplay, renderer->mode.vdisplay,
+            GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
     if (!renderer->surface)
         return 0x04;
     renderer->egl_display = eglGetDisplay((EGLNativeDisplayType)renderer->gbm);
@@ -733,6 +747,39 @@ static int show_frame(struct renderer *renderer)
     return 0;
 }
 
+static int show_startup_frame(struct renderer *renderer)
+{
+    static const GLfloat quad[] = {
+        -1, -1, 0, 0,  1, -1, 1, 0,  1, 1, 1, 1,
+        -1, -1, 0, 0,  1, 1, 1, 1, -1, 1, 0, 1,
+    };
+
+    /* Exercise the same offscreen texture, copy shader, GBM swap and KMS
+     * scanout used by real compositor scenes before publishing readiness. */
+    glBindFramebuffer(GL_FRAMEBUFFER, renderer->framebuffer);
+    glViewport(0, 0, renderer->width, renderer->height);
+    glDisable(GL_BLEND);
+    glClearColor(200.0f / 255.0f, 200.0f / 255.0f, 200.0f / 255.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glUseProgram(renderer->copy_program);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glEnableVertexAttribArray(renderer->copy_position);
+    glEnableVertexAttribArray(renderer->copy_uv);
+    glVertexAttribPointer(renderer->copy_position, 2, GL_FLOAT, GL_FALSE,
+                          4 * sizeof(GLfloat), quad);
+    glVertexAttribPointer(renderer->copy_uv, 2, GL_FLOAT, GL_FALSE,
+                          4 * sizeof(GLfloat), quad + 2);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, renderer->color_texture);
+    glUniform1i(renderer->copy_sampler, 0);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    if (glGetError() != GL_NO_ERROR)
+        return -EIO;
+    return show_frame(renderer);
+}
+
 static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t length)
 {
     if (length < SCENE_HEADER_LEN || get_u32(scene) != SCENE_MAGIC ||
@@ -839,6 +886,11 @@ int main(void)
         show_dumb_failure(&renderer, failure_stage);
         return 1;
     }
+    if (show_startup_frame(&renderer)) {
+        dprintf(2, "mDriver GPU: startup scanout failed errno=%d\n", errno);
+        show_dumb_failure(&renderer, 0x0f);
+        return 1;
+    }
     int control = open("/dev/mboot-gpu", O_RDWR | O_CLOEXEC);
     if (control < 0) {
         dprintf(2, "mDriver GPU: control unavailable errno=%d\n", errno);
@@ -868,6 +920,8 @@ int main(void)
         }
         int status = mapping == MAP_FAILED ? -errno :
             render_scene(&renderer, mapping, request.scene_length);
+        if (status)
+            show_dumb_failure(&renderer, status == -EINVAL ? 0x11 : 0x12);
         if (write_response(control, request.generation, status))
             break;
     }

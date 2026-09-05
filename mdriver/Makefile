@@ -7,6 +7,7 @@ BR2_MAKE := $(MDRIVER_DIR)/scripts/buildroot-make.sh
 SETUP_STAMP := $(MDRIVER_DIR)/.cache/setup-complete
 ARTIFACTS_STAMP := $(OUTPUT_DIR)/.artifacts-ready
 LINUX_INPUT_STATE := $(MDRIVER_DIR)/.cache/linux-inputs.sha256
+LOCAL_INPUT_STATE := $(MDRIVER_DIR)/.cache/local-inputs.sha256
 MDRIVER_INPUTS := $(shell find \
 	$(MDRIVER_DIR)/board \
 	$(MDRIVER_DIR)/configs \
@@ -16,7 +17,7 @@ MDRIVER_INPUTS := $(shell find \
 	-type f -print 2>/dev/null)
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 
-.PHONY: all build build-offline clean defconfig distclean legal-info prepare-linux setup source
+.PHONY: all build build-offline clean defconfig distclean legal-info prepare-linux prepare-local setup source
 
 all: build
 
@@ -35,13 +36,16 @@ $(SETUP_STAMP): $(MDRIVER_DIR)/../setup.sh \
 		$(MDRIVER_DIR)/board/mdriver/linux.config
 	@MNU_DIR="$(abspath $(MDRIVER_DIR)/../../core)" $(MDRIVER_DIR)/../setup.sh
 
-build: prepare-linux
+build: prepare-linux prepare-local
 	@$(MAKE) $(ARTIFACTS_STAMP)
 
 prepare-linux: $(SETUP_STAMP)
 	@$(MDRIVER_DIR)/scripts/prepare-linux-inputs.sh
 
-$(ARTIFACTS_STAMP): $(SETUP_STAMP) $(LINUX_INPUT_STATE) $(MDRIVER_INPUTS) $(MDRIVER_DIR)/Makefile
+prepare-local: $(SETUP_STAMP)
+	@$(MDRIVER_DIR)/scripts/prepare-local-inputs.sh
+
+$(ARTIFACTS_STAMP): $(SETUP_STAMP) $(LINUX_INPUT_STATE) $(LOCAL_INPUT_STATE) $(MDRIVER_INPUTS) $(MDRIVER_DIR)/Makefile
 	@$(BR2_MAKE) -j$(JOBS)
 	@$(MDRIVER_DIR)/scripts/publish-artifacts.sh
 	@touch "$@"
