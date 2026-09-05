@@ -222,6 +222,25 @@ static GLuint make_program(const char *vertex_source, const char *fragment_sourc
     return program;
 }
 
+static int choose_egl_config(EGLDisplay display, const EGLint *attributes,
+                             EGLConfig *selected)
+{
+    EGLConfig configs[64];
+    EGLint count = 0;
+
+    if (!eglChooseConfig(display, attributes, configs, ARRAY_LEN(configs), &count))
+        return -1;
+    for (EGLint index = 0; index < count; index++) {
+        EGLint visual = 0;
+        if (eglGetConfigAttrib(display, configs[index], EGL_NATIVE_VISUAL_ID, &visual) &&
+            visual == GBM_FORMAT_XRGB8888) {
+            *selected = configs[index];
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static int initialize_gl(struct renderer *renderer)
 {
     static const EGLint config_attributes[] = {
@@ -249,7 +268,6 @@ static int initialize_gl(struct renderer *renderer)
         "precision mediump float; varying vec2 v_uv; uniform sampler2D image;"
         "void main(){gl_FragColor=texture2D(image,v_uv);}";
     EGLConfig config;
-    EGLint count;
 
     renderer->gbm = gbm_create_device(renderer->drm_fd);
     if (!renderer->gbm)
@@ -263,7 +281,7 @@ static int initialize_gl(struct renderer *renderer)
     if (renderer->egl_display == EGL_NO_DISPLAY ||
         !eglInitialize(renderer->egl_display, NULL, NULL) ||
         !eglBindAPI(EGL_OPENGL_ES_API) ||
-        !eglChooseConfig(renderer->egl_display, config_attributes, &config, 1, &count) || !count)
+        choose_egl_config(renderer->egl_display, config_attributes, &config))
         return -1;
     renderer->egl_context = eglCreateContext(renderer->egl_display, config,
         EGL_NO_CONTEXT, context_attributes);
@@ -484,6 +502,18 @@ static int show_frame(struct renderer *renderer)
     return 0;
 }
 
+static int show_startup_frame(struct renderer *renderer)
+{
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, renderer->width, renderer->height);
+    glDisable(GL_BLEND);
+    glClearColor(200.0f / 255.0f, 200.0f / 255.0f, 200.0f / 255.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (glGetError() != GL_NO_ERROR)
+        return -EIO;
+    return show_frame(renderer);
+}
+
 static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t length)
 {
     if (length < SCENE_HEADER_LEN || get_u32(scene) != SCENE_MAGIC ||
@@ -571,16 +601,19 @@ static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t 
 int main(void)
 {
     struct renderer renderer = { .drm_fd = -1 };
-    int control = open("/dev/mboot-gpu", O_RDWR | O_CLOEXEC);
-    if (control < 0) {
-        dprintf(2, "mDriver GPU: control unavailable errno=%d\n", errno);
-        return 1;
-    }
     while (open_drm(&renderer))
         poll(NULL, 0, 100);
     if (initialize_gl(&renderer)) {
         dprintf(2, "mDriver GPU: initialization failed errno=%d\n", errno);
-        close(control);
+        return 1;
+    }
+    if (show_startup_frame(&renderer)) {
+        dprintf(2, "mDriver GPU: startup frame failed errno=%d\n", errno);
+        return 1;
+    }
+    int control = open("/dev/mboot-gpu", O_RDWR | O_CLOEXEC);
+    if (control < 0) {
+        dprintf(2, "mDriver GPU: control unavailable errno=%d\n", errno);
         return 1;
     }
     dprintf(2, "mDriver GPU: hardware renderer ready\n");
