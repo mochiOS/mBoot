@@ -545,13 +545,47 @@ static uint32_t framebuffer_for_bo(struct renderer *renderer, struct gbm_bo *bo)
     struct drm_framebuffer *framebuffer = gbm_bo_get_user_data(bo);
     if (framebuffer)
         return framebuffer->id;
+
+    uint32_t handles[4] = { 0 };
+    uint32_t pitches[4] = { 0 };
+    uint32_t offsets[4] = { 0 };
+    uint64_t modifiers[4] = { 0 };
+    int plane_count = gbm_bo_get_plane_count(bo);
+    uint64_t modifier = gbm_bo_get_modifier(bo);
+    if (plane_count < 1 || plane_count > (int)ARRAY_LEN(handles)) {
+        errno = EINVAL;
+        return 0;
+    }
+    for (int plane = 0; plane < plane_count; plane++) {
+        handles[plane] = gbm_bo_get_handle_for_plane(bo, plane).u32;
+        pitches[plane] = gbm_bo_get_stride_for_plane(bo, plane);
+        offsets[plane] = gbm_bo_get_offset(bo, plane);
+        modifiers[plane] = modifier;
+    }
+
     framebuffer = calloc(1, sizeof(*framebuffer));
     if (!framebuffer)
         return 0;
-    union gbm_bo_handle handle = gbm_bo_get_handle(bo);
     framebuffer->fd = renderer->drm_fd;
-    if (drmModeAddFB(renderer->drm_fd, renderer->width, renderer->height, 24, 32,
-                     gbm_bo_get_stride(bo), handle.u32, &framebuffer->id)) {
+    int result;
+    if (modifier == DRM_FORMAT_MOD_INVALID) {
+        result = drmModeAddFB2(renderer->drm_fd, renderer->width,
+                               renderer->height, gbm_bo_get_format(bo), handles,
+                               pitches, offsets, &framebuffer->id, 0);
+    } else {
+        result = drmModeAddFB2WithModifiers(renderer->drm_fd, renderer->width,
+                                             renderer->height,
+                                             gbm_bo_get_format(bo), handles,
+                                             pitches, offsets, modifiers,
+                                             &framebuffer->id,
+                                             DRM_MODE_FB_MODIFIERS);
+        if (result && modifier == DRM_FORMAT_MOD_LINEAR)
+            result = drmModeAddFB2(renderer->drm_fd, renderer->width,
+                                   renderer->height, gbm_bo_get_format(bo),
+                                   handles, pitches, offsets,
+                                   &framebuffer->id, 0);
+    }
+    if (result) {
         free(framebuffer);
         return 0;
     }
@@ -561,6 +595,10 @@ static uint32_t framebuffer_for_bo(struct renderer *renderer, struct gbm_bo *bo)
 
 static int show_frame(struct renderer *renderer)
 {
+    /* Do not hand KMS a buffer until rendering into it has completed. */
+    glFinish();
+    if (glGetError() != GL_NO_ERROR)
+        return -EIO;
     if (!eglSwapBuffers(renderer->egl_display, renderer->egl_surface))
         return -EIO;
     struct gbm_bo *bo = gbm_surface_lock_front_buffer(renderer->surface);
