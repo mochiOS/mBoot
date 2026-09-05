@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000050 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 13:00:00 +0900
+Subject: [PATCH] x86/mboot: report a missing GPU renderer on scanout
+
+Once the DRM framebuffer is available, arm a ten-second watchdog for the
+userspace GPU renderer. If the renderer never opens its control device, draw a
+persistent diagnostic directly through the registered framebuffer. This path
+does not depend on PID 1, a dynamic loader, devtmpfs, or the mochiOS display
+protocol, so an otherwise silent userspace failure remains visible.
+---
+ arch/x86/kernel/cpu/mboot.c | 131 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 129 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index ffffffffffff..111111111111 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -9,6 +9,7 @@
+ #include <linux/device/class.h>
+ #include <linux/errno.h>
+ #include <linux/fb.h>
++#include <linux/font.h>
+ #include <linux/fs.h>
+ #include <linux/init.h>
+ #include <linux/io.h>
+@@ -1426,6 +1427,129 @@ static int mboot_gpu_submit(const struct mboot_control_request *request)
+ 	return status;
+ }
+ 
++static u32 mboot_gpu_diagnostic_component(u8 value,
++					 const struct fb_bitfield *field)
++{
++	u64 maximum;
++
++	if (!field->length || field->offset >= 32)
++		return 0;
++	maximum = field->length >= 32 ? U32_MAX : BIT_ULL(field->length) - 1;
++	return (u32)(((u64)value * maximum / 255) << field->offset);
++}
++
++static u32 mboot_gpu_diagnostic_color(const struct fb_var_screeninfo *var,
++				      u8 red, u8 green, u8 blue)
++{
++	return mboot_gpu_diagnostic_component(red, &var->red) |
++		mboot_gpu_diagnostic_component(green, &var->green) |
++		mboot_gpu_diagnostic_component(blue, &var->blue);
++}
++
++static void mboot_gpu_diagnostic_draw(void)
++{
++	static const char message[] = "MDRIVER GPU PROCESS 10";
++	const struct font_desc *font = find_font("VGA8x16");
++	struct fb_info *info;
++	struct fb_image image = { };
++	u32 background;
++	u32 foreground;
++	u32 *pixels;
++	u32 width;
++	u32 height;
++	u32 scale = 2;
++	u32 text_width;
++	u32 text_height;
++	u32 text_x;
++	u32 text_y;
++	size_t index;
++
++	if (!num_registered_fb || !registered_fb[0])
++		return;
++	info = registered_fb[0];
++	if (info->var.bits_per_pixel != 32 || !info->fbops ||
++	    !info->fbops->fb_imageblit)
++		return;
++	width = min_t(u32, info->var.xres, 640);
++	height = min_t(u32, info->var.yres, 160);
++	if (!width || !height)
++		return;
++	pixels = kvmalloc_array((size_t)width * height, sizeof(*pixels),
++				 GFP_KERNEL | __GFP_ZERO);
++	if (!pixels)
++		return;
++	background = mboot_gpu_diagnostic_color(&info->var, 176, 24, 40);
++	foreground = mboot_gpu_diagnostic_color(&info->var, 255, 255, 255);
++	for (index = 0; index < (size_t)width * height; index++)
++		pixels[index] = background;
++
++	if (font && font->width <= 8) {
++		text_width = (sizeof(message) - 1) * font->width * scale;
++		text_height = font->height * scale;
++		if (text_width > width || text_height > height) {
++			scale = 1;
++			text_width = (sizeof(message) - 1) * font->width;
++			text_height = font->height;
++		}
++		text_x = width > text_width ? (width - text_width) / 2 : 0;
++		text_y = height > text_height ? (height - text_height) / 2 : 0;
++		for (index = 0; index < sizeof(message) - 1; index++) {
++			const u8 *glyph = font->data +
++				((u8)message[index] * font->height);
++			u32 row;
++
++			for (row = 0; row < font->height; row++) {
++				u32 column;
++
++				for (column = 0; column < font->width; column++) {
++					u32 sx;
++					u32 sy;
++
++					if (!(glyph[row] & BIT(7 - column)))
++						continue;
++					for (sy = 0; sy < scale; sy++)
++						for (sx = 0; sx < scale; sx++) {
++							u32 x = text_x +
++								index * font->width * scale +
++								column * scale + sx;
++							u32 y = text_y + row * scale + sy;
++
++							if (x < width && y < height)
++								pixels[(size_t)y * width + x] =
++									foreground;
++						}
++				}
++			}
++		}
++	}
++
++	image.dx = (info->var.xres - width) / 2;
++	image.dy = (info->var.yres - height) / 2;
++	image.width = width;
++	image.height = height;
++	image.depth = 32;
++	image.data = (u8 *)pixels;
++	lock_fb_info(info);
++	if (info->state == FBINFO_STATE_RUNNING && info->fbops->fb_imageblit) {
++		info->fbops->fb_imageblit(info, &image);
++		if (info->fbops->fb_sync)
++			info->fbops->fb_sync(info);
++	}
++	unlock_fb_info(info);
++	kvfree(pixels);
++}
++
++static void mboot_gpu_watchdog_workfn(struct work_struct *work)
++{
++	if (!READ_ONCE(mboot_gpu_open)) {
++		pr_err("mDriver: GPU renderer did not become ready\n");
++		mboot_gpu_diagnostic_draw();
++	}
++}
++
++static DECLARE_DELAYED_WORK(mboot_gpu_watchdog_work,
++				    mboot_gpu_watchdog_workfn);
++
+ static int mboot_gpu_open_device(struct inode *inode, struct file *file)
+ {
+ 	mutex_lock(&mboot_gpu_lock);
+@@ -1437,6 +1558,7 @@ static int mboot_gpu_open_device(struct inode *inode, struct file *file)
+ 	mboot_gpu_open = true;
+ 	wake_up_interruptible(&mboot_gpu_request_wait);
+ 	mutex_unlock(&mboot_gpu_lock);
++	cancel_delayed_work(&mboot_gpu_watchdog_work);
+ 	return 0;
+ }
+ 
+@@ -3631,8 +3753,12 @@ static void mboot_ready_workfn(struct work_struct *work)
+ 	    atomic_cmpxchg(&mboot_ready_started, 0, 1))
+ 		return;
+ 	fb_unregister_client(&mboot_fb_notifier);
+-	if (mboot_finish_ready())
++	if (mboot_finish_ready()) {
+ 		pr_err("mDriver: hardware backend startup failed\n");
++		return;
++	}
++	mod_delayed_work(system_wq, &mboot_gpu_watchdog_work,
++			 msecs_to_jiffies(10000));
+ }
+ 
+ static int mboot_fb_event(struct notifier_block *notifier,
+-- 
+2.43.0
