@@ -7,11 +7,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <gbm.h>
+#include <linux/fb.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <xf86drm.h>
@@ -83,6 +85,90 @@ struct renderer {
     uint32_t width;
     uint32_t height;
 };
+
+static uint32_t fb_color(const struct fb_var_screeninfo *info,
+                         uint8_t red, uint8_t green, uint8_t blue)
+{
+    uint32_t color = 0;
+    if (info->red.length && info->red.length < 32)
+        color |= (uint32_t)(((uint64_t)red * ((1ULL << info->red.length) - 1) / 255)
+                            << info->red.offset);
+    if (info->green.length && info->green.length < 32)
+        color |= (uint32_t)(((uint64_t)green * ((1ULL << info->green.length) - 1) / 255)
+                            << info->green.offset);
+    if (info->blue.length && info->blue.length < 32)
+        color |= (uint32_t)(((uint64_t)blue * ((1ULL << info->blue.length) - 1) / 255)
+                            << info->blue.offset);
+    return color;
+}
+
+static void fb_rect(uint8_t *pixels, const struct fb_fix_screeninfo *fixed,
+                    const struct fb_var_screeninfo *variable, uint32_t x,
+                    uint32_t y, uint32_t width, uint32_t height, uint32_t color)
+{
+    uint32_t right = x + width < variable->xres ? x + width : variable->xres;
+    uint32_t bottom = y + height < variable->yres ? y + height : variable->yres;
+    for (uint32_t row = y; row < bottom; row++) {
+        uint32_t *destination = (uint32_t *)(pixels +
+            (row + variable->yoffset) * fixed->line_length) + x + variable->xoffset;
+        for (uint32_t column = x; column < right; column++)
+            *destination++ = color;
+    }
+}
+
+static void fb_hex_digit(uint8_t *pixels, const struct fb_fix_screeninfo *fixed,
+                         const struct fb_var_screeninfo *variable, uint32_t x,
+                         uint32_t y, uint32_t scale, unsigned int value,
+                         uint32_t color)
+{
+    static const uint8_t segments[16] = {
+        0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07,
+        0x7f, 0x6f, 0x77, 0x7c, 0x39, 0x5e, 0x79, 0x71,
+    };
+    uint8_t enabled = segments[value & 0xf];
+    if (enabled & 0x01) fb_rect(pixels, fixed, variable, x + scale, y, scale * 3, scale, color);
+    if (enabled & 0x02) fb_rect(pixels, fixed, variable, x + scale * 4, y + scale, scale, scale * 2, color);
+    if (enabled & 0x04) fb_rect(pixels, fixed, variable, x + scale * 4, y + scale * 4, scale, scale * 2, color);
+    if (enabled & 0x08) fb_rect(pixels, fixed, variable, x + scale, y + scale * 6, scale * 3, scale, color);
+    if (enabled & 0x10) fb_rect(pixels, fixed, variable, x, y + scale * 4, scale, scale * 2, color);
+    if (enabled & 0x20) fb_rect(pixels, fixed, variable, x, y + scale, scale, scale * 2, color);
+    if (enabled & 0x40) fb_rect(pixels, fixed, variable, x + scale, y + scale * 3, scale * 3, scale, color);
+}
+
+static void report_gpu_failure(unsigned int stage)
+{
+    struct fb_fix_screeninfo fixed;
+    struct fb_var_screeninfo variable;
+    int fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    if (fd < 0 || ioctl(fd, FBIOGET_FSCREENINFO, &fixed) ||
+        ioctl(fd, FBIOGET_VSCREENINFO, &variable) || variable.bits_per_pixel != 32 ||
+        !variable.xres || !variable.yres || !fixed.smem_len ||
+        (uint64_t)(variable.yoffset + variable.yres) * fixed.line_length > fixed.smem_len) {
+        if (fd >= 0)
+            close(fd);
+        return;
+    }
+    uint8_t *pixels = mmap(NULL, fixed.smem_len, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, fd, 0);
+    if (pixels == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+    uint32_t background = fb_color(&variable, 180, 24, 38);
+    uint32_t foreground = fb_color(&variable, 255, 255, 255);
+    fb_rect(pixels, &fixed, &variable, 0, 0, variable.xres, variable.yres, background);
+    uint32_t scale = variable.xres < variable.yres ? variable.xres / 32 : variable.yres / 18;
+    if (!scale)
+        scale = 1;
+    uint32_t total_width = scale * 12;
+    uint32_t x = variable.xres > total_width ? (variable.xres - total_width) / 2 : 0;
+    uint32_t y = variable.yres > scale * 7 ? (variable.yres - scale * 7) / 2 : 0;
+    fb_hex_digit(pixels, &fixed, &variable, x, y, scale, stage >> 4, foreground);
+    fb_hex_digit(pixels, &fixed, &variable, x + scale * 7, y, scale, stage, foreground);
+    msync(pixels, fixed.smem_len, MS_SYNC);
+    munmap(pixels, fixed.smem_len);
+    close(fd);
+}
 
 static uint16_t get_u16(const uint8_t *p)
 {
@@ -166,21 +252,23 @@ static int choose_output(int fd, struct renderer *renderer)
     return -1;
 }
 
-static int open_drm(struct renderer *renderer)
+static int open_drm(struct renderer *renderer, unsigned int *failure_stage)
 {
     char path[32];
+    int found_card = 0;
     for (unsigned int index = 0; index < 16; index++) {
         snprintf(path, sizeof(path), "/dev/dri/card%u", index);
         int fd = open(path, O_RDWR | O_CLOEXEC);
         if (fd < 0)
             continue;
-        if (drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) == 0 &&
-            choose_output(fd, renderer) == 0) {
+        found_card = 1;
+        if (choose_output(fd, renderer) == 0) {
             renderer->drm_fd = fd;
             return 0;
         }
         close(fd);
     }
+    *failure_stage = found_card ? 0x02 : 0x01;
     return -1;
 }
 
@@ -271,39 +359,45 @@ static int initialize_gl(struct renderer *renderer)
 
     renderer->gbm = gbm_create_device(renderer->drm_fd);
     if (!renderer->gbm)
-        return -1;
+        return 0x03;
     renderer->surface = gbm_surface_create(renderer->gbm, renderer->mode.hdisplay,
         renderer->mode.vdisplay, GBM_FORMAT_XRGB8888,
         GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
     if (!renderer->surface)
-        return -1;
+        return 0x04;
     renderer->egl_display = eglGetDisplay((EGLNativeDisplayType)renderer->gbm);
-    if (renderer->egl_display == EGL_NO_DISPLAY ||
-        !eglInitialize(renderer->egl_display, NULL, NULL) ||
-        !eglBindAPI(EGL_OPENGL_ES_API) ||
-        choose_egl_config(renderer->egl_display, config_attributes, &config))
-        return -1;
+    if (renderer->egl_display == EGL_NO_DISPLAY)
+        return 0x05;
+    if (!eglInitialize(renderer->egl_display, NULL, NULL))
+        return 0x06;
+    if (!eglBindAPI(EGL_OPENGL_ES_API))
+        return 0x07;
+    if (choose_egl_config(renderer->egl_display, config_attributes, &config))
+        return 0x08;
     renderer->egl_context = eglCreateContext(renderer->egl_display, config,
         EGL_NO_CONTEXT, context_attributes);
+    if (renderer->egl_context == EGL_NO_CONTEXT)
+        return 0x09;
     renderer->egl_surface = eglCreateWindowSurface(renderer->egl_display, config,
         (EGLNativeWindowType)renderer->surface, NULL);
-    if (renderer->egl_context == EGL_NO_CONTEXT || renderer->egl_surface == EGL_NO_SURFACE ||
-        !eglMakeCurrent(renderer->egl_display, renderer->egl_surface,
+    if (renderer->egl_surface == EGL_NO_SURFACE)
+        return 0x0a;
+    if (!eglMakeCurrent(renderer->egl_display, renderer->egl_surface,
                         renderer->egl_surface, renderer->egl_context))
-        return -1;
+        return 0x0b;
     const char *gpu_name = (const char *)glGetString(GL_RENDERER);
     if (!gpu_name || strstr(gpu_name, "llvmpipe") || strstr(gpu_name, "softpipe") ||
         strstr(gpu_name, "Software Rasterizer")) {
         dprintf(2, "mDriver GPU: refusing software renderer %s\n",
                 gpu_name ? gpu_name : "unknown");
-        return -1;
+        return 0x0c;
     }
     dprintf(2, "mDriver GPU: renderer=%s\n", gpu_name);
 
     renderer->scene_program = make_program(scene_vertex, scene_fragment);
     renderer->copy_program = make_program(copy_vertex, copy_fragment);
     if (!renderer->scene_program || !renderer->copy_program)
-        return -1;
+        return 0x0d;
     renderer->scene_position = glGetAttribLocation(renderer->scene_program, "position");
     renderer->scene_uv = glGetAttribLocation(renderer->scene_program, "uv");
     renderer->scene_color = glGetAttribLocation(renderer->scene_program, "color");
@@ -323,7 +417,7 @@ static int initialize_gl(struct renderer *renderer)
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                            renderer->color_texture, 0);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-        return -1;
+        return 0x0e;
     renderer->width = renderer->mode.hdisplay;
     renderer->height = renderer->mode.vdisplay;
     /* KMS page flips below provide the single frame-rate boundary. */
@@ -601,14 +695,23 @@ static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t 
 int main(void)
 {
     struct renderer renderer = { .drm_fd = -1 };
-    while (open_drm(&renderer))
+    unsigned int failure_stage = 0x01;
+    unsigned int wait_cycles = 0;
+    while (open_drm(&renderer, &failure_stage)) {
+        if (++wait_cycles == 50)
+            report_gpu_failure(failure_stage);
         poll(NULL, 0, 100);
-    if (initialize_gl(&renderer)) {
-        dprintf(2, "mDriver GPU: initialization failed errno=%d\n", errno);
+    }
+    failure_stage = initialize_gl(&renderer);
+    if (failure_stage) {
+        dprintf(2, "mDriver GPU: initialization failed stage=%02x errno=%d\n",
+                failure_stage, errno);
+        report_gpu_failure(failure_stage);
         return 1;
     }
     if (show_startup_frame(&renderer)) {
         dprintf(2, "mDriver GPU: startup frame failed errno=%d\n", errno);
+        report_gpu_failure(0x0f);
         return 1;
     }
     int control = open("/dev/mboot-gpu", O_RDWR | O_CLOEXEC);
