@@ -6,8 +6,8 @@ Expose the shared display surface to a single privileged mDriver renderer and
 synchronously forward validated scene submissions. The userspace renderer owns
 Mesa and DRM policy; the hypervisor transport remains device independent.
 ---
- arch/x86/kernel/cpu/mboot.c | 184 +++++++++++++++++++++++++++++++++++++
- 1 file changed, 184 insertions(+)
+ arch/x86/kernel/cpu/mboot.c | 189 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 189 insertions(+)
 
 --- a/arch/x86/kernel/cpu/mboot.c
 +++ b/arch/x86/kernel/cpu/mboot.c
@@ -106,7 +106,7 @@ Mesa and DRM policy; the hypervisor transport remains device independent.
  	mboot_display_device_id = device_id;
  	mboot_display_info = registered_fb[0];
  	return 0;
-@@ -1334,6 +1366,146 @@
+@@ -1334,6 +1366,151 @@
  	return 0;
  }
  

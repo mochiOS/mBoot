@@ -43,12 +43,7 @@ pub fn initialize(boot_services: &BootServices) -> bool {
     HEIGHT.store(height, Ordering::Relaxed);
     STRIDE.store(stride, Ordering::Relaxed);
     ORDER.store(order, Ordering::Relaxed);
-    starting();
     true
-}
-
-pub fn starting() {
-    show(0x0017_2033, b"MBOOT", b"STARTING");
 }
 
 /// Ends mBoot framebuffer output before the firmware display controller is
@@ -205,29 +200,15 @@ pub fn domain_crash(domain_id: u32, raw_reason: u64, address: u64, info: u64) {
     }
 }
 
-pub fn backend(intel: bool) {
-    show(
-        0x0017_2033,
-        b"MBOOT",
-        if intel { b"INTEL VMX" } else { b"AMD SVM" },
-    );
-}
+pub fn backend(_intel: bool) {}
 
-pub fn bootstrap_success() {
-    show(0x0017_4F35, b"MBOOT", b"MNU OK");
-}
+pub fn bootstrap_success() {}
 
-pub fn isolation_success() {
-    show(0x0017_4F35, b"MBOOT", b"ISOLATION OK");
-}
+pub fn isolation_success() {}
 
-pub fn mochios_ready() {
-    show(0x0017_4F35, b"MBOOT", b"MOCHIOS OK");
-}
+pub fn mochios_ready() {}
 
-pub fn hardware_ready() {
-    show(0x0017_4F35, b"MBOOT", b"HARDWARE OK");
-}
+pub fn hardware_ready() {}
 
 pub fn mdriver_query(_index: u16, _requester: Option<u16>) {}
 

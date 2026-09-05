@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000049 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 12:00:00 +0900
+Subject: [PATCH] x86/mboot: bound the GPU renderer wait
+
+Do not stall an entire desktop frame for a minute when the userspace DRM
+renderer cannot start. The compositor retries GPU submission, so a short
+bounded wait preserves recovery without silently forcing software rendering.
+---
+ arch/x86/kernel/cpu/mboot.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index eeeeeeeeeeee..ffffffffffff 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -1395,6 +1395,6 @@ static int mboot_gpu_submit(const struct mboot_control_request *request)
+ 		return -EINVAL;
+ 	waited = wait_event_interruptible_timeout(mboot_gpu_request_wait,
+-		READ_ONCE(mboot_gpu_open), msecs_to_jiffies(60000));
++		READ_ONCE(mboot_gpu_open), msecs_to_jiffies(5000));
+ 	if (waited <= 0)
+ 		return waited ? waited : -ETIMEDOUT;
+ 	mutex_lock(&mboot_gpu_lock);
+-- 
+2.43.0

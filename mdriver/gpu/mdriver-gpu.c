@@ -542,13 +542,14 @@ static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t 
 int main(void)
 {
     struct renderer renderer = { .drm_fd = -1 };
-    if (open_drm(&renderer) || initialize_gl(&renderer)) {
-        dprintf(2, "mDriver GPU: initialization failed errno=%d\n", errno);
-        return 1;
-    }
     int control = open("/dev/mboot-gpu", O_RDWR | O_CLOEXEC);
     if (control < 0) {
         dprintf(2, "mDriver GPU: control unavailable errno=%d\n", errno);
+        return 1;
+    }
+    if (open_drm(&renderer) || initialize_gl(&renderer)) {
+        dprintf(2, "mDriver GPU: initialization failed errno=%d\n", errno);
+        close(control);
         return 1;
     }
     dprintf(2, "mDriver GPU: hardware renderer ready\n");
