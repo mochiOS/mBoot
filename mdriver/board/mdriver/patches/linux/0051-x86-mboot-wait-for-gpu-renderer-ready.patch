@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000051 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 22:00:00 +0900
+Subject: [PATCH] x86/mboot: wait for the GPU renderer before ready
+
+The framebuffer registered by the DRM driver is not sufficient to advertise
+the hardware display backend. Wait until the userspace KMS/EGL renderer has
+presented its first frame and opened the GPU endpoint. This makes the Hardware
+Domain Ready event the handoff boundary used by the System Domain.
+
+Do not advertise GPU scene support before that endpoint is owned. Retry the
+ready work while userspace completes initialization instead of depending on a
+second framebuffer notification.
+---
+ arch/x86/kernel/cpu/mboot.c | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 111111111111..222222222222 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -1135,7 +1135,6 @@ static bool mboot_display_backend_ready(void)
+ 	if (num_registered_fb && registered_fb[0] &&
+ 	    registered_fb[0]->var.bits_per_pixel == 32 &&
+-	    registered_fb[0]->fbops && registered_fb[0]->fbops->fb_imageblit) {
+-		return true;
+-	}
++	    registered_fb[0]->fbops && registered_fb[0]->fbops->fb_imageblit)
++		return READ_ONCE(mboot_gpu_open);
+ 	return false;
+ }
+@@ -3752,7 +3752,13 @@ static void mboot_ready_workfn(struct work_struct *work)
+ {
+ 	mboot_reprobe_display();
+-	if (!mboot_display_backend_ready() ||
+-	    atomic_cmpxchg(&mboot_ready_started, 0, 1))
++	if (!mboot_display_backend_ready()) {
++		/* The DRM framebuffer can appear before the userspace renderer has
++		 * completed EGL setup and its first KMS commit. */
++		mod_delayed_work(system_wq, &mboot_ready_work,
++				 msecs_to_jiffies(100));
++		return;
++	}
++	if (atomic_cmpxchg(&mboot_ready_started, 0, 1))
+ 		return;
+ 	fb_unregister_client(&mboot_fb_notifier);
+ 	if (mboot_finish_ready()) {
+-- 
+2.43.0

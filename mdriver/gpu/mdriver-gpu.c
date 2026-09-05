@@ -204,38 +204,6 @@ static int write_response(int fd, uint64_t generation, int status)
     return write(fd, &response, sizeof(response)) == sizeof(response) ? 0 : -1;
 }
 
-/*
- * Keep /dev/mboot-gpu owned without touching DRM while mochiOS uses the
- * kernel framebuffer transport.  The old startup path performed a KMS
- * modeset before mochiOS had any proof that EGL scanout worked; a failure
- * therefore replaced the working fbdev console with a black buffer.  This
- * compatibility mode remains in place until the control protocol has an
- * explicit GPU-renderer-ready transition.
- */
-static int preserve_cpu_framebuffer(void)
-{
-    int control;
-
-    do {
-        control = open("/dev/mboot-gpu", O_RDWR | O_CLOEXEC);
-        if (control < 0)
-            poll(NULL, 0, 100);
-    } while (control < 0);
-
-    for (;;) {
-        struct gpu_request request;
-        ssize_t received = read(control, &request, sizeof(request));
-        if (received < 0 && errno == EINTR)
-            continue;
-        if (received != sizeof(request))
-            break;
-        if (write_response(control, request.generation, -ENOTSUP))
-            break;
-    }
-    close(control);
-    return 1;
-}
-
 static int choose_output(int fd, struct renderer *renderer)
 {
     drmModeRes *resources = drmModeGetResources(fd);
@@ -371,7 +339,7 @@ static void show_dumb_failure(struct renderer *renderer, unsigned int stage)
                    &renderer->connector_id, 1, &renderer->mode);
 }
 
-static int initialize_dumb_scanout(struct renderer *renderer)
+static int initialize_dumb_buffer(struct renderer *renderer)
 {
     struct drm_mode_create_dumb create = {
         .width = renderer->mode.hdisplay,
@@ -403,9 +371,9 @@ static int initialize_dumb_scanout(struct renderer *renderer)
     }
     dumb_rect(renderer, 0, 0, create.width, create.height, 0x00c8c8c8);
     msync(renderer->fallback.pixels, renderer->fallback.size, MS_SYNC);
-    return drmModeSetCrtc(renderer->drm_fd, renderer->crtc_id,
-                          renderer->fallback.id, 0, 0,
-                          &renderer->connector_id, 1, &renderer->mode);
+    /* Do not replace the working fbdev scanout yet.  This buffer is only an
+     * emergency target after the GPU renderer has taken display ownership. */
+    return 0;
 }
 
 static GLuint compile_shader(GLenum type, const char *source)
@@ -898,10 +866,6 @@ static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t 
 
 int main(void)
 {
-    const char *mode = getenv("MDRIVER_GPU_MODE");
-    if (mode && !strcmp(mode, "cpu-framebuffer"))
-        return preserve_cpu_framebuffer();
-
     struct renderer renderer = { .drm_fd = -1 };
     unsigned int failure_stage = 0x01;
     unsigned int wait_cycles = 0;
@@ -910,8 +874,8 @@ int main(void)
             report_gpu_failure(failure_stage);
         poll(NULL, 0, 100);
     }
-    if (initialize_dumb_scanout(&renderer)) {
-        dprintf(2, "mDriver GPU: dumb scanout failed errno=%d\n", errno);
+    if (initialize_dumb_buffer(&renderer)) {
+        dprintf(2, "mDriver GPU: diagnostic buffer failed errno=%d\n", errno);
         report_gpu_failure(0x10);
         return 1;
     }
@@ -919,12 +883,14 @@ int main(void)
     if (failure_stage) {
         dprintf(2, "mDriver GPU: initialization failed stage=%02x errno=%d\n",
                 failure_stage, errno);
-        show_dumb_failure(&renderer, failure_stage);
+        /* EGL has not produced a valid scanout yet.  Keep the current fbdev
+         * scanout instead of replacing it with the diagnostic dumb buffer. */
+        report_gpu_failure(failure_stage);
         return 1;
     }
     if (show_startup_frame(&renderer)) {
         dprintf(2, "mDriver GPU: startup scanout failed errno=%d\n", errno);
-        show_dumb_failure(&renderer, 0x0f);
+        report_gpu_failure(0x0f);
         return 1;
     }
     int control = open("/dev/mboot-gpu", O_RDWR | O_CLOEXEC);

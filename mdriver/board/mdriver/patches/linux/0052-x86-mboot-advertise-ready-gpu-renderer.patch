@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000052 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 22:05:00 +0900
+Subject: [PATCH] x86/mboot: advertise only a ready GPU renderer
+
+Expose GPU scene support only while the userspace renderer owns the control
+endpoint. Hardware Domain readiness is gated on the same state.
+---
+ arch/x86/kernel/cpu/mboot.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 222222222222..333333333333 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -1188 +1188,2 @@ static u64 mboot_control_device_features(const struct mboot_pci_device_info *info)
+-		features |= MBOOT_DEVICE_FEATURE_DISPLAY_GPU_SCENE;
++		if (READ_ONCE(mboot_gpu_open))
++			features |= MBOOT_DEVICE_FEATURE_DISPLAY_GPU_SCENE;
+-- 
+2.43.0
