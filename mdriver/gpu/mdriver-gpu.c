@@ -547,7 +547,9 @@ int main(void)
         dprintf(2, "mDriver GPU: control unavailable errno=%d\n", errno);
         return 1;
     }
-    if (open_drm(&renderer) || initialize_gl(&renderer)) {
+    while (open_drm(&renderer))
+        poll(NULL, 0, 100);
+    if (initialize_gl(&renderer)) {
         dprintf(2, "mDriver GPU: initialization failed errno=%d\n", errno);
         close(control);
         return 1;
