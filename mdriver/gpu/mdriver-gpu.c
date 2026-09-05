@@ -57,6 +57,14 @@ struct drm_framebuffer {
     uint32_t id;
 };
 
+struct dumb_framebuffer {
+    uint32_t handle;
+    uint32_t id;
+    uint32_t pitch;
+    uint64_t size;
+    uint8_t *pixels;
+};
+
 struct renderer {
     int drm_fd;
     uint32_t connector_id;
@@ -82,6 +90,7 @@ struct renderer {
     GLint copy_sampler;
     struct texture textures[MAX_TEXTURES];
     struct gbm_bo *front_bo;
+    struct dumb_framebuffer fallback;
     uint32_t width;
     uint32_t height;
 };
@@ -270,6 +279,96 @@ static int open_drm(struct renderer *renderer, unsigned int *failure_stage)
     }
     *failure_stage = found_card ? 0x02 : 0x01;
     return -1;
+}
+
+static void dumb_rect(struct renderer *renderer, uint32_t x, uint32_t y,
+                      uint32_t width, uint32_t height, uint32_t color)
+{
+    struct dumb_framebuffer *framebuffer = &renderer->fallback;
+    uint32_t right = x + width < renderer->mode.hdisplay ?
+        x + width : renderer->mode.hdisplay;
+    uint32_t bottom = y + height < renderer->mode.vdisplay ?
+        y + height : renderer->mode.vdisplay;
+    for (uint32_t row = y; row < bottom; row++) {
+        uint32_t *destination = (uint32_t *)(framebuffer->pixels +
+                                             (uint64_t)row * framebuffer->pitch) + x;
+        for (uint32_t column = x; column < right; column++)
+            *destination++ = color;
+    }
+}
+
+static void dumb_hex_digit(struct renderer *renderer, uint32_t x, uint32_t y,
+                           uint32_t scale, unsigned int value, uint32_t color)
+{
+    static const uint8_t segments[16] = {
+        0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07,
+        0x7f, 0x6f, 0x77, 0x7c, 0x39, 0x5e, 0x79, 0x71,
+    };
+    uint8_t enabled = segments[value & 0xf];
+    if (enabled & 0x01) dumb_rect(renderer, x + scale, y, scale * 3, scale, color);
+    if (enabled & 0x02) dumb_rect(renderer, x + scale * 4, y + scale, scale, scale * 2, color);
+    if (enabled & 0x04) dumb_rect(renderer, x + scale * 4, y + scale * 4, scale, scale * 2, color);
+    if (enabled & 0x08) dumb_rect(renderer, x + scale, y + scale * 6, scale * 3, scale, color);
+    if (enabled & 0x10) dumb_rect(renderer, x, y + scale * 4, scale, scale * 2, color);
+    if (enabled & 0x20) dumb_rect(renderer, x, y + scale, scale, scale * 2, color);
+    if (enabled & 0x40) dumb_rect(renderer, x + scale, y + scale * 3, scale * 3, scale, color);
+}
+
+static void show_dumb_failure(struct renderer *renderer, unsigned int stage)
+{
+    if (!renderer->fallback.pixels)
+        return;
+    dumb_rect(renderer, 0, 0, renderer->mode.hdisplay, renderer->mode.vdisplay,
+              0x00b01828);
+    uint32_t scale = renderer->mode.hdisplay < renderer->mode.vdisplay ?
+        renderer->mode.hdisplay / 32 : renderer->mode.vdisplay / 18;
+    if (!scale)
+        scale = 1;
+    uint32_t total_width = scale * 12;
+    uint32_t x = renderer->mode.hdisplay > total_width ?
+        (renderer->mode.hdisplay - total_width) / 2 : 0;
+    uint32_t y = renderer->mode.vdisplay > scale * 7 ?
+        (renderer->mode.vdisplay - scale * 7) / 2 : 0;
+    dumb_hex_digit(renderer, x, y, scale, stage >> 4, 0x00ffffff);
+    dumb_hex_digit(renderer, x + scale * 7, y, scale, stage, 0x00ffffff);
+    msync(renderer->fallback.pixels, renderer->fallback.size, MS_SYNC);
+}
+
+static int initialize_dumb_scanout(struct renderer *renderer)
+{
+    struct drm_mode_create_dumb create = {
+        .width = renderer->mode.hdisplay,
+        .height = renderer->mode.vdisplay,
+        .bpp = 32,
+    };
+    if (ioctl(renderer->drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create))
+        return -1;
+    renderer->fallback.handle = create.handle;
+    renderer->fallback.pitch = create.pitch;
+    renderer->fallback.size = create.size;
+
+    uint32_t handles[4] = { create.handle, 0, 0, 0 };
+    uint32_t pitches[4] = { create.pitch, 0, 0, 0 };
+    uint32_t offsets[4] = { 0 };
+    if (drmModeAddFB2(renderer->drm_fd, create.width, create.height,
+                      DRM_FORMAT_XRGB8888, handles, pitches, offsets,
+                      &renderer->fallback.id, 0))
+        return -1;
+
+    struct drm_mode_map_dumb map = { .handle = create.handle };
+    if (ioctl(renderer->drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &map))
+        return -1;
+    renderer->fallback.pixels = mmap(NULL, create.size, PROT_READ | PROT_WRITE,
+                                     MAP_SHARED, renderer->drm_fd, map.offset);
+    if (renderer->fallback.pixels == MAP_FAILED) {
+        renderer->fallback.pixels = NULL;
+        return -1;
+    }
+    dumb_rect(renderer, 0, 0, create.width, create.height, 0x00c8c8c8);
+    msync(renderer->fallback.pixels, renderer->fallback.size, MS_SYNC);
+    return drmModeSetCrtc(renderer->drm_fd, renderer->crtc_id,
+                          renderer->fallback.id, 0, 0,
+                          &renderer->connector_id, 1, &renderer->mode);
 }
 
 static GLuint compile_shader(GLenum type, const char *source)
@@ -634,18 +733,6 @@ static int show_frame(struct renderer *renderer)
     return 0;
 }
 
-static int show_startup_frame(struct renderer *renderer)
-{
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, renderer->width, renderer->height);
-    glDisable(GL_BLEND);
-    glClearColor(200.0f / 255.0f, 200.0f / 255.0f, 200.0f / 255.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    if (glGetError() != GL_NO_ERROR)
-        return -EIO;
-    return show_frame(renderer);
-}
-
 static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t length)
 {
     if (length < SCENE_HEADER_LEN || get_u32(scene) != SCENE_MAGIC ||
@@ -740,16 +827,16 @@ int main(void)
             report_gpu_failure(failure_stage);
         poll(NULL, 0, 100);
     }
+    if (initialize_dumb_scanout(&renderer)) {
+        dprintf(2, "mDriver GPU: dumb scanout failed errno=%d\n", errno);
+        report_gpu_failure(0x10);
+        return 1;
+    }
     failure_stage = initialize_gl(&renderer);
     if (failure_stage) {
         dprintf(2, "mDriver GPU: initialization failed stage=%02x errno=%d\n",
                 failure_stage, errno);
-        report_gpu_failure(failure_stage);
-        return 1;
-    }
-    if (show_startup_frame(&renderer)) {
-        dprintf(2, "mDriver GPU: startup frame failed errno=%d\n", errno);
-        report_gpu_failure(0x0f);
+        show_dumb_failure(&renderer, failure_stage);
         return 1;
     }
     int control = open("/dev/mboot-gpu", O_RDWR | O_CLOEXEC);
