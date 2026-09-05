@@ -63,6 +63,7 @@ const MAX_GUEST_MEMORY_PAGES: usize = 131_072;
 const MIN_GRANT_WINDOW_PAGES: usize = 64;
 const MAX_GRANT_WINDOW_PAGES: usize = 8192;
 const DEVICE_WINDOW_PAGES: usize = 64;
+const DEVICE_WINDOW_BYTES: u64 = DEVICE_WINDOW_PAGES as u64 * 4096;
 const DOMAIN_STACK_BYTES: u64 = 1024 * 1024;
 const DEVICE_WINDOW_START: u64 = 0x1000_0000;
 const DEVICE_WINDOW_LIMIT: u64 = mnu_abi::hypervisor::DOMAIN_DEVICE_ADDRESS_LIMIT;
@@ -159,6 +160,13 @@ struct RuntimeDomain {
     initramfs: Option<Vec<u8>>,
     command_line: String,
     entropy_root: [u8; 32],
+    intel_graphics_opregion: Option<IntelGraphicsOpRegion>,
+}
+
+struct IntelGraphicsOpRegion {
+    requester: u16,
+    guest_address: u64,
+    image: Vec<u8>,
 }
 
 impl BootMemoryMap {
@@ -208,6 +216,34 @@ impl BootMemoryMap {
                 let region_end = region.start.saturating_add(region.len);
                 end <= region.start || start >= region_end || region.mmio
             })
+    }
+
+    fn contains_firmware_memory(&self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if self.overflowed || start == 0 || len == 0 {
+            return false;
+        }
+        let mut cursor = start;
+        while cursor < end {
+            let mut covered_until = cursor;
+            for region in &self.regions[..self.len] {
+                let region_end = region.start.saturating_add(region.len);
+                if !region.usable
+                    && !region.mmio
+                    && cursor >= region.start
+                    && cursor < region_end
+                {
+                    covered_until = covered_until.max(region_end.min(end));
+                }
+            }
+            if covered_until == cursor {
+                return false;
+            }
+            cursor = covered_until;
+        }
+        true
     }
 }
 
@@ -854,6 +890,13 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             } else {
                 (0, 0)
             };
+        let intel_graphics_opregion = if prepared.role == DomainRole::Hardware {
+            deferred_display.and_then(|requester| {
+                prepare_intel_graphics_opregion(&nested, &memory_map, requester)
+            })
+        } else {
+            None
+        };
         // SAFETY: Control pages are exclusive, execution is pinned to the BSP,
         // interrupts are disabled, and this code runs at CPL0.
         let virtualization = if index == 0 {
@@ -993,6 +1036,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             initramfs: prepared.initramfs,
             command_line: prepared.command_line,
             entropy_root: prepared.entropy_root,
+            intel_graphics_opregion,
         });
     }
 
@@ -1374,8 +1418,17 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     if runtime_domains[index].domain.role() == DomainRole::Hardware
                         && devices.can_read_config(domain_id, requester) =>
                 {
-                    unsafe { pci::config_read(requester, offset) }
-                        .map_or(HYPERCALL_INVALID_ARGUMENT, u64::from)
+                    runtime_domains[index]
+                        .intel_graphics_opregion
+                        .as_ref()
+                        .filter(|opregion| {
+                            opregion.requester == requester && offset == 0xfc
+                        })
+                        .map(|opregion| opregion.guest_address)
+                        .unwrap_or_else(|| {
+                            unsafe { pci::config_read(requester, offset) }
+                                .map_or(HYPERCALL_INVALID_ARGUMENT, u64::from)
+                        })
                 }
                 _ => HYPERCALL_INVALID_ARGUMENT,
             };
@@ -2310,6 +2363,9 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
         } else {
             (0, 0)
         };
+    if let Some(opregion) = runtime.intel_graphics_opregion.as_ref() {
+        install_intel_graphics_opregion(runtime.domain.nested_pages(), opregion);
+    }
     runtime.restart_count = runtime.restart_count.saturating_add(1);
     let backend = match runtime.domain.backend() {
         BackendKind::IntelVmx => HYPERVISOR_BACKEND_INTEL_VMX,
@@ -2845,6 +2901,189 @@ fn external_device_window_start(memory: &NestedPageTable) -> u64 {
 
 fn device_window_start(memory: &NestedPageTable) -> u64 {
     grant_window_start(memory) - DEVICE_WINDOW_PAGES as u64 * 4096
+}
+
+fn prepare_intel_graphics_opregion(
+    memory: &NestedPageTable,
+    memory_map: &BootMemoryMap,
+    requester: u16,
+) -> Option<IntelGraphicsOpRegion> {
+    // SAFETY: PCI configuration ownership belongs exclusively to mBoot here.
+    let Some(host_address) = (unsafe { pci::intel_graphics_opregion_address(requester) }) else {
+        return None;
+    };
+    if !memory_map.contains_firmware_memory(host_address, pci::INTEL_GRAPHICS_OPREGION_SIZE) {
+        log!(
+            "Intel graphics OpRegion {:#x} is not contained in firmware-owned SystemMemory",
+            host_address
+        );
+        return None;
+    }
+    let mut image = Vec::with_capacity(pci::INTEL_GRAPHICS_OPREGION_SIZE as usize);
+    image.resize(pci::INTEL_GRAPHICS_OPREGION_SIZE as usize, 0);
+    // SAFETY: The firmware memory map contains this complete reserved range and
+    // mBoot retains the boot-time identity mapping after ExitBootServices.
+    unsafe {
+        copy_nonoverlapping(
+            host_address as *const u8,
+            image.as_mut_ptr(),
+            image.len(),
+        )
+    };
+    if image.get(..16) != Some(b"IntelGraphicsMem") {
+        log!(
+            "Intel graphics OpRegion at {:#x} has an invalid signature",
+            host_address
+        );
+        return None;
+    }
+    if !copy_external_intel_vbt(
+        &mut image,
+        host_address,
+        device_window_start(memory),
+        memory_map,
+    ) {
+        return None;
+    }
+    let opregion = IntelGraphicsOpRegion {
+        requester,
+        guest_address: device_window_start(memory),
+        image,
+    };
+    install_intel_graphics_opregion(memory, &opregion);
+    log!(
+        "Intel graphics OpRegion copied for Hardware Domain: host={:#x} guest={:#x} size={}",
+        host_address,
+        opregion.guest_address,
+        opregion.image.len()
+    );
+    Some(opregion)
+}
+
+fn copy_external_intel_vbt(
+    image: &mut Vec<u8>,
+    host_opregion: u64,
+    guest_opregion: u64,
+    memory_map: &BootMemoryMap,
+) -> bool {
+    const VERSION_MINOR_OFFSET: usize = 26;
+    const VERSION_MAJOR_OFFSET: usize = 27;
+    const MAILBOXES_OFFSET: usize = 88;
+    const MAILBOX_ASLE: u32 = 1 << 2;
+    const ASLE_RVDA_OFFSET: usize = 0x3ba;
+    const ASLE_RVDS_OFFSET: usize = 0x3c2;
+
+    let Some(major) = image.get(VERSION_MAJOR_OFFSET).copied() else {
+        return false;
+    };
+    let Some(minor) = image.get(VERSION_MINOR_OFFSET).copied() else {
+        return false;
+    };
+    let Some(mailboxes) = read_u32_le(image, MAILBOXES_OFFSET) else {
+        return false;
+    };
+    if major < 2 || mailboxes & MAILBOX_ASLE == 0 {
+        return true;
+    }
+    let Some(rvda) = read_u64_le(image, ASLE_RVDA_OFFSET) else {
+        return false;
+    };
+    let Some(rvds) = read_u32_le(image, ASLE_RVDS_OFFSET).map(u64::from) else {
+        return false;
+    };
+    if rvda == 0 || rvds == 0 {
+        return true;
+    }
+
+    let relative = major > 2 || minor >= 1;
+    let (host_vbt, guest_offset) = if relative {
+        if rvda < pci::INTEL_GRAPHICS_OPREGION_SIZE {
+            log!("Intel graphics relative VBT overlaps its OpRegion");
+            return false;
+        }
+        let Some(host_vbt) = host_opregion.checked_add(rvda) else {
+            return false;
+        };
+        (host_vbt, rvda)
+    } else {
+        (rvda, pci::INTEL_GRAPHICS_OPREGION_SIZE)
+    };
+    let Some(guest_end) = guest_offset.checked_add(rvds) else {
+        return false;
+    };
+    if guest_end > DEVICE_WINDOW_BYTES
+        || !memory_map.contains_firmware_memory(host_vbt, rvds)
+    {
+        log!(
+            "Intel graphics external VBT rejected: host={:#x} offset={:#x} size={}",
+            host_vbt,
+            guest_offset,
+            rvds
+        );
+        return false;
+    }
+    let Ok(guest_offset) = usize::try_from(guest_offset) else {
+        return false;
+    };
+    let Ok(guest_end) = usize::try_from(guest_end) else {
+        return false;
+    };
+    image.resize(guest_end, 0);
+    // SAFETY: The complete VBT source lies in firmware-owned SystemMemory and
+    // the destination is the validated, exclusively owned Vec range.
+    unsafe {
+        copy_nonoverlapping(
+            host_vbt as *const u8,
+            image.as_mut_ptr().add(guest_offset),
+            rvds as usize,
+        )
+    };
+    if image.get(guest_offset..guest_offset + 4) != Some(b"$VBT") {
+        log!("Intel graphics external VBT has an invalid signature");
+        return false;
+    }
+    if !relative {
+        let guest_vbt = guest_opregion + guest_offset as u64;
+        image[ASLE_RVDA_OFFSET..ASLE_RVDA_OFFSET + 8]
+            .copy_from_slice(&guest_vbt.to_le_bytes());
+    }
+    log!(
+        "Intel graphics external VBT copied: guest={:#x} size={} version={}.{}",
+        guest_opregion + guest_offset as u64,
+        rvds,
+        major,
+        minor
+    );
+    true
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?))
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(offset..offset + 8)?.try_into().ok()?))
+}
+
+fn install_intel_graphics_opregion(
+    memory: &NestedPageTable,
+    opregion: &IntelGraphicsOpRegion,
+) {
+    let Some(destination) = memory.guest_host_address(
+        opregion.guest_address,
+        opregion.image.len() as u64,
+    ) else {
+        halt_with_error("Intel graphics OpRegion", mboot::Error::InvalidPage)
+    };
+    // SAFETY: The Domain is stopped and the Device Window is reserved from all
+    // image, stack, boot-module, and Grant allocations.
+    unsafe {
+        copy_nonoverlapping(
+            opregion.image.as_ptr(),
+            destination as *mut u8,
+            opregion.image.len(),
+        )
+    };
 }
 
 const fn align_up_4k(value: u64) -> u64 {

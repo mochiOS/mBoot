@@ -36,6 +36,8 @@ const PCI_CLASS_STORAGE_RAID: u16 = 0x0104;
 const VMD_VMCONFIG: u8 = 0x44;
 const VMD_VMCONFIG_MSI_REMAP: u16 = 1 << 1;
 const INTEL_GRAPHICS_REQUESTER: u16 = 0x0010;
+const INTEL_GRAPHICS_ASLS: u8 = 0xfc;
+pub const INTEL_GRAPHICS_OPREGION_SIZE: u64 = 8 * 1024;
 const INTEL_BDSM: u8 = 0xb0;
 const INTEL_BGSM: u8 = 0xb4;
 const INTEL_TOLUD: u8 = 0xbc;
@@ -591,6 +593,25 @@ pub unsafe fn intel_graphics_stolen_range(requester: u16) -> Option<(u64, u64)> 
     let bgsm = unsafe { read_u32(0, 0, 0, INTEL_BGSM) };
     let tolud = unsafe { read_u32(0, 0, 0, INTEL_TOLUD) };
     intel_graphics_stolen_range_from_registers(bdsm, bgsm, tolud)
+}
+
+/// Returns the firmware ACPI OpRegion used by an Intel integrated display.
+///
+/// The ASLS register contains a 32-bit, page-aligned SystemMemory address. The
+/// caller must still verify that the returned range belongs to firmware-owned
+/// memory before reading it.
+///
+/// # Safety
+/// The caller must exclusively own PCI configuration-space access.
+pub unsafe fn intel_graphics_opregion_address(requester: u16) -> Option<u64> {
+    if requester != INTEL_GRAPHICS_REQUESTER
+        || unsafe { read_u16(0, 2, 0, 0) } != INTEL_VENDOR_ID
+        || unsafe { read_u8(0, 2, 0, 0x0b) } != 0x03
+    {
+        return None;
+    }
+    let address = u64::from(unsafe { read_u32(0, 2, 0, INTEL_GRAPHICS_ASLS) });
+    (address != 0 && address & 0xfff == 0).then_some(address)
 }
 
 fn intel_graphics_stolen_range_from_registers(
