@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000053 Mon Sep 17 00:00:00 2001
+From: tas0dev <156896971+tas0dev@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 09:40:00 +0900
+Subject: [PATCH] x86/mboot: arm GPU watchdog before readiness
+
+Hardware Domain readiness now depends on the userspace GPU renderer owning its
+control endpoint.  The renderer watchdog was still armed only after that same
+readiness transition, so it could never report a renderer which failed to
+start.  Schedule it while readiness is waiting and do not postpone an already
+pending timeout on every retry.
+---
+ arch/x86/kernel/cpu/mboot.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+index 333333333333..444444444444 100644
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -3752,6 +3752,10 @@ static void mboot_ready_workfn(struct work_struct *work)
+ {
+ 	mboot_reprobe_display();
+ 	if (!mboot_display_backend_ready()) {
++		/* Do not reset the deadline on each 100 ms readiness retry. */
++		if (!READ_ONCE(mboot_gpu_open))
++			schedule_delayed_work(&mboot_gpu_watchdog_work,
++					      msecs_to_jiffies(5000));
+ 		/* The DRM framebuffer can appear before the userspace renderer has
+ 		 * completed EGL setup and its first KMS commit. */
+ 		mod_delayed_work(system_wq, &mboot_ready_work,
+@@ -3765,8 +3769,6 @@ static void mboot_ready_workfn(struct work_struct *work)
+ 		pr_err("mDriver: hardware backend startup failed\n");
+ 		return;
+ 	}
+-	mod_delayed_work(system_wq, &mboot_gpu_watchdog_work,
+-			 msecs_to_jiffies(10000));
+ }
+ 
+ static int mboot_fb_event(struct notifier_block *notifier,
+-- 
+2.43.0

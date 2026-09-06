@@ -349,7 +349,7 @@ static void hold_drm_failure(struct renderer *renderer, unsigned int stage)
     }
 }
 
-static int initialize_dumb_buffer(struct renderer *renderer)
+static int initialize_dumb_scanout(struct renderer *renderer)
 {
     struct drm_mode_create_dumb create = {
         .width = renderer->mode.hdisplay,
@@ -381,9 +381,13 @@ static int initialize_dumb_buffer(struct renderer *renderer)
     }
     dumb_rect(renderer, 0, 0, create.width, create.height, 0x00c8c8c8);
     msync(renderer->fallback.pixels, renderer->fallback.size, MS_SYNC);
-    /* Do not replace the working fbdev scanout yet.  This buffer is only an
-     * emergency target after the GPU renderer has taken display ownership. */
-    return 0;
+    /* Establish a known-good KMS target before EGL takes over.  Native DRM
+     * drivers may already have removed the firmware framebuffer by now, so
+     * leaving the CRTC without an explicit replacement produces an
+     * unobservable black gap when userspace initialization fails. */
+    return drmModeSetCrtc(renderer->drm_fd, renderer->crtc_id,
+                          renderer->fallback.id, 0, 0,
+                          &renderer->connector_id, 1, &renderer->mode);
 }
 
 static GLuint compile_shader(GLenum type, const char *source)
@@ -833,7 +837,7 @@ int main(void)
             report_gpu_failure(failure_stage);
         poll(NULL, 0, 100);
     }
-    if (initialize_dumb_buffer(&renderer)) {
+    if (initialize_dumb_scanout(&renderer)) {
         dprintf(2, "mDriver GPU: diagnostic buffer failed errno=%d\n", errno);
         hold_fb_failure(0x10);
     }
