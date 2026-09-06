@@ -24,7 +24,7 @@ MOCHIOS_SYSTEM_INPUTS := $(shell find $(MOCHIOS_SYSTEM_DIR)/src $(MOCHIOS_SYSTEM
 IMAGE_INPUTS := $(MBOOT_INPUTS) $(MNU_INPUTS) $(MOCHIOS_SYSTEM_INPUTS) $(CONFIG) \
 	$(wildcard $(MDRIVER_KERNEL) $(MDRIVER_INITRAMFS) $(MOCHIOS_INITFS) $(MOCHIOS_ROOTFS))
 
-.PHONY: all build clean device-io-test mdriver-test help image image-test qemu-test setup test watchdog-image watchdog-test
+.PHONY: all build clean device-io-test mdriver-test help image image-test qemu-test setup test
 .PHONY: hv-build hv-device-io-test hv-mdriver-test hv-image hv-image-test hv-qemu-test hv-test
 
 all: image
@@ -98,17 +98,6 @@ qemu-test:
 	RING_BOOTSTRAP_DOMAIN_ELF="$(MOCHIOS_SYSTEM_DIR)/target/x86_64-unknown-none/release/ring-bootstrap" \
 	MBOOT_LAUNCH_MANIFEST="$(OUTPUT_DIR)/launch.manifest" scripts/test-qemu.sh
 
-watchdog-image:
-	MBOOT_EXTRA_FEATURES=watchdog-reset-test $(MAKE) image \
-		CONFIG="$(CURDIR)/config/qemu.toml" \
-		OUTPUT_DIR="$(OUTPUT_DIR)/watchdog" \
-		IMAGE="$(OUTPUT_DIR)/watchdog/mochiOS.img" \
-		PXE_DIR="$(OUTPUT_DIR)/watchdog/pxe" \
-		UEFI_NET_DIR="$(OUTPUT_DIR)/watchdog/uefi-net"
-
-watchdog-test: watchdog-image
-	HV_DISK_IMAGE="$(OUTPUT_DIR)/watchdog/mochiOS.img" scripts/test-watchdog.sh
-
 clean:
 	rm -rf "$(OUTPUT_DIR)"
 	rm -f "$(SETUP_STAMP)"
@@ -130,5 +119,3 @@ help:
 	@echo '  make qemu-test         Test scheduling and Domain recovery with QEMU'
 	@echo '  make device-io-test    Test PCI, DMA, IOMMU, and interrupt routing'
 	@echo '  make mdriver-test Boot externally supplied mDriver artifacts'
-	@echo '  make watchdog-image    Build the watchdog reset proof image'
-	@echo '  make watchdog-test     Prove hardware watchdog reset under QEMU'

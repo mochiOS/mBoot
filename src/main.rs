@@ -27,7 +27,6 @@ use mboot::manifest::{
 use mboot::memory::{NestedPageResources, NestedPageTable};
 use mboot::pci;
 use mboot::scheduler::CooperativeScheduler;
-use mboot::watchdog::HardwareWatchdog;
 use mboot::{
     cpuid, image, BackendKind, CpuidResult, GuestBootMode, GuestConfig, Virtualization,
     VirtualizationResources, VmExitReason,
@@ -54,7 +53,7 @@ use uefi::proto::rng::Rng;
 #[cfg(feature = "uefi-net")]
 use uefi::table::boot::ScopedProtocol;
 use uefi::table::boot::{AllocateType, BootServices, MemoryType};
-use uefi::table::cfg::{ACPI2_GUID, ACPI_GUID};
+use uefi::table::cfg::{ACPI_GUID, ACPI2_GUID};
 #[cfg(feature = "uefi-net")]
 use uefi::CStr8;
 use uefi::CString16;
@@ -231,7 +230,11 @@ impl BootMemoryMap {
             let mut covered_until = cursor;
             for region in &self.regions[..self.len] {
                 let region_end = region.start.saturating_add(region.len);
-                if !region.usable && !region.mmio && cursor >= region.start && cursor < region_end {
+                if !region.usable
+                    && !region.mmio
+                    && cursor >= region.start
+                    && cursor < region_end
+                {
                     covered_until = covered_until.max(region_end.min(end));
                 }
             }
@@ -642,44 +645,14 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             );
         }
     }
-    let watchdog_timeout = if cfg!(feature = "watchdog-reset-test") {
-        4
-    } else {
-        120
-    };
-    // SAFETY: Firmware I/O has ended, mBoot exclusively owns PCI configuration
-    // space, and the UEFI identity map still covers assigned MMIO ranges.
-    let mut hardware_watchdog =
-        match unsafe { HardwareWatchdog::start(quarantine.inventory(), watchdog_timeout) } {
-            Ok(watchdog) => watchdog,
-            Err(error) => {
-                log!("hardware watchdog initialization failed: {:?}", error);
-                if cfg!(feature = "watchdog-reset-test") {
-                    halt_with_error("hardware watchdog", mboot::Error::InvalidState)
-                }
-                None
-            }
-        };
-    if let Some(watchdog) = hardware_watchdog.as_ref() {
-        log!(
-            "hardware watchdog active: {} timeout={}s",
-            watchdog.name(),
-            watchdog_timeout
-        );
-    } else {
-        log!("hardware watchdog unavailable");
-        if cfg!(feature = "watchdog-reset-test") {
-            halt_with_error("hardware watchdog", mboot::Error::InvalidState)
-        }
-    }
-    let mut watchdog_heartbeat_seen = false;
     // VT-d can retain only the firmware-declared GOP and stolen-memory ranges
     // while scanout remains active. AMD-Vi does not use that temporary Intel
     // context: quarantine its display until the Hardware Domain owns it.
     let deferred_display = quarantine.display_requester.filter(|requester| {
         !quarantine.active_requesters().contains(requester)
             && iommu_topology.is_some_and(|topology| {
-                topology.kind() == IommuKind::IntelVtd && topology.covers_requester(0, *requester)
+                topology.kind() == IommuKind::IntelVtd
+                    && topology.covers_requester(0, *requester)
             })
     });
     if let Some(requester) = deferred_display {
@@ -689,7 +662,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             requester >> 3 & 0x1f,
             requester & 7
         );
-        if let (Some(topology), Some(framebuffer)) = (iommu_topology.as_mut(), firmware_framebuffer)
+        if let (Some(topology), Some(framebuffer)) =
+            (iommu_topology.as_mut(), firmware_framebuffer)
         {
             let base = framebuffer.address & !0xfff;
             let Some(limit) = framebuffer
@@ -1204,9 +1178,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                         .guest_instruction_pointer()
                 }
                 .unwrap_or(0);
-                let (cr0, cr3) =
-                    unsafe { runtime_domains[index].virtualization.guest_paging_state() }
-                        .unwrap_or((0, 0));
+                let (cr0, cr3) = unsafe {
+                    runtime_domains[index]
+                        .virtualization
+                        .guest_paging_state()
+                }
+                .unwrap_or((0, 0));
                 let paging_state = (cr0 << 32) | (cr3 & u64::from(u32::MAX));
                 isolate_crashed_domain(
                     index,
@@ -1260,8 +1237,14 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 .interrupts
                 .read_msr(vm_exit.msr)
                 .ok()
-                .or_else(|| unsafe { runtime.virtualization.read_guest_msr(vm_exit.msr).ok() });
-            runtime.resume_kind = value.map_or(ResumeKind::GeneralProtection, ResumeKind::MsrRead);
+                .or_else(|| unsafe {
+                    runtime
+                        .virtualization
+                        .read_guest_msr(vm_exit.msr)
+                        .ok()
+                });
+            runtime.resume_kind =
+                value.map_or(ResumeKind::GeneralProtection, ResumeKind::MsrRead);
             continue;
         }
         if vm_exit.reason == VmExitReason::MsrWrite {
@@ -1438,7 +1421,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     runtime_domains[index]
                         .intel_graphics_opregion
                         .as_ref()
-                        .filter(|opregion| opregion.requester == requester && offset == 0xfc)
+                        .filter(|opregion| {
+                            opregion.requester == requester && offset == 0xfc
+                        })
                         .map(|opregion| opregion.guest_address)
                         .unwrap_or_else(|| {
                             unsafe { pci::config_read(requester, offset) }
@@ -1665,19 +1650,20 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             };
             let writable = flags & GRANT_FLAG_WRITABLE != 0;
             let valid_flags = flags & !GRANT_FLAG_WRITABLE == 0;
-            let host_page = if grant_window_contains_range(
-                runtime_domains[index].domain.nested_pages(),
-                source_page,
-                page_count,
-            ) && !grants.target_range_is_mapped(owner, source_page, page_count)
-            {
-                runtime_domains[index]
-                    .domain
-                    .nested_pages()
-                    .owned_page_host_address(source_page)
-            } else {
-                None
-            };
+            let host_page =
+                if grant_window_contains_range(
+                    runtime_domains[index].domain.nested_pages(),
+                    source_page,
+                    page_count,
+                ) && !grants.target_range_is_mapped(owner, source_page, page_count)
+                {
+                    runtime_domains[index]
+                        .domain
+                        .nested_pages()
+                        .owned_page_host_address(source_page)
+                } else {
+                    None
+                };
             runtime_domains[index].pending_result = match (target, host_page) {
                 (Some(target), Some(host_page)) if target_is_running && valid_flags => grants
                     .create_range(owner, target, host_page, page_count, writable)
@@ -1726,7 +1712,8 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                                 page_count,
                             )
                         })
-                }) {
+                })
+            {
                 reference.and_then(|reference| grants.map(target, reference, target_page).ok())
             } else {
                 None
@@ -1932,15 +1919,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     let result = if masked {
                         unsafe { pci_assignments.set_interrupt_mask(domain_id, vector, true) }
                             .and_then(|()| {
-                                runtime_domains[index]
-                                    .interrupts
-                                    .set_masked(vector, true)
+                                runtime_domains[index].interrupts.set_masked(vector, true)
                                     .map_err(|_| pci::PciError::InvalidState)
                             })
                     } else {
-                        runtime_domains[index]
-                            .interrupts
-                            .set_masked(vector, false)
+                        runtime_domains[index].interrupts.set_masked(vector, false)
                             .map_err(|_| pci::PciError::InvalidState)
                             .and_then(|()| unsafe {
                                 pci_assignments.set_interrupt_mask(domain_id, vector, false)
@@ -2089,37 +2072,6 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                         } else {
                             display::hardware_ready();
                         }
-                    }
-                    HYPERCALL_SUCCESS
-                }
-            }
-            number if number == HypercallNumber::WatchdogHeartbeat as u64 => {
-                if runtime.domain.role() != DomainRole::System
-                    || vm_exit.arg0 != 0
-                    || vm_exit.arg1 != 0
-                    || vm_exit.arg2 != 0
-                    || hardware_watchdog.is_none()
-                {
-                    HYPERCALL_INVALID_ARGUMENT
-                } else {
-                    // SAFETY: The device remains exclusively owned and mapped by
-                    // mBoot for the entire hypervisor lifetime.
-                    if unsafe {
-                        hardware_watchdog
-                            .as_mut()
-                            .expect("checked watchdog")
-                            .heartbeat()
-                    }
-                    .is_err()
-                    {
-                        halt_with_error("hardware watchdog", mboot::Error::InvalidState)
-                    }
-                    if !watchdog_heartbeat_seen {
-                        watchdog_heartbeat_seen = true;
-                        log!(
-                            "hardware watchdog heartbeat accepted from System Domain {}",
-                            runtime.domain.id().get()
-                        );
                     }
                     HYPERCALL_SUCCESS
                 }
@@ -2632,10 +2584,13 @@ fn claim_pci_device(
             return false;
         }
     };
-    if descriptor.bars[..descriptor.bar_count].iter().any(|bar| {
-        bar.host_page_range()
-            .is_none_or(|(start, len)| !memory_map.allows_device_mmio(start, len))
-    }) {
+    if descriptor.bars[..descriptor.bar_count]
+        .iter()
+        .any(|bar| {
+            bar.host_page_range()
+                .is_none_or(|(start, len)| !memory_map.allows_device_mmio(start, len))
+        })
+    {
         log!("PCI requester {:04x} exposed an unsafe MMIO BAR", requester);
         display::mdriver_claim_failure(requester, b"MMIO ERROR");
         return false;
@@ -2679,14 +2634,26 @@ fn claim_pci_device(
     let mut mapped_count = 0;
     for bar in bars.iter().filter(|bar| bar.length != 0) {
         let Some((guest_start, mapped_len)) = bar.guest_page_range() else {
-            if !rollback_pci_mapping(index, runtime_domains, assignments, requester, mapped_bars) {
+            if !rollback_pci_mapping(
+                index,
+                runtime_domains,
+                assignments,
+                requester,
+                mapped_bars,
+            ) {
                 halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
             }
             display::mdriver_claim_failure(requester, b"EPT RANGE ERROR");
             return false;
         };
         let Some((host_start, _)) = bar.host_page_range() else {
-            if !rollback_pci_mapping(index, runtime_domains, assignments, requester, mapped_bars) {
+            if !rollback_pci_mapping(
+                index,
+                runtime_domains,
+                assignments,
+                requester,
+                mapped_bars,
+            ) {
                 halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
             }
             display::mdriver_claim_failure(requester, b"EPT RANGE ERROR");
@@ -2700,7 +2667,13 @@ fn claim_pci_device(
         }
         .is_err()
         {
-            if !rollback_pci_mapping(index, runtime_domains, assignments, requester, mapped_bars) {
+            if !rollback_pci_mapping(
+                index,
+                runtime_domains,
+                assignments,
+                requester,
+                mapped_bars,
+            ) {
                 halt_with_error("PCI mapping rollback", mboot::Error::InvalidState)
             }
             display::mdriver_claim_failure(requester, b"EPT ERROR");
@@ -2782,8 +2755,7 @@ fn claim_pci_device(
         .domain
         .nested_pages()
         .guest_memory_size();
-    if let Err(error) = unsafe { remapper.assign(0, requester, domain_id, guest_base, guest_size) }
-    {
+    if let Err(error) = unsafe { remapper.assign(0, requester, domain_id, guest_base, guest_size) } {
         log!(
             "PCI requester {:04x} DMA mapping failed for Domain {}: {:?}",
             requester,
@@ -2950,7 +2922,13 @@ fn prepare_intel_graphics_opregion(
     image.resize(pci::INTEL_GRAPHICS_OPREGION_SIZE as usize, 0);
     // SAFETY: The firmware memory map contains this complete reserved range and
     // mBoot retains the boot-time identity mapping after ExitBootServices.
-    unsafe { copy_nonoverlapping(host_address as *const u8, image.as_mut_ptr(), image.len()) };
+    unsafe {
+        copy_nonoverlapping(
+            host_address as *const u8,
+            image.as_mut_ptr(),
+            image.len(),
+        )
+    };
     if image.get(..16) != Some(b"IntelGraphicsMem") {
         log!(
             "Intel graphics OpRegion at {:#x} has an invalid signature",
@@ -3032,7 +3010,9 @@ fn copy_external_intel_vbt(
     let Some(guest_end) = guest_offset.checked_add(rvds) else {
         return false;
     };
-    if guest_end > DEVICE_WINDOW_BYTES || !memory_map.contains_firmware_memory(host_vbt, rvds) {
+    if guest_end > DEVICE_WINDOW_BYTES
+        || !memory_map.contains_firmware_memory(host_vbt, rvds)
+    {
         log!(
             "Intel graphics external VBT rejected: host={:#x} offset={:#x} size={}",
             host_vbt,
@@ -3063,7 +3043,8 @@ fn copy_external_intel_vbt(
     }
     if !relative {
         let guest_vbt = guest_opregion + guest_offset as u64;
-        image[ASLE_RVDA_OFFSET..ASLE_RVDA_OFFSET + 8].copy_from_slice(&guest_vbt.to_le_bytes());
+        image[ASLE_RVDA_OFFSET..ASLE_RVDA_OFFSET + 8]
+            .copy_from_slice(&guest_vbt.to_le_bytes());
     }
     log!(
         "Intel graphics external VBT copied: guest={:#x} size={} version={}.{}",
@@ -3076,21 +3057,21 @@ fn copy_external_intel_vbt(
 }
 
 fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        bytes.get(offset..offset + 4)?.try_into().ok()?,
-    ))
+    Some(u32::from_le_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?))
 }
 
 fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(
-        bytes.get(offset..offset + 8)?.try_into().ok()?,
-    ))
+    Some(u64::from_le_bytes(bytes.get(offset..offset + 8)?.try_into().ok()?))
 }
 
-fn install_intel_graphics_opregion(memory: &NestedPageTable, opregion: &IntelGraphicsOpRegion) {
-    let Some(destination) =
-        memory.guest_host_address(opregion.guest_address, opregion.image.len() as u64)
-    else {
+fn install_intel_graphics_opregion(
+    memory: &NestedPageTable,
+    opregion: &IntelGraphicsOpRegion,
+) {
+    let Some(destination) = memory.guest_host_address(
+        opregion.guest_address,
+        opregion.image.len() as u64,
+    ) else {
         halt_with_error("Intel graphics OpRegion", mboot::Error::InvalidPage)
     };
     // SAFETY: The Domain is stopped and the Device Window is reserved from all
@@ -3116,7 +3097,11 @@ fn domain_stack_pointer(memory: &NestedPageTable) -> u64 {
     device_window_start(memory) - 16
 }
 
-fn grant_window_contains_range(memory: &NestedPageTable, guest_page: u64, page_count: u32) -> bool {
+fn grant_window_contains_range(
+    memory: &NestedPageTable,
+    guest_page: u64,
+    page_count: u32,
+) -> bool {
     guest_page & 0xfff == 0
         && page_count != 0
         && guest_page >= grant_window_start(memory)

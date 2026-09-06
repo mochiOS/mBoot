@@ -14,7 +14,6 @@ pub mod manifest;
 pub mod memory;
 pub mod pci;
 pub mod scheduler;
-pub mod watchdog;
 
 use arch::x86_64::{cpu, svm, vmx};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

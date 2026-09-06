@@ -92,12 +92,7 @@ struct IntelVtdCapabilities {
 }
 
 impl IntelVtdCapabilities {
-    fn decode(
-        version: u32,
-        capability: u64,
-        extended: u64,
-        dmar_host_width: u8,
-    ) -> Result<Self, Error> {
+    fn decode(version: u32, capability: u64, extended: u64, dmar_host_width: u8) -> Result<Self, Error> {
         let major = ((version >> 4) & 0xf) as u8;
         let minor = (version & 0xf) as u8;
         // mBoot currently implements legacy root/context tables and register
@@ -110,7 +105,8 @@ impl IntelVtdCapabilities {
         // SAGAW selects the page-table format. MGAW independently limits the
         // addresses software may place in that format; hardware may support a
         // four-level (48-bit adjusted) table while reporting a 39-bit MGAW.
-        if !(30..=64).contains(&maximum_guest_address_width) || !(1..=64).contains(&dmar_host_width)
+        if !(30..=64).contains(&maximum_guest_address_width)
+            || !(1..=64).contains(&dmar_host_width)
         {
             return Err(Error::UnsupportedHardware);
         }
@@ -144,7 +140,8 @@ impl IntelVtdCapabilities {
         let Some(last) = base.checked_add(size.saturating_sub(1)) else {
             return false;
         };
-        self.maximum_host_address_width == 64 || last < (1_u64 << self.maximum_host_address_width)
+        self.maximum_host_address_width == 64
+            || last < (1_u64 << self.maximum_host_address_width)
     }
 
     fn accepts_guest_range(self, base: u64, size: u64) -> bool {
@@ -154,7 +151,8 @@ impl IntelVtdCapabilities {
         let Some(last) = base.checked_add(size - 1) else {
             return false;
         };
-        self.maximum_guest_address_width == 64 || last < (1_u64 << self.maximum_guest_address_width)
+        self.maximum_guest_address_width == 64
+            || last < (1_u64 << self.maximum_guest_address_width)
     }
 }
 
@@ -286,10 +284,9 @@ impl IommuTopology {
         if self.kind == IommuKind::AmdVi {
             return true;
         }
-        let has_explicit = self
-            .units()
-            .iter()
-            .any(|candidate| candidate.segment == segment && candidate.covers_requester(requester));
+        let has_explicit = self.units().iter().any(|candidate| {
+            candidate.segment == segment && candidate.covers_requester(requester)
+        });
         if has_explicit {
             unit.covers_requester(requester)
         } else {
@@ -298,7 +295,8 @@ impl IommuTopology {
     }
 
     pub fn covers_requester(&self, segment: u16, requester: u16) -> bool {
-        (0..self.unit_count).any(|index| self.unit_handles_requester(index, segment, requester))
+        (0..self.unit_count)
+            .any(|index| self.unit_handles_requester(index, segment, requester))
     }
 
     fn push(&mut self, unit: IommuUnit) -> Result<(), Error> {
@@ -323,8 +321,8 @@ impl IommuTopology {
         let mut index = 0;
         while index < self.reserved_mapping_count {
             let known = self.reserved_mappings[index];
-            let same_requester =
-                known.segment == merged.segment && known.requester == merged.requester;
+            let same_requester = known.segment == merged.segment
+                && known.requester == merged.requester;
             let touches = known.base <= merged.limit.saturating_add(1)
                 && merged.base <= known.limit.saturating_add(1);
             if same_requester && touches {
@@ -516,8 +514,9 @@ impl DmaRemapper {
         {
             validate_resources(topology.kind, resource)?;
             let deferred = topology.kind == IommuKind::IntelVtd
-                && deferred_requester
-                    .is_some_and(|requester| topology.unit_handles_requester(index, 0, requester));
+                && deferred_requester.is_some_and(|requester| {
+                    topology.unit_handles_requester(index, 0, requester)
+                });
             if deferred {
                 remapper.units[index].resources = resource;
                 continue;
@@ -625,7 +624,9 @@ impl DmaRemapper {
                     }
                     has_reserved_mapping = true;
                     if mapping.base < size {
-                        let _ = unsafe { self.detach(segment, requester, u32::from(domain_id)) };
+                        let _ = unsafe {
+                            self.detach(segment, requester, u32::from(domain_id))
+                        };
                         return Err(Error::ReservedDevice);
                     }
                     if let Err(error) = unsafe {
@@ -638,7 +639,9 @@ impl DmaRemapper {
                                 .is_some_and(|capabilities| capabilities.supports_2m_pages),
                         )
                     } {
-                        let _ = unsafe { self.detach(segment, requester, u32::from(domain_id)) };
+                        let _ = unsafe {
+                            self.detach(segment, requester, u32::from(domain_id))
+                        };
                         return Err(error);
                     }
                 }
@@ -875,7 +878,12 @@ pub unsafe fn enable_deny_all(
     if table_addresses.len() != topology.unit_count {
         return Err(Error::InvalidResources);
     }
-    for (index, (unit, table_address)) in topology.units().iter().zip(table_addresses).enumerate() {
+    for (index, (unit, table_address)) in topology
+        .units()
+        .iter()
+        .zip(table_addresses)
+        .enumerate()
+    {
         if topology.kind == IommuKind::IntelVtd
             && deferred_requester
                 .is_some_and(|requester| topology.unit_handles_requester(index, 0, requester))
@@ -959,8 +967,16 @@ unsafe fn enable_intel_protection_with_progress(
     // SAFETY: GSTS is readable while the unit processes the disable command.
     unsafe {
         wait_intel_status(unit.register_base, INTEL_TRANSLATION_ENABLE, false)?;
-        wait_intel_status(unit.register_base, INTEL_QUEUED_INVALIDATION_ENABLE, false)?;
-        wait_intel_status(unit.register_base, INTEL_INTERRUPT_REMAP_ENABLE, false)?;
+        wait_intel_status(
+            unit.register_base,
+            INTEL_QUEUED_INVALIDATION_ENABLE,
+            false,
+        )?;
+        wait_intel_status(
+            unit.register_base,
+            INTEL_INTERRUPT_REMAP_ENABLE,
+            false,
+        )?;
         clear_intel_fault_records(unit, capability)?;
         flush_intel_write_buffer(unit, capability, 0, progress)?;
         progress(IntelTransitionStage::Root);
@@ -1036,10 +1052,23 @@ unsafe fn replace_intel_protection(
             INTEL_GLOBAL_COMMAND,
             INTEL_TRANSLATION_ENABLE,
         );
-        wait_intel_status(unit.register_base, INTEL_QUEUED_INVALIDATION_ENABLE, false)?;
-        wait_intel_status(unit.register_base, INTEL_INTERRUPT_REMAP_ENABLE, false)?;
+        wait_intel_status(
+            unit.register_base,
+            INTEL_QUEUED_INVALIDATION_ENABLE,
+            false,
+        )?;
+        wait_intel_status(
+            unit.register_base,
+            INTEL_INTERRUPT_REMAP_ENABLE,
+            false,
+        )?;
         clear_intel_fault_records(unit, capability)?;
-        flush_intel_write_buffer(unit, capability, INTEL_TRANSLATION_ENABLE, progress)?;
+        flush_intel_write_buffer(
+            unit,
+            capability,
+            INTEL_TRANSLATION_ENABLE,
+            progress,
+        )?;
 
         progress(IntelTransitionStage::Root);
         mmio_write_u64(unit.register_base, INTEL_ROOT_TABLE_ADDRESS, root_table);
@@ -1106,9 +1135,14 @@ unsafe fn disable_intel_protected_memory(
     wait_intel_protected_memory_status(unit, false)
 }
 
-unsafe fn wait_intel_protected_memory_status(unit: &IommuUnit, enabled: bool) -> Result<(), Error> {
+unsafe fn wait_intel_protected_memory_status(
+    unit: &IommuUnit,
+    enabled: bool,
+) -> Result<(), Error> {
     for _ in 0..REGISTER_WAIT_LIMIT {
-        let value = unsafe { mmio_read_u32(unit.register_base, INTEL_PROTECTED_MEMORY_ENABLE) };
+        let value = unsafe {
+            mmio_read_u32(unit.register_base, INTEL_PROTECTED_MEMORY_ENABLE)
+        };
         if (value & INTEL_PROTECTED_MEMORY_STATUS != 0) == enabled {
             return Ok(());
         }
@@ -1162,7 +1196,8 @@ unsafe fn clear_intel_fault_records(unit: &IommuUnit, capability: u64) -> Result
 }
 
 unsafe fn ensure_intel_no_faults(unit: &IommuUnit) -> Result<(), Error> {
-    if unsafe { mmio_read_u32(unit.register_base, INTEL_FAULT_STATUS) } & INTEL_FAULT_STATUS_ERRORS
+    if unsafe { mmio_read_u32(unit.register_base, INTEL_FAULT_STATUS) }
+        & INTEL_FAULT_STATUS_ERRORS
         != 0
     {
         return Err(Error::RegisterWriteFailed);
@@ -1208,9 +1243,16 @@ unsafe fn invalidate_intel_caches_with_progress(
             capability >> 54 & 1 != 0,
             capability >> 55 & 1 != 0,
         );
-        mmio_write_u64(unit.register_base, command, invalidate);
+        mmio_write_u64(
+            unit.register_base,
+            command,
+            invalidate,
+        );
         wait_u64_clear(unit.register_base, command, INTEL_INVALIDATE_IOTLB)?;
-        if !intel_iotlb_global_invalidation_completed(mmio_read_u64(unit.register_base, command)) {
+        if !intel_iotlb_global_invalidation_completed(mmio_read_u64(
+            unit.register_base,
+            command,
+        )) {
             return Err(Error::RegisterWriteFailed);
         }
     }
@@ -1901,7 +1943,9 @@ pub unsafe fn discover(rsdp_address: u64) -> Result<Option<IommuTopology>, Error
         return Err(Error::InvalidRsdp);
     }
     let root = unsafe { acpi_table(root_address)? };
-    if &root[..4] != root_signature || !(root.len() - ACPI_HEADER_SIZE).is_multiple_of(entry_size) {
+    if &root[..4] != root_signature
+        || !(root.len() - ACPI_HEADER_SIZE).is_multiple_of(entry_size)
+    {
         return Err(Error::InvalidTable);
     }
     for entry in root[ACPI_HEADER_SIZE..].chunks_exact(entry_size) {
@@ -2525,14 +2569,20 @@ mod tests {
         let root = base;
 
         unsafe {
-            map_domain_reserved_identity(&mut runtime, root, 0x2000_0000, 0x201f_ffff, false)
-                .unwrap()
+            map_domain_reserved_identity(
+                &mut runtime,
+                root,
+                0x2000_0000,
+                0x201f_ffff,
+                false,
+            )
+            .unwrap()
         };
 
         let level3 = unsafe { read_volatile(root as *const u64) } & 0x000f_ffff_ffff_f000;
         let level2 = unsafe { read_volatile(level3 as *const u64) } & 0x000f_ffff_ffff_f000;
-        let level1 =
-            unsafe { read_volatile((level2 + 0x100 * 8) as *const u64) } & 0x000f_ffff_ffff_f000;
+        let level1 = unsafe { read_volatile((level2 + 0x100 * 8) as *const u64) }
+            & 0x000f_ffff_ffff_f000;
         assert_ne!(level1, 0);
         assert_eq!(unsafe { read_volatile(level1 as *const u64) }, 0x2000_0003);
     }

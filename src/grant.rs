@@ -339,7 +339,9 @@ mod tests {
         let mut table = GrantTable::new();
         let owner = DomainId::new(1);
         let target = DomainId::new(2);
-        let reference = table.create_range(owner, target, 0x8000, 3, true).unwrap();
+        let reference = table
+            .create_range(owner, target, 0x8000, 3, true)
+            .unwrap();
         let mapping = table.map(target, reference, 0x20_000).unwrap();
         assert_eq!(mapping.page_count, 3);
         assert!(table.target_page_is_mapped(target, 0x21_000));
