@@ -138,7 +138,8 @@ static void fb_hex_digit(uint8_t *pixels, const struct fb_fix_screeninfo *fixed,
     if (enabled & 0x40) fb_rect(pixels, fixed, variable, x + scale, y + scale * 3, scale * 3, scale, color);
 }
 
-static void report_gpu_failure(unsigned int stage)
+static void report_fb_status(unsigned int stage, uint8_t red, uint8_t green,
+                             uint8_t blue)
 {
     struct fb_fix_screeninfo fixed;
     struct fb_var_screeninfo variable;
@@ -157,7 +158,7 @@ static void report_gpu_failure(unsigned int stage)
         close(fd);
         return;
     }
-    uint32_t background = fb_color(&variable, 180, 24, 38);
+    uint32_t background = fb_color(&variable, red, green, blue);
     uint32_t foreground = fb_color(&variable, 255, 255, 255);
     fb_rect(pixels, &fixed, &variable, 0, 0, variable.xres, variable.yres, background);
     uint32_t scale = variable.xres < variable.yres ? variable.xres / 32 : variable.yres / 18;
@@ -173,10 +174,23 @@ static void report_gpu_failure(unsigned int stage)
     close(fd);
 }
 
+static void report_gpu_failure(unsigned int stage)
+{
+    report_fb_status(stage, 180, 24, 38);
+}
+
 static void hold_fb_failure(unsigned int stage)
 {
     for (;;) {
         report_gpu_failure(stage);
+        poll(NULL, 0, 1000);
+    }
+}
+
+static void hold_fb_success(unsigned int stage)
+{
+    for (;;) {
+        report_fb_status(stage, 24, 140, 82);
         poll(NULL, 0, 1000);
     }
 }
@@ -692,6 +706,43 @@ static uint32_t framebuffer_for_bo(struct renderer *renderer, struct gbm_bo *bo)
     return framebuffer->id;
 }
 
+/* Verify the complete hardware-rendering path without changing the active
+ * CRTC.  This leaves the kernel framebuffer visible, so a physical machine
+ * can report exactly whether failure happens before or during KMS handoff. */
+static void diagnose_before_kms(struct renderer *renderer)
+{
+    GLubyte sample[4] = { 0 };
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, renderer->width, renderer->height);
+    glDisable(GL_BLEND);
+    glClearColor(200.0f / 255.0f, 200.0f / 255.0f, 200.0f / 255.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glReadPixels(renderer->width / 2, renderer->height / 2, 1, 1,
+                 GL_RGBA, GL_UNSIGNED_BYTE, sample);
+    if (glGetError() != GL_NO_ERROR ||
+        sample[0] < 190 || sample[0] > 210 ||
+        sample[1] < 190 || sample[1] > 210 ||
+        sample[2] < 190 || sample[2] > 210)
+        hold_fb_failure(0xd1);
+
+    glFinish();
+    if (glGetError() != GL_NO_ERROR)
+        hold_fb_failure(0xd2);
+    if (!eglSwapBuffers(renderer->egl_display, renderer->egl_surface))
+        hold_fb_failure(0xd3);
+
+    struct gbm_bo *bo = gbm_surface_lock_front_buffer(renderer->surface);
+    if (!bo)
+        hold_fb_failure(0xd4);
+    if (!framebuffer_for_bo(renderer, bo))
+        hold_fb_failure(0xd5);
+
+    /* D5 on green means rendering, swap, BO export and framebuffer creation
+     * all worked.  No drmModeSetCrtc or page flip has happened in this mode. */
+    hold_fb_success(0xd5);
+}
+
 static int show_frame(struct renderer *renderer)
 {
     /* Do not hand KMS a buffer until rendering into it has completed. */
@@ -838,6 +889,15 @@ int main(void)
         if (wait_cycles >= 50 && wait_cycles % 10 == 0)
             report_gpu_failure(failure_stage);
         poll(NULL, 0, 100);
+    }
+    if (getenv("MDRIVER_GPU_DIAG_PRE_KMS")) {
+        failure_stage = initialize_gl(&renderer);
+        if (failure_stage) {
+            dprintf(2, "mDriver GPU: initialization failed stage=%02x errno=%d\n",
+                    failure_stage, errno);
+            hold_fb_failure(failure_stage);
+        }
+        diagnose_before_kms(&renderer);
     }
     if (initialize_dumb_scanout(&renderer)) {
         dprintf(2, "mDriver GPU: diagnostic buffer failed errno=%d\n", errno);
