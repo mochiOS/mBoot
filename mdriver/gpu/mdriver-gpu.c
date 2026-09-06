@@ -472,18 +472,12 @@ static int initialize_gl(struct renderer *renderer)
     renderer->gbm = gbm_create_device(renderer->drm_fd);
     if (!renderer->gbm)
         return 0x03;
-    /* An explicit linear scanout avoids relying on implicit modifier state
-     * when a GBM buffer is handed to legacy KMS.  Keep the generic path for
-     * drivers which cannot render to a linear scanout buffer. */
-    static const uint64_t scanout_modifiers[] = { DRM_FORMAT_MOD_LINEAR };
-    renderer->surface = gbm_surface_create_with_modifiers(
+    /* Let Mesa and the physical DRM driver agree on a renderable scanout
+     * layout.  Forcing a linear modifier here can yield a valid KMS
+     * framebuffer whose GPU writes are not visible on Intel hardware. */
+    renderer->surface = gbm_surface_create(
         renderer->gbm, renderer->mode.hdisplay, renderer->mode.vdisplay,
-        GBM_FORMAT_XRGB8888, scanout_modifiers,
-        ARRAY_LEN(scanout_modifiers));
-    if (!renderer->surface)
-        renderer->surface = gbm_surface_create(
-            renderer->gbm, renderer->mode.hdisplay, renderer->mode.vdisplay,
-            GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+        GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
     if (!renderer->surface)
         return 0x04;
     renderer->egl_display = eglGetDisplay((EGLNativeDisplayType)renderer->gbm);
@@ -741,6 +735,8 @@ static int show_frame(struct renderer *renderer)
 
 static int show_startup_frame(struct renderer *renderer)
 {
+    GLubyte sample[4] = { 0 };
+
     /* Exercise the same EGL back buffer, GBM swap and KMS scanout used by
      * compositor scenes before publishing readiness. */
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -748,7 +744,13 @@ static int show_startup_frame(struct renderer *renderer)
     glDisable(GL_BLEND);
     glClearColor(200.0f / 255.0f, 200.0f / 255.0f, 200.0f / 255.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    glReadPixels(renderer->width / 2, renderer->height / 2, 1, 1,
+                 GL_RGBA, GL_UNSIGNED_BYTE, sample);
     if (glGetError() != GL_NO_ERROR)
+        return -EIO;
+    if (sample[0] < 190 || sample[0] > 210 ||
+        sample[1] < 190 || sample[1] > 210 ||
+        sample[2] < 190 || sample[2] > 210)
         return -EIO;
     return show_frame(renderer);
 }
