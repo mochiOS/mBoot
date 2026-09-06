@@ -77,17 +77,11 @@ struct renderer {
     EGLContext egl_context;
     EGLSurface egl_surface;
     GLuint scene_program;
-    GLuint copy_program;
-    GLuint framebuffer;
-    GLuint color_texture;
     GLuint vertex_buffer;
     GLint scene_position;
     GLint scene_uv;
     GLint scene_color;
     GLint scene_sampler;
-    GLint copy_position;
-    GLint copy_uv;
-    GLint copy_sampler;
     struct texture textures[MAX_TEXTURES];
     struct gbm_bo *front_bo;
     struct dumb_framebuffer fallback;
@@ -469,12 +463,6 @@ static int initialize_gl(struct renderer *renderer)
         "precision mediump float; varying vec2 v_uv; varying vec4 v_color;"
         "uniform sampler2D image; void main(){vec4 p=texture2D(image,v_uv);"
         "gl_FragColor=vec4(p.b,p.g,p.r,p.a)*v_color;}";
-    static const char copy_vertex[] =
-        "attribute vec2 position; attribute vec2 uv; varying vec2 v_uv;"
-        "void main(){gl_Position=vec4(position,0.0,1.0);v_uv=uv;}";
-    static const char copy_fragment[] =
-        "precision mediump float; varying vec2 v_uv; uniform sampler2D image;"
-        "void main(){gl_FragColor=texture2D(image,v_uv);}";
     EGLConfig config;
 
     renderer->gbm = gbm_create_device(renderer->drm_fd);
@@ -524,29 +512,13 @@ static int initialize_gl(struct renderer *renderer)
     dprintf(2, "mDriver GPU: renderer=%s\n", gpu_name);
 
     renderer->scene_program = make_program(scene_vertex, scene_fragment);
-    renderer->copy_program = make_program(copy_vertex, copy_fragment);
-    if (!renderer->scene_program || !renderer->copy_program)
+    if (!renderer->scene_program)
         return 0x0d;
     renderer->scene_position = glGetAttribLocation(renderer->scene_program, "position");
     renderer->scene_uv = glGetAttribLocation(renderer->scene_program, "uv");
     renderer->scene_color = glGetAttribLocation(renderer->scene_program, "color");
     renderer->scene_sampler = glGetUniformLocation(renderer->scene_program, "image");
-    renderer->copy_position = glGetAttribLocation(renderer->copy_program, "position");
-    renderer->copy_uv = glGetAttribLocation(renderer->copy_program, "uv");
-    renderer->copy_sampler = glGetUniformLocation(renderer->copy_program, "image");
     glGenBuffers(1, &renderer->vertex_buffer);
-    glGenFramebuffers(1, &renderer->framebuffer);
-    glGenTextures(1, &renderer->color_texture);
-    glBindTexture(GL_TEXTURE_2D, renderer->color_texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, renderer->mode.hdisplay,
-                 renderer->mode.vdisplay, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glBindFramebuffer(GL_FRAMEBUFFER, renderer->framebuffer);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                           renderer->color_texture, 0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-        return 0x0e;
     renderer->width = renderer->mode.hdisplay;
     renderer->height = renderer->mode.vdisplay;
     /* KMS page flips below provide the single frame-rate boundary. */
@@ -765,32 +737,13 @@ static int show_frame(struct renderer *renderer)
 
 static int show_startup_frame(struct renderer *renderer)
 {
-    static const GLfloat quad[] = {
-        -1, -1, 0, 0,  1, -1, 1, 0,  1, 1, 1, 1,
-        -1, -1, 0, 0,  1, 1, 1, 1, -1, 1, 0, 1,
-    };
-
-    /* Exercise the same offscreen texture, copy shader, GBM swap and KMS
-     * scanout used by real compositor scenes before publishing readiness. */
-    glBindFramebuffer(GL_FRAMEBUFFER, renderer->framebuffer);
+    /* Exercise the same EGL back buffer, GBM swap and KMS scanout used by
+     * compositor scenes before publishing readiness. */
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, renderer->width, renderer->height);
     glDisable(GL_BLEND);
     glClearColor(200.0f / 255.0f, 200.0f / 255.0f, 200.0f / 255.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glUseProgram(renderer->copy_program);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glEnableVertexAttribArray(renderer->copy_position);
-    glEnableVertexAttribArray(renderer->copy_uv);
-    glVertexAttribPointer(renderer->copy_position, 2, GL_FLOAT, GL_FALSE,
-                          4 * sizeof(GLfloat), quad);
-    glVertexAttribPointer(renderer->copy_uv, 2, GL_FLOAT, GL_FALSE,
-                          4 * sizeof(GLfloat), quad + 2);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, renderer->color_texture);
-    glUniform1i(renderer->copy_sampler, 0);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
     if (glGetError() != GL_NO_ERROR)
         return -EIO;
     return show_frame(renderer);
@@ -823,8 +776,15 @@ static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t 
     if (result)
         return result;
 
-    glBindFramebuffer(GL_FRAMEBUFFER, renderer->framebuffer);
+    /* The compositor submits a complete scene, so render it straight into the
+     * EGL back buffer which becomes the next KMS scanout.  An intermediate
+     * RGBA framebuffer and full-screen copy added a redundant GPU pass and
+     * could silently produce a black scanout on physical drivers. */
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, renderer->width, renderer->height);
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(renderer->scene_program);
     glBindBuffer(GL_ARRAY_BUFFER, renderer->vertex_buffer);
     glBufferData(GL_ARRAY_BUFFER, (size_t)vertex_count * VERTEX_STRIDE,
@@ -857,24 +817,6 @@ static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t 
         glDrawArrays(GL_TRIANGLES, first, count);
     }
 
-    static const GLfloat quad[] = {
-        -1, -1, 0, 0,  1, -1, 1, 0,  1, 1, 1, 1,
-        -1, -1, 0, 0,  1, 1, 1, 1, -1, 1, 0, 1,
-    };
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glDisable(GL_BLEND);
-    glUseProgram(renderer->copy_program);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glEnableVertexAttribArray(renderer->copy_position);
-    glEnableVertexAttribArray(renderer->copy_uv);
-    glVertexAttribPointer(renderer->copy_position, 2, GL_FLOAT, GL_FALSE,
-                          4 * sizeof(GLfloat), quad);
-    glVertexAttribPointer(renderer->copy_uv, 2, GL_FLOAT, GL_FALSE,
-                          4 * sizeof(GLfloat), quad + 2);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, renderer->color_texture);
-    glUniform1i(renderer->copy_sampler, 0);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
     if (glGetError() != GL_NO_ERROR)
         return -EIO;
     return show_frame(renderer);
