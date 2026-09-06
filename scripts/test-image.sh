@@ -56,6 +56,9 @@ cleanup() {
 trap cleanup EXIT
 cp "$OVMF_VARS" "$WORK/OVMF_VARS.fd"
 cp --sparse=always "$IMAGE" "$WORK/mochiOS.img"
+SERIAL_LOG=${HV_SERIAL_LOG:-"$WORK/serial.log"}
+mkdir -p "$(dirname "$SERIAL_LOG")"
+: > "$SERIAL_LOG"
 
 "$QEMU" \
     -accel "$ACCEL" \
@@ -70,7 +73,7 @@ cp --sparse=always "$IMAGE" "$WORK/mochiOS.img"
     -device virtio-blk-pci,drive=disk,bootindex=1 \
     -display none \
     -monitor none \
-    -serial "file:$WORK/serial.log" \
+    -serial "file:$SERIAL_LOG" \
     -net none \
     "${QEMU_GPU_ARGS[@]}" \
     -no-reboot \
@@ -87,43 +90,43 @@ fi
 for ((attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++)); do
     marker_ready=1
     if [[ -n $DESKTOP_MARKER ]] \
-        && ! grep -Fq "$DESKTOP_MARKER" "$WORK/serial.log" 2>/dev/null; then
+        && ! grep -Fq "$DESKTOP_MARKER" "$SERIAL_LOG" 2>/dev/null; then
         marker_ready=0
     fi
-    if grep -Fq "$expected" "$WORK/serial.log" 2>/dev/null \
+    if grep -Fq "$expected" "$SERIAL_LOG" 2>/dev/null \
         && { [[ $HARDWARE_BOOTSTRAP_ID == 0 ]] \
-            || grep -Fq "[mBoot] Hardware Domain $HARDWARE_BOOTSTRAP_ID ready" "$WORK/serial.log" 2>/dev/null; } \
+            || grep -Fq "[mBoot] Hardware Domain $HARDWARE_BOOTSTRAP_ID ready" "$SERIAL_LOG" 2>/dev/null; } \
         && [[ $marker_ready == 1 ]]; then
         break
     fi
     kill -0 "$QEMU_PID" 2>/dev/null || break
     sleep 0.1
 done
-grep -Fq "$expected" "$WORK/serial.log" || {
-    sed -n '1,200p' "$WORK/serial.log" >&2
+grep -Fq "$expected" "$SERIAL_LOG" || {
+    sed -n '1,200p' "$SERIAL_LOG" >&2
     echo "hypervisor image did not reach its expected Domain state" >&2
     exit 1
 }
 if [[ -n $DESKTOP_MARKER ]]; then
-    grep -Fq "$DESKTOP_MARKER" "$WORK/serial.log" || {
-        sed -n '1,260p' "$WORK/serial.log" >&2
+    grep -Fq "$DESKTOP_MARKER" "$SERIAL_LOG" || {
+        sed -n '1,260p' "$SERIAL_LOG" >&2
         echo "desktop marker was not reached: $DESKTOP_MARKER" >&2
         exit 1
     }
 fi
 if [[ $HARDWARE_BOOTSTRAP_ID != 0 ]]; then
-    grep -Fq "[mBoot] Hardware Domain $HARDWARE_BOOTSTRAP_ID ready" "$WORK/serial.log" || {
-        sed -n '1,200p' "$WORK/serial.log" >&2
+    grep -Fq "[mBoot] Hardware Domain $HARDWARE_BOOTSTRAP_ID ready" "$SERIAL_LOG" || {
+        sed -n '1,200p' "$SERIAL_LOG" >&2
         echo 'Hardware Domain did not query devices and become ready' >&2
         exit 1
     }
 fi
 if [[ $GPU_TEST == 1 ]]; then
-    grep -Eq '\[mBoot\].*(display|Display).*(Hardware Domain|Domain 2|handed off)|mboot-pci.*display' "$WORK/serial.log" || {
-        sed -n '1,240p' "$WORK/serial.log" >&2
+    grep -Eq '\[mBoot\].*(display|Display).*(Hardware Domain|Domain 2|handed off)|mboot-pci.*display' "$SERIAL_LOG" || {
+        sed -n '1,240p' "$SERIAL_LOG" >&2
         echo 'mDriver did not claim an automatically discovered display controller' >&2
         exit 1
     }
 fi
-grep -E '\[mBoot\]|\[Domain' "$WORK/serial.log"
+grep -E '\[mBoot\]|\[Domain' "$SERIAL_LOG"
 echo 'test-disk-image: PASS'
