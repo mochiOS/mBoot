@@ -179,6 +179,14 @@ static void report_gpu_failure(unsigned int stage)
     close(fd);
 }
 
+static void hold_fb_failure(unsigned int stage)
+{
+    for (;;) {
+        report_gpu_failure(stage);
+        poll(NULL, 0, 1000);
+    }
+}
+
 static uint16_t get_u16(const uint8_t *p)
 {
     return (uint16_t)p[0] | (uint16_t)p[1] << 8;
@@ -337,6 +345,14 @@ static void show_dumb_failure(struct renderer *renderer, unsigned int stage)
     drmModeSetCrtc(renderer->drm_fd, renderer->crtc_id,
                    renderer->fallback.id, 0, 0,
                    &renderer->connector_id, 1, &renderer->mode);
+}
+
+static void hold_drm_failure(struct renderer *renderer, unsigned int stage)
+{
+    for (;;) {
+        show_dumb_failure(renderer, stage);
+        poll(NULL, 0, 1000);
+    }
 }
 
 static int initialize_dumb_buffer(struct renderer *renderer)
@@ -870,33 +886,29 @@ int main(void)
     unsigned int failure_stage = 0x01;
     unsigned int wait_cycles = 0;
     while (open_drm(&renderer, &failure_stage)) {
-        if (++wait_cycles == 50)
+        wait_cycles++;
+        if (wait_cycles >= 50 && wait_cycles % 10 == 0)
             report_gpu_failure(failure_stage);
         poll(NULL, 0, 100);
     }
     if (initialize_dumb_buffer(&renderer)) {
         dprintf(2, "mDriver GPU: diagnostic buffer failed errno=%d\n", errno);
-        report_gpu_failure(0x10);
-        return 1;
+        hold_fb_failure(0x10);
     }
     failure_stage = initialize_gl(&renderer);
     if (failure_stage) {
         dprintf(2, "mDriver GPU: initialization failed stage=%02x errno=%d\n",
                 failure_stage, errno);
-        /* EGL has not produced a valid scanout yet.  Keep the current fbdev
-         * scanout instead of replacing it with the diagnostic dumb buffer. */
-        report_gpu_failure(failure_stage);
-        return 1;
+        hold_drm_failure(&renderer, failure_stage);
     }
     if (show_startup_frame(&renderer)) {
         dprintf(2, "mDriver GPU: startup scanout failed errno=%d\n", errno);
-        report_gpu_failure(0x0f);
-        return 1;
+        hold_drm_failure(&renderer, 0x0f);
     }
     int control = open("/dev/mboot-gpu", O_RDWR | O_CLOEXEC);
     if (control < 0) {
         dprintf(2, "mDriver GPU: control unavailable errno=%d\n", errno);
-        return 1;
+        hold_drm_failure(&renderer, 0x13);
     }
     dprintf(2, "mDriver GPU: hardware renderer ready\n");
     void *mapping = MAP_FAILED;
@@ -907,12 +919,11 @@ int main(void)
         if (received != sizeof(request)) {
             if (received < 0 && errno == EINTR)
                 continue;
-            break;
+            hold_drm_failure(&renderer, 0x14);
         }
         if (request.reserved || !request.scene_length ||
             request.scene_length > request.buffer_size) {
-            write_response(control, request.generation, -EINVAL);
-            continue;
+            hold_drm_failure(&renderer, 0x11);
         }
         if (mapping == MAP_FAILED || mapped_size != request.buffer_size) {
             if (mapping != MAP_FAILED)
@@ -923,9 +934,8 @@ int main(void)
         int status = mapping == MAP_FAILED ? -errno :
             render_scene(&renderer, mapping, request.scene_length);
         if (status)
-            show_dumb_failure(&renderer, status == -EINVAL ? 0x11 : 0x12);
+            hold_drm_failure(&renderer, status == -EINVAL ? 0x11 : 0x12);
         if (write_response(control, request.generation, status))
-            break;
+            hold_drm_failure(&renderer, 0x15);
     }
-    return 1;
 }
