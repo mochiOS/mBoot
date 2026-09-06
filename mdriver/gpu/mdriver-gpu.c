@@ -187,14 +187,6 @@ static void hold_fb_failure(unsigned int stage)
     }
 }
 
-static void hold_fb_success(unsigned int stage)
-{
-    for (;;) {
-        report_fb_status(stage, 24, 140, 82);
-        poll(NULL, 0, 1000);
-    }
-}
-
 static uint16_t get_u16(const uint8_t *p)
 {
     return (uint16_t)p[0] | (uint16_t)p[1] << 8;
@@ -330,12 +322,13 @@ static void dumb_hex_digit(struct renderer *renderer, uint32_t x, uint32_t y,
     if (enabled & 0x40) dumb_rect(renderer, x + scale, y + scale * 3, scale * 3, scale, color);
 }
 
-static void show_dumb_failure(struct renderer *renderer, unsigned int stage)
+static void show_dumb_status(struct renderer *renderer, unsigned int stage,
+                             uint32_t background)
 {
     if (!renderer->fallback.pixels)
         return;
     dumb_rect(renderer, 0, 0, renderer->mode.hdisplay, renderer->mode.vdisplay,
-              0x00b01828);
+              background);
     uint32_t scale = renderer->mode.hdisplay < renderer->mode.vdisplay ?
         renderer->mode.hdisplay / 32 : renderer->mode.vdisplay / 18;
     if (!scale)
@@ -355,10 +348,23 @@ static void show_dumb_failure(struct renderer *renderer, unsigned int stage)
                    &renderer->connector_id, 1, &renderer->mode);
 }
 
+static void show_dumb_failure(struct renderer *renderer, unsigned int stage)
+{
+    show_dumb_status(renderer, stage, 0x00b01828);
+}
+
 static void hold_drm_failure(struct renderer *renderer, unsigned int stage)
 {
     for (;;) {
         show_dumb_failure(renderer, stage);
+        poll(NULL, 0, 1000);
+    }
+}
+
+static void hold_drm_success(struct renderer *renderer, unsigned int stage)
+{
+    for (;;) {
+        show_dumb_status(renderer, stage, 0x00188c52);
         poll(NULL, 0, 1000);
     }
 }
@@ -724,23 +730,23 @@ static void diagnose_before_kms(struct renderer *renderer)
         sample[0] < 190 || sample[0] > 210 ||
         sample[1] < 190 || sample[1] > 210 ||
         sample[2] < 190 || sample[2] > 210)
-        hold_fb_failure(0xd1);
+        hold_drm_failure(renderer, 0xd1);
 
     glFinish();
     if (glGetError() != GL_NO_ERROR)
-        hold_fb_failure(0xd2);
+        hold_drm_failure(renderer, 0xd2);
     if (!eglSwapBuffers(renderer->egl_display, renderer->egl_surface))
-        hold_fb_failure(0xd3);
+        hold_drm_failure(renderer, 0xd3);
 
     struct gbm_bo *bo = gbm_surface_lock_front_buffer(renderer->surface);
     if (!bo)
-        hold_fb_failure(0xd4);
+        hold_drm_failure(renderer, 0xd4);
     if (!framebuffer_for_bo(renderer, bo))
-        hold_fb_failure(0xd5);
+        hold_drm_failure(renderer, 0xd5);
 
     /* D5 on green means rendering, swap, BO export and framebuffer creation
      * all worked.  No drmModeSetCrtc or page flip has happened in this mode. */
-    hold_fb_success(0xd5);
+    hold_drm_success(renderer, 0xd5);
 }
 
 static int show_frame(struct renderer *renderer)
@@ -890,18 +896,18 @@ int main(void)
             report_gpu_failure(failure_stage);
         poll(NULL, 0, 100);
     }
+    if (initialize_dumb_scanout(&renderer)) {
+        dprintf(2, "mDriver GPU: diagnostic buffer failed errno=%d\n", errno);
+        hold_fb_failure(0x10);
+    }
     if (getenv("MDRIVER_GPU_DIAG_PRE_KMS")) {
         failure_stage = initialize_gl(&renderer);
         if (failure_stage) {
             dprintf(2, "mDriver GPU: initialization failed stage=%02x errno=%d\n",
                     failure_stage, errno);
-            hold_fb_failure(failure_stage);
+            hold_drm_failure(&renderer, failure_stage);
         }
         diagnose_before_kms(&renderer);
-    }
-    if (initialize_dumb_scanout(&renderer)) {
-        dprintf(2, "mDriver GPU: diagnostic buffer failed errno=%d\n", errno);
-        hold_fb_failure(0x10);
     }
     failure_stage = initialize_gl(&renderer);
     if (failure_stage) {
