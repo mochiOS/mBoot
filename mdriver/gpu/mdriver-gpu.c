@@ -344,7 +344,8 @@ static int initialize_atomic_kms(struct renderer *renderer)
     drmModePlaneRes *planes = drmModeGetPlaneResources(renderer->drm_fd);
     if (!planes)
         return -1;
-    for (uint32_t index = 0; index < planes->count_planes && !kms->plane_id; index++) {
+    uint32_t available_primary = 0;
+    for (uint32_t index = 0; index < planes->count_planes; index++) {
         drmModePlane *plane = drmModeGetPlane(renderer->drm_fd, planes->planes[index]);
         uint64_t type = 0;
         if (!plane)
@@ -352,11 +353,21 @@ static int initialize_atomic_kms(struct renderer *renderer)
         if ((plane->possible_crtcs & (1u << renderer->crtc_index)) &&
             plane_supports_format(plane, DRM_FORMAT_XRGB8888) &&
             property_id(renderer->drm_fd, plane->plane_id, DRM_MODE_OBJECT_PLANE,
-                        "type", &type) && type == DRM_PLANE_TYPE_PRIMARY)
-            kms->plane_id = plane->plane_id;
+                        "type", &type) && type == DRM_PLANE_TYPE_PRIMARY) {
+            if (!available_primary)
+                available_primary = plane->plane_id;
+            /* i915 fbdev already has a working mode and scanout plane.  Keep
+             * that complete state and later replace only its FB_ID. */
+            if (plane->crtc_id == renderer->crtc_id && plane->fb_id) {
+                kms->plane_id = plane->plane_id;
+                kms->active = renderer->saved_crtc && renderer->saved_crtc->mode_valid;
+            }
+        }
         drmModeFreePlane(plane);
     }
     drmModeFreePlaneResources(planes);
+    if (!kms->plane_id)
+        kms->plane_id = available_primary;
     if (!kms->plane_id)
         return -1;
 
