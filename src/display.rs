@@ -128,7 +128,9 @@ pub fn present_firmware_frame(
                             0,
                         ]));
                 } else {
-                    framebuffer.add(destination).write_volatile(pixels[source + 2]);
+                    framebuffer
+                        .add(destination)
+                        .write_volatile(pixels[source + 2]);
                     framebuffer
                         .add(destination + 1)
                         .write_volatile(pixels[source + 1]);
@@ -259,10 +261,7 @@ pub fn nvme_candidates(first: (u16, u16, u16), second: (u16, u16, u16)) {
     draw_pci_identity(second, line_y(2));
 }
 
-pub fn storage_candidates(
-    first: Option<(u16, u16, u16, u8)>,
-    second: Option<(u16, u16, u16, u8)>,
-) {
+pub fn storage_candidates(first: Option<(u16, u16, u16, u8)>, second: Option<(u16, u16, u16, u8)>) {
     show(0x006B_2028, b"STORAGE", b"");
     let Some((requester, vendor, device, subclass)) = first else {
         draw_centered(b"NONE", line_y(1));

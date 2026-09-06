@@ -299,9 +299,7 @@ impl NestedPageTable {
         for index in 0..u64::from(page_count) {
             let offset = index.checked_mul(PAGE_SIZE).ok_or(Error::InvalidPage)?;
             unsafe {
-                self.restore_owned_page(
-                    guest_page.checked_add(offset).ok_or(Error::InvalidPage)?,
-                )?
+                self.restore_owned_page(guest_page.checked_add(offset).ok_or(Error::InvalidPage)?)?
             };
         }
         Ok(())

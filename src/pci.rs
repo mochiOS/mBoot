@@ -106,6 +106,60 @@ pub unsafe fn config_read(requester: u16, offset: u16) -> Result<u32, PciError> 
     Ok(unsafe { read_u32(bus, device, function, offset as u8) })
 }
 
+/// Writes one aligned PCI configuration dword through mechanism 1.
+///
+/// # Safety
+/// The caller must exclusively own PCI configuration-space access and must
+/// preserve every field outside the register it intends to change.
+pub unsafe fn config_write(requester: u16, offset: u16, value: u32) -> Result<(), PciError> {
+    if offset > 0xfc || offset & 3 != 0 {
+        return Err(PciError::InvalidState);
+    }
+    let bus = (requester >> 8) as u8;
+    let device = (requester >> 3 & 0x1f) as u8;
+    let function = (requester & 7) as u8;
+    unsafe { write_u32(bus, device, function, offset as u8, value) };
+    Ok(())
+}
+
+/// Reads one PCI configuration byte through mechanism 1.
+///
+/// # Safety
+/// The caller must exclusively own PCI configuration-space access.
+pub unsafe fn config_read_u8(requester: u16, offset: u16) -> Result<u8, PciError> {
+    if offset > 0xff {
+        return Err(PciError::InvalidState);
+    }
+    let (bus, device, function) = requester_parts(requester)?;
+    Ok(unsafe { read_u8(bus, device, function, offset as u8) })
+}
+
+/// Writes one PCI configuration byte through mechanism 1.
+///
+/// # Safety
+/// The caller must exclusively own PCI configuration-space access.
+pub unsafe fn config_write_u8(requester: u16, offset: u16, value: u8) -> Result<(), PciError> {
+    if offset > 0xff {
+        return Err(PciError::InvalidState);
+    }
+    let (bus, device, function) = requester_parts(requester)?;
+    unsafe { write_u8(bus, device, function, offset as u8, value) };
+    Ok(())
+}
+
+/// Writes one PCI configuration halfword through mechanism 1.
+///
+/// # Safety
+/// The caller must exclusively own PCI configuration-space access.
+pub unsafe fn config_write_u16(requester: u16, offset: u16, value: u16) -> Result<(), PciError> {
+    if offset > 0xfe || offset & 1 != 0 {
+        return Err(PciError::InvalidState);
+    }
+    let (bus, device, function) = requester_parts(requester)?;
+    unsafe { write_u16(bus, device, function, offset as u8, value) };
+    Ok(())
+}
+
 fn clear_bar_probe_failure() {
     BAR_FAILURE_VALID.store(0, Ordering::Release);
 }
@@ -136,7 +190,10 @@ fn memory_bar_layout(mask: u64) -> Option<(u64, u64)> {
         return None;
     }
     let implemented = mask >> shift;
-    if implemented.checked_add(1).is_none_or(|value| !value.is_power_of_two()) {
+    if implemented
+        .checked_add(1)
+        .is_none_or(|value| !value.is_power_of_two())
+    {
         return None;
     }
     let length = 1_u64.checked_shl(shift)?;
@@ -180,10 +237,7 @@ impl PciBar {
 fn page_range(address: u64, length: u64) -> Option<(u64, u64)> {
     const PAGE_MASK: u64 = 4095;
     let start = address & !PAGE_MASK;
-    let end = address
-        .checked_add(length)?
-        .checked_add(PAGE_MASK)?
-        & !PAGE_MASK;
+    let end = address.checked_add(length)?.checked_add(PAGE_MASK)? & !PAGE_MASK;
     (start != 0 && end > start).then_some((start, end - start))
 }
 
@@ -462,15 +516,12 @@ impl AssignmentTable {
         }) else {
             return Ok(());
         };
-        let vector_index = assignment.guest_vectors
-            [..usize::from(assignment.interrupt_count)]
+        let vector_index = assignment.guest_vectors[..usize::from(assignment.interrupt_count)]
             .iter()
             .position(|vector| *vector == guest_vector)
             .ok_or(PciError::InvalidState)?;
         match assignment.interrupt_mode.ok_or(PciError::InvalidState)? {
-            PciInterruptMode::Msi => unsafe {
-                set_msi_mask(&assignment.descriptor, masked)
-            },
+            PciInterruptMode::Msi => unsafe { set_msi_mask(&assignment.descriptor, masked) },
             PciInterruptMode::MsixShared | PciInterruptMode::MsixSplit => unsafe {
                 set_msix_mask(&assignment.descriptor, vector_index, masked)
             },
@@ -751,14 +802,7 @@ pub unsafe fn probe_descriptor(requester: u16) -> Result<PciDescriptor, PciError
                 u64::from(mask_low & !0xf)
             };
             let Some((length, address_mask)) = memory_bar_layout(mask) else {
-                record_bar_probe_failure(
-                    index,
-                    BAR_FAILURE_LENGTH,
-                    low,
-                    high,
-                    mask_low,
-                    mask_high,
-                );
+                record_bar_probe_failure(index, BAR_FAILURE_LENGTH, low, high, mask_low, mask_high);
                 return Err(PciError::InvalidBar);
             };
             if let Some(reason) = bar_failure_reason(address, length, address_mask) {
@@ -1113,7 +1157,10 @@ unsafe fn set_msix_mask(
     let entry_offset = table_offset
         .checked_add((vector_index * 16) as u64)
         .ok_or(PciError::InvalidBar)?;
-    if entry_offset.checked_add(16).is_none_or(|end| end > bar.length) {
+    if entry_offset
+        .checked_add(16)
+        .is_none_or(|end| end > bar.length)
+    {
         return Err(PciError::InvalidBar);
     }
     let vector_control = (bar.physical_address + entry_offset + 12) as *mut u32;
@@ -1397,8 +1444,7 @@ pub unsafe fn resume_firmware_display(requester: u16) -> Result<(), PciError> {
     let command = unsafe { read_u16(bus, device, function, 4) };
     let resumed = firmware_display_command(command);
     unsafe { write_u16(bus, device, function, 4, resumed) };
-    if unsafe { read_u16(bus, device, function, 4) }
-        & (COMMAND_MEMORY | COMMAND_BUS_MASTER)
+    if unsafe { read_u16(bus, device, function, 4) } & (COMMAND_MEMORY | COMMAND_BUS_MASTER)
         != (COMMAND_MEMORY | COMMAND_BUS_MASTER)
     {
         return Err(PciError::RegisterWriteFailed);
@@ -1463,6 +1509,14 @@ unsafe fn write_u16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
     let port = CONFIG_DATA + u16::from(offset & 2);
     // SAFETY: The selected PCI command halfword is writable through this port.
     unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) };
+}
+
+unsafe fn write_u8(bus: u8, device: u8, function: u8, offset: u8, value: u8) {
+    // SAFETY: Forwarded from this function's serialized configuration access.
+    unsafe { select(bus, device, function, offset) };
+    let port = CONFIG_DATA + u16::from(offset & 3);
+    // SAFETY: The selected PCI configuration byte is writable through this port.
+    unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) };
 }
 
 unsafe fn write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {

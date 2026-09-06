@@ -223,6 +223,11 @@ for my $domain (@{$config->{domains}}) {
 my $network_bundle = "$output_dir/mboot.bundle";
 write_network_bundle($network_bundle, \@network_files);
 
+my $extra_features = $ENV{MBOOT_EXTRA_FEATURES} // '';
+$extra_features =~ /^[a-z0-9,-]*$/
+    or die "MBOOT_EXTRA_FEATURES contains an invalid character\n";
+my $uefi_features = 'uefi-app';
+$uefi_features .= ",$extra_features" if length $extra_features;
 run_env(
     {
         MBOOT_LAUNCH_MANIFEST => $manifest,
@@ -230,7 +235,7 @@ run_env(
     },
     $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc,compiler_builtins',
     '--release', '--target', 'x86_64-unknown-uefi', '--target-dir', $target,
-    '--package', 'mboot', '--features', 'uefi-app',
+    '--package', 'mboot', '--features', $uefi_features,
     '--manifest-path', "$mboot_dir/Cargo.toml",
     '--config', qq{patch."https://github.com/mochiOS/mnu".mnu-abi.path="$mnu_abi"},
 );
@@ -238,6 +243,8 @@ my $efi = "$target/x86_64-unknown-uefi/release/mboot.efi";
 -s $efi or die "mBoot UEFI binary was not produced: $efi\n";
 
 if (defined $uefi_net_stage) {
+    my $uefi_net_features = 'uefi-app,uefi-net';
+    $uefi_net_features .= ",$extra_features" if length $extra_features;
     run_env(
         {
             MBOOT_LAUNCH_MANIFEST => $manifest,
@@ -245,7 +252,7 @@ if (defined $uefi_net_stage) {
         },
         $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc,compiler_builtins',
         '--release', '--target', 'x86_64-unknown-uefi', '--target-dir', $network_target,
-        '--package', 'mboot', '--features', 'uefi-app,uefi-net',
+        '--package', 'mboot', '--features', $uefi_net_features,
         '--manifest-path', "$mboot_dir/Cargo.toml",
         '--config', qq{patch."https://github.com/mochiOS/mnu".mnu-abi.path="$mnu_abi"},
     );

@@ -19,6 +19,7 @@ required-features = ["uefi-app"]
 default = []
 uefi-app = ["dep:uefi"]
 uefi-net = ["uefi-app"]
+watchdog-reset-test = []
 
 [dependencies]
 mnu-abi = { git = "https://github.com/mochiOS/mnu" }

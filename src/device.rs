@@ -188,8 +188,7 @@ impl DeviceTable {
     /// by its assigned display controller without assigning the bridge itself.
     pub fn can_read_config(&self, domain_id: u32, requester: u16) -> bool {
         self.record(requester).is_ok_and(|record| {
-            record.info.owner_domain == domain_id
-                || self.is_config_dependency(domain_id, requester)
+            record.info.owner_domain == domain_id || self.is_config_dependency(domain_id, requester)
         })
     }
 
@@ -259,9 +258,8 @@ impl DeviceTable {
     }
 
     pub fn is_firmware_deferred(&self, requester: u16) -> bool {
-        self.record(requester).is_ok_and(|record| {
-            record.info.state == PCI_DEVICE_STATE_FIRMWARE_DEFERRED
-        })
+        self.record(requester)
+            .is_ok_and(|record| record.info.state == PCI_DEVICE_STATE_FIRMWARE_DEFERRED)
     }
 
     pub fn can_release(&self, domain_id: u32, requester: u16) -> Result<(), DeviceError> {
@@ -321,12 +319,12 @@ impl DeviceTable {
 
     fn is_config_dependency(&self, domain_id: u32, requester: u16) -> bool {
         requester == 0
-            && self.record(requester).is_ok_and(|record| {
-                record.info.class == 0x06 && record.info.subclass == 0x00
-            })
-            && self.devices[..self.count].iter().any(|record| {
-                record.allowed_domain == domain_id && record.info.class == 0x03
-            })
+            && self
+                .record(requester)
+                .is_ok_and(|record| record.info.class == 0x06 && record.info.subclass == 0x00)
+            && self.devices[..self.count]
+                .iter()
+                .any(|record| record.allowed_domain == domain_id && record.info.class == 0x03)
     }
 }
 

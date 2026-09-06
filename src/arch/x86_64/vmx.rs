@@ -1025,10 +1025,7 @@ unsafe fn initialize_vmcs(config: GuestConfig) -> Result<(), Error> {
     let (pin, primary, secondary, exit, entry) = unsafe {
         (
             adjusted_vm_control(1, read_msr(pin_msr)),
-            adjusted_vm_control(
-                (1 << 7) | (1 << 28) | (1 << 31),
-                read_msr(primary_msr),
-            ),
+            adjusted_vm_control((1 << 7) | (1 << 28) | (1 << 31), read_msr(primary_msr)),
             adjusted_vm_control(
                 (1 << 1) | if pvh { 1 << 7 } else { 0 },
                 read_msr(IA32_VMX_PROCBASED_CTLS2),
@@ -1170,20 +1167,12 @@ unsafe fn initialize_guest_state(config: GuestConfig) -> Result<(), Error> {
         let cr0_fixed1 = read_msr(IA32_VMX_CR0_FIXED1);
         let cr4_fixed0 = read_msr(IA32_VMX_CR4_FIXED0);
         let cr4_fixed1 = read_msr(IA32_VMX_CR4_FIXED1);
-        let mut guest_cr0 = adjusted_control_register(
-            requested_cr0,
-            cr0_fixed0,
-            cr0_fixed1,
-        );
+        let mut guest_cr0 = adjusted_control_register(requested_cr0, cr0_fixed0, cr0_fixed1);
         if pvh {
             guest_cr0 &= !(1 << 31);
             guest_cr0 |= 1;
         }
-        let guest_cr4 = adjusted_control_register(
-            requested_cr4,
-            cr4_fixed0,
-            cr4_fixed1,
-        );
+        let guest_cr4 = adjusted_control_register(requested_cr4, cr4_fixed0, cr4_fixed1);
         vmwrite(GUEST_CR0, guest_cr0)?;
         vmwrite(GUEST_CR3, if pvh { 0 } else { config.page_table_root })?;
         vmwrite(GUEST_CR4, guest_cr4)?;
@@ -1506,10 +1495,7 @@ mod tests {
     #[test]
     fn vmx_only_hides_host_required_control_bits() {
         let fixed0 = CR0_PAGING | (1 << 5) | 1;
-        assert_eq!(
-            fixed_mask_for_guest(fixed0, CR0_PAGING | 1),
-            1 << 5
-        );
+        assert_eq!(fixed_mask_for_guest(fixed0, CR0_PAGING | 1), 1 << 5);
         assert_eq!(fixed_mask_for_guest(1 << 13, 0), 1 << 13);
     }
 
