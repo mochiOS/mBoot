@@ -65,10 +65,30 @@ struct dumb_framebuffer {
     uint8_t *pixels;
 };
 
+struct kms_properties {
+    uint32_t plane_id;
+    uint32_t mode_blob_id;
+    uint32_t connector_crtc_id;
+    uint32_t crtc_mode_id;
+    uint32_t crtc_active;
+    uint32_t plane_fb_id;
+    uint32_t plane_crtc_id;
+    uint32_t plane_src_x;
+    uint32_t plane_src_y;
+    uint32_t plane_src_w;
+    uint32_t plane_src_h;
+    uint32_t plane_crtc_x;
+    uint32_t plane_crtc_y;
+    uint32_t plane_crtc_w;
+    uint32_t plane_crtc_h;
+    int active;
+};
+
 struct renderer {
     int drm_fd;
     uint32_t connector_id;
     uint32_t crtc_id;
+    uint32_t crtc_index;
     drmModeModeInfo mode;
     drmModeCrtc *saved_crtc;
     struct gbm_device *gbm;
@@ -85,6 +105,7 @@ struct renderer {
     struct texture textures[MAX_TEXTURES];
     struct gbm_bo *front_bo;
     struct dumb_framebuffer fallback;
+    struct kms_properties kms;
     uint32_t width;
     uint32_t height;
 };
@@ -248,6 +269,17 @@ static int choose_output(int fd, struct renderer *renderer)
             drmModeFreeConnector(connector);
             continue;
         }
+        int crtc_index = -1;
+        for (int ri = 0; ri < resources->count_crtcs; ri++) {
+            if (resources->crtcs[ri] == crtc) {
+                crtc_index = ri;
+                break;
+            }
+        }
+        if (crtc_index < 0) {
+            drmModeFreeConnector(connector);
+            continue;
+        }
         int preferred = 0;
         for (int mi = 0; mi < connector->count_modes; mi++) {
             if (connector->modes[mi].type & DRM_MODE_TYPE_PREFERRED) {
@@ -257,6 +289,7 @@ static int choose_output(int fd, struct renderer *renderer)
         }
         renderer->connector_id = connector->connector_id;
         renderer->crtc_id = crtc;
+        renderer->crtc_index = (uint32_t)crtc_index;
         renderer->saved_crtc = drmModeGetCrtc(fd, crtc);
         renderer->mode = renderer->saved_crtc && renderer->saved_crtc->mode_valid
             ? renderer->saved_crtc->mode
@@ -269,6 +302,101 @@ static int choose_output(int fd, struct renderer *renderer)
     return -1;
 }
 
+static uint32_t property_id(int fd, uint32_t object_id, uint32_t object_type,
+                            const char *name, uint64_t *value)
+{
+    uint32_t id = 0;
+    drmModeObjectProperties *properties =
+        drmModeObjectGetProperties(fd, object_id, object_type);
+    if (!properties)
+        return 0;
+    for (uint32_t index = 0; index < properties->count_props; index++) {
+        drmModePropertyRes *property = drmModeGetProperty(fd, properties->props[index]);
+        if (!property)
+            continue;
+        if (strcmp(property->name, name) == 0) {
+            id = property->prop_id;
+            if (value)
+                *value = properties->prop_values[index];
+            drmModeFreeProperty(property);
+            break;
+        }
+        drmModeFreeProperty(property);
+    }
+    drmModeFreeObjectProperties(properties);
+    return id;
+}
+
+static int plane_supports_format(const drmModePlane *plane, uint32_t format)
+{
+    for (uint32_t index = 0; index < plane->count_formats; index++)
+        if (plane->formats[index] == format)
+            return 1;
+    return 0;
+}
+
+static int initialize_atomic_kms(struct renderer *renderer)
+{
+    struct kms_properties *kms = &renderer->kms;
+    if (drmSetClientCap(renderer->drm_fd, DRM_CLIENT_CAP_ATOMIC, 1))
+        return -1;
+
+    drmModePlaneRes *planes = drmModeGetPlaneResources(renderer->drm_fd);
+    if (!planes)
+        return -1;
+    for (uint32_t index = 0; index < planes->count_planes && !kms->plane_id; index++) {
+        drmModePlane *plane = drmModeGetPlane(renderer->drm_fd, planes->planes[index]);
+        uint64_t type = 0;
+        if (!plane)
+            continue;
+        if ((plane->possible_crtcs & (1u << renderer->crtc_index)) &&
+            plane_supports_format(plane, DRM_FORMAT_XRGB8888) &&
+            property_id(renderer->drm_fd, plane->plane_id, DRM_MODE_OBJECT_PLANE,
+                        "type", &type) && type == DRM_PLANE_TYPE_PRIMARY)
+            kms->plane_id = plane->plane_id;
+        drmModeFreePlane(plane);
+    }
+    drmModeFreePlaneResources(planes);
+    if (!kms->plane_id)
+        return -1;
+
+    if (drmModeCreatePropertyBlob(renderer->drm_fd, &renderer->mode,
+                                  sizeof(renderer->mode), &kms->mode_blob_id))
+        return -1;
+    kms->connector_crtc_id = property_id(renderer->drm_fd, renderer->connector_id,
+        DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID", NULL);
+    kms->crtc_mode_id = property_id(renderer->drm_fd, renderer->crtc_id,
+        DRM_MODE_OBJECT_CRTC, "MODE_ID", NULL);
+    kms->crtc_active = property_id(renderer->drm_fd, renderer->crtc_id,
+        DRM_MODE_OBJECT_CRTC, "ACTIVE", NULL);
+    kms->plane_fb_id = property_id(renderer->drm_fd, kms->plane_id,
+        DRM_MODE_OBJECT_PLANE, "FB_ID", NULL);
+    kms->plane_crtc_id = property_id(renderer->drm_fd, kms->plane_id,
+        DRM_MODE_OBJECT_PLANE, "CRTC_ID", NULL);
+    kms->plane_src_x = property_id(renderer->drm_fd, kms->plane_id,
+        DRM_MODE_OBJECT_PLANE, "SRC_X", NULL);
+    kms->plane_src_y = property_id(renderer->drm_fd, kms->plane_id,
+        DRM_MODE_OBJECT_PLANE, "SRC_Y", NULL);
+    kms->plane_src_w = property_id(renderer->drm_fd, kms->plane_id,
+        DRM_MODE_OBJECT_PLANE, "SRC_W", NULL);
+    kms->plane_src_h = property_id(renderer->drm_fd, kms->plane_id,
+        DRM_MODE_OBJECT_PLANE, "SRC_H", NULL);
+    kms->plane_crtc_x = property_id(renderer->drm_fd, kms->plane_id,
+        DRM_MODE_OBJECT_PLANE, "CRTC_X", NULL);
+    kms->plane_crtc_y = property_id(renderer->drm_fd, kms->plane_id,
+        DRM_MODE_OBJECT_PLANE, "CRTC_Y", NULL);
+    kms->plane_crtc_w = property_id(renderer->drm_fd, kms->plane_id,
+        DRM_MODE_OBJECT_PLANE, "CRTC_W", NULL);
+    kms->plane_crtc_h = property_id(renderer->drm_fd, kms->plane_id,
+        DRM_MODE_OBJECT_PLANE, "CRTC_H", NULL);
+
+    return !(kms->connector_crtc_id && kms->crtc_mode_id && kms->crtc_active &&
+             kms->plane_fb_id && kms->plane_crtc_id && kms->plane_src_x &&
+             kms->plane_src_y && kms->plane_src_w && kms->plane_src_h &&
+             kms->plane_crtc_x && kms->plane_crtc_y && kms->plane_crtc_w &&
+             kms->plane_crtc_h) ? -1 : 0;
+}
+
 static int open_drm(struct renderer *renderer, unsigned int *failure_stage)
 {
     char path[32];
@@ -279,14 +407,64 @@ static int open_drm(struct renderer *renderer, unsigned int *failure_stage)
         if (fd < 0)
             continue;
         found_card = 1;
-        if (choose_output(fd, renderer) == 0) {
+        if (drmSetMaster(fd) == 0 && choose_output(fd, renderer) == 0) {
             renderer->drm_fd = fd;
-            return 0;
+            if (initialize_atomic_kms(renderer) == 0)
+                return 0;
+            renderer->drm_fd = -1;
         }
         close(fd);
     }
-    *failure_stage = found_card ? 0x02 : 0x01;
+    *failure_stage = found_card ? 0x16 : 0x01;
     return -1;
+}
+
+static int add_atomic_property(drmModeAtomicReq *request, uint32_t object_id,
+                               uint32_t property, uint64_t value)
+{
+    return property && drmModeAtomicAddProperty(request, object_id, property, value) >= 0
+        ? 0 : -1;
+}
+
+static int present_framebuffer(struct renderer *renderer, uint32_t framebuffer)
+{
+    struct kms_properties *kms = &renderer->kms;
+    drmModeAtomicReq *request = drmModeAtomicAlloc();
+    if (!request)
+        return -1;
+
+    int result = add_atomic_property(request, kms->plane_id,
+                                     kms->plane_fb_id, framebuffer);
+    uint32_t flags = 0;
+    if (!kms->active) {
+        result |= add_atomic_property(request, renderer->connector_id,
+                                      kms->connector_crtc_id, renderer->crtc_id);
+        result |= add_atomic_property(request, renderer->crtc_id,
+                                      kms->crtc_mode_id, kms->mode_blob_id);
+        result |= add_atomic_property(request, renderer->crtc_id,
+                                      kms->crtc_active, 1);
+        result |= add_atomic_property(request, kms->plane_id,
+                                      kms->plane_crtc_id, renderer->crtc_id);
+        result |= add_atomic_property(request, kms->plane_id, kms->plane_src_x, 0);
+        result |= add_atomic_property(request, kms->plane_id, kms->plane_src_y, 0);
+        result |= add_atomic_property(request, kms->plane_id, kms->plane_src_w,
+                                      (uint64_t)renderer->mode.hdisplay << 16);
+        result |= add_atomic_property(request, kms->plane_id, kms->plane_src_h,
+                                      (uint64_t)renderer->mode.vdisplay << 16);
+        result |= add_atomic_property(request, kms->plane_id, kms->plane_crtc_x, 0);
+        result |= add_atomic_property(request, kms->plane_id, kms->plane_crtc_y, 0);
+        result |= add_atomic_property(request, kms->plane_id, kms->plane_crtc_w,
+                                      renderer->mode.hdisplay);
+        result |= add_atomic_property(request, kms->plane_id, kms->plane_crtc_h,
+                                      renderer->mode.vdisplay);
+        flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
+    }
+    if (!result)
+        result = drmModeAtomicCommit(renderer->drm_fd, request, flags, NULL);
+    drmModeAtomicFree(request);
+    if (!result)
+        kms->active = 1;
+    return result;
 }
 
 static void dumb_rect(struct renderer *renderer, uint32_t x, uint32_t y,
@@ -341,11 +519,8 @@ static void show_dumb_status(struct renderer *renderer, unsigned int stage,
     dumb_hex_digit(renderer, x, y, scale, stage >> 4, 0x00ffffff);
     dumb_hex_digit(renderer, x + scale * 7, y, scale, stage, 0x00ffffff);
     msync(renderer->fallback.pixels, renderer->fallback.size, MS_SYNC);
-    /* The GPU may already be scanning out a GBM buffer.  Merely updating the
-     * dumb buffer would then leave the monitor black and hide the failure. */
-    drmModeSetCrtc(renderer->drm_fd, renderer->crtc_id,
-                   renderer->fallback.id, 0, 0,
-                   &renderer->connector_id, 1, &renderer->mode);
+    drmModeDirtyFB(renderer->drm_fd, renderer->fallback.id, NULL, 0);
+    present_framebuffer(renderer, renderer->fallback.id);
 }
 
 static void show_dumb_failure(struct renderer *renderer, unsigned int stage)
@@ -357,14 +532,6 @@ static void hold_drm_failure(struct renderer *renderer, unsigned int stage)
 {
     for (;;) {
         show_dumb_failure(renderer, stage);
-        poll(NULL, 0, 1000);
-    }
-}
-
-static void hold_drm_success(struct renderer *renderer, unsigned int stage)
-{
-    for (;;) {
-        show_dumb_status(renderer, stage, 0x00188c52);
         poll(NULL, 0, 1000);
     }
 }
@@ -401,13 +568,8 @@ static int initialize_dumb_scanout(struct renderer *renderer)
     }
     dumb_rect(renderer, 0, 0, create.width, create.height, 0x00c8c8c8);
     msync(renderer->fallback.pixels, renderer->fallback.size, MS_SYNC);
-    /* Establish a known-good KMS target before EGL takes over.  Native DRM
-     * drivers may already have removed the firmware framebuffer by now, so
-     * leaving the CRTC without an explicit replacement produces an
-     * unobservable black gap when userspace initialization fails. */
-    return drmModeSetCrtc(renderer->drm_fd, renderer->crtc_id,
-                          renderer->fallback.id, 0, 0,
-                          &renderer->connector_id, 1, &renderer->mode);
+    drmModeDirtyFB(renderer->drm_fd, renderer->fallback.id, NULL, 0);
+    return present_framebuffer(renderer, renderer->fallback.id);
 }
 
 static GLuint compile_shader(GLenum type, const char *source)
@@ -622,33 +784,6 @@ static int sync_textures(struct renderer *renderer, const uint8_t *scene, size_t
     return glGetError() == GL_NO_ERROR ? 0 : -EIO;
 }
 
-static void page_flip_complete(int fd, unsigned int sequence, unsigned int seconds,
-                               unsigned int microseconds, void *data)
-{
-    (void)fd;
-    (void)sequence;
-    (void)seconds;
-    (void)microseconds;
-    *(int *)data = 0;
-}
-
-static int wait_for_page_flip(int fd, int *waiting)
-{
-    drmEventContext context = {
-        .version = DRM_EVENT_CONTEXT_VERSION,
-        .page_flip_handler = page_flip_complete,
-    };
-    while (*waiting) {
-        struct pollfd poll_fd = { .fd = fd, .events = POLLIN };
-        int result = poll(&poll_fd, 1, 1000);
-        if (result <= 0)
-            return result ? -errno : -ETIMEDOUT;
-        if (drmHandleEvent(fd, &context))
-            return -errno;
-    }
-    return 0;
-}
-
 static void destroy_drm_framebuffer(struct gbm_bo *bo, void *data)
 {
     (void)bo;
@@ -712,43 +847,6 @@ static uint32_t framebuffer_for_bo(struct renderer *renderer, struct gbm_bo *bo)
     return framebuffer->id;
 }
 
-/* Verify the complete hardware-rendering path without changing the active
- * CRTC.  This leaves the kernel framebuffer visible, so a physical machine
- * can report exactly whether failure happens before or during KMS handoff. */
-static void diagnose_before_kms(struct renderer *renderer)
-{
-    GLubyte sample[4] = { 0 };
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, renderer->width, renderer->height);
-    glDisable(GL_BLEND);
-    glClearColor(200.0f / 255.0f, 200.0f / 255.0f, 200.0f / 255.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glReadPixels(renderer->width / 2, renderer->height / 2, 1, 1,
-                 GL_RGBA, GL_UNSIGNED_BYTE, sample);
-    if (glGetError() != GL_NO_ERROR ||
-        sample[0] < 190 || sample[0] > 210 ||
-        sample[1] < 190 || sample[1] > 210 ||
-        sample[2] < 190 || sample[2] > 210)
-        hold_drm_failure(renderer, 0xd1);
-
-    glFinish();
-    if (glGetError() != GL_NO_ERROR)
-        hold_drm_failure(renderer, 0xd2);
-    if (!eglSwapBuffers(renderer->egl_display, renderer->egl_surface))
-        hold_drm_failure(renderer, 0xd3);
-
-    struct gbm_bo *bo = gbm_surface_lock_front_buffer(renderer->surface);
-    if (!bo)
-        hold_drm_failure(renderer, 0xd4);
-    if (!framebuffer_for_bo(renderer, bo))
-        hold_drm_failure(renderer, 0xd5);
-
-    /* D5 on green means rendering, swap, BO export and framebuffer creation
-     * all worked.  No drmModeSetCrtc or page flip has happened in this mode. */
-    hold_drm_success(renderer, 0xd5);
-}
-
 static int show_frame(struct renderer *renderer)
 {
     /* Do not hand KMS a buffer until rendering into it has completed. */
@@ -765,20 +863,7 @@ static int show_frame(struct renderer *renderer)
         gbm_surface_release_buffer(renderer->surface, bo);
         return errno ? -errno : -EIO;
     }
-    int result;
-    if (!renderer->front_bo) {
-        result = drmModeSetCrtc(renderer->drm_fd, renderer->crtc_id, fb, 0, 0,
-                                &renderer->connector_id, 1, &renderer->mode);
-    } else {
-        int waiting = 1;
-        result = drmModePageFlip(renderer->drm_fd, renderer->crtc_id, fb,
-                                 DRM_MODE_PAGE_FLIP_EVENT, &waiting);
-        if (!result)
-            result = wait_for_page_flip(renderer->drm_fd, &waiting);
-        if (result)
-            result = drmModeSetCrtc(renderer->drm_fd, renderer->crtc_id, fb, 0, 0,
-                                    &renderer->connector_id, 1, &renderer->mode);
-    }
+    int result = present_framebuffer(renderer, fb);
     if (result) {
         gbm_surface_release_buffer(renderer->surface, bo);
         return -errno;
@@ -899,15 +984,6 @@ int main(void)
     if (initialize_dumb_scanout(&renderer)) {
         dprintf(2, "mDriver GPU: diagnostic buffer failed errno=%d\n", errno);
         hold_fb_failure(0x10);
-    }
-    if (getenv("MDRIVER_GPU_DIAG_PRE_KMS")) {
-        failure_stage = initialize_gl(&renderer);
-        if (failure_stage) {
-            dprintf(2, "mDriver GPU: initialization failed stage=%02x errno=%d\n",
-                    failure_stage, errno);
-            hold_drm_failure(&renderer, failure_stage);
-        }
-        diagnose_before_kms(&renderer);
     }
     failure_stage = initialize_gl(&renderer);
     if (failure_stage) {
