@@ -1,0 +1,40 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: diagnose GGTT probe before framebuffer removal
+
+Advance the opt-in diagnostic stop past reset, DMA setup, perf setup and
+GGTT probing. Preserve each failing return before cleanup. Stop on success
+before drm_aperture_remove_conflicting_pci_framebuffers and GGTT init.
+
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -370,7 +370,7 @@
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+ 			      "MMIO OK BEFORE GPU RESET", 0);
+ 	sanitize_gpu(dev_priv);
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+ 			      "AFTER GPU RESET BEFORE HW PROBE", 0);
+ 
+ 	return 0;
+@@ -504,16 +504,21 @@
+ 	intel_dram_edram_detect(dev_priv);
+ 
+ 	ret = i915_set_dma_info(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "DMA INFO", ret);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = i915_perf_init(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "PERF INIT", ret);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = i915_ggtt_probe_hw(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "GGTT PROBE", ret);
+ 	if (ret)
+ 		goto err_perf;
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++			      "GGTT PROBE OK BEFORE FB REMOVE", 0);
+ 
+ 	ret = drm_aperture_remove_conflicting_pci_framebuffers(pdev, dev_priv->drm.driver);
+ 	if (ret)

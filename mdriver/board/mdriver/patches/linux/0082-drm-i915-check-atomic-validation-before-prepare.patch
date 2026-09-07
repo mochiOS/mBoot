@@ -1,0 +1,29 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: isolate atomic validation from commit preparation
+
+The initial state preparation completed on hardware. Move the opt-in
+checkpoint to the internal synchronous commit callback, after DRM atomic
+validation but before runtime-PM acquisition and prepare/setup/swap/tail.
+
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -7622,6 +7622,9 @@
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+ 	int ret = 0;
+ 
++	if (state->internal && !nonblock)
++		mboot_gpu_probe_trace(dev->dev, "i915-stop",
++				      "ATOMIC CHECK OK BEFORE COMMIT PREPARE", 0);
+ 	state->wakeref = intel_runtime_pm_get(&dev_priv->runtime_pm);
+ 
+ 	/*
+@@ -8242,8 +8245,6 @@
+ 		}
+ 	}
+ 
+-	mboot_gpu_probe_trace(dev->dev, "i915-stop",
+-			      "INITIAL STATE READY BEFORE ATOMIC COMMIT", 0);
+ 	ret = drm_atomic_commit(state);
+ 
+ out:
+

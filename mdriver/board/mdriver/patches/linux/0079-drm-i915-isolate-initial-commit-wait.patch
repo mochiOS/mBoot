@@ -1,0 +1,19 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: isolate initial commit from PXP and HDCP setup
+
+Final display probe no longer reaches its diagnostic report. Stop after
+PXP and HDCP component setup, before entering the initial atomic commit,
+to distinguish component setup from modeset waits without adding a timer.
+
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c
+@@ -513,6 +513,8 @@
+ 	 * happen during gem/ggtt init.
+ 	 */
+ 	intel_hdcp_component_init(i915);
++	mboot_gpu_probe_trace(i915->drm.dev, "i915-stop",
++			      "PXP HDCP RETURNED BEFORE INITIAL COMMIT", 0);
+ 
+ 	/*
+ 	 * Force all active planes to recompute their states. So that on
+

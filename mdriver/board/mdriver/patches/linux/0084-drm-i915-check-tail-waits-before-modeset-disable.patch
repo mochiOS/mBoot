@@ -1,0 +1,51 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: isolate tail waits before modeset disables
+
+Prepare/setup/swap completed with a full modeset on hardware. Advance
+through workqueue flushing, fence/dependency waits and display power
+preparation, then stop before disabling the firmware scanout. Record
+returned waits without treating void wait helpers as verified success.
+
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -7349,12 +7349,18 @@
+ 	int i;
+ 
+ 	intel_atomic_commit_fence_wait(state);
++	if (state->internal)
++		mboot_gpu_probe_trace(dev->dev, "i915-tail", "FENCE WAIT RETURNED", 0);
+ 
+ 	intel_td_flush(dev_priv);
++	if (state->internal)
++		mboot_gpu_probe_trace(dev->dev, "i915-tail", "TD FLUSH RETURNED", 0);
+ 
+ 	drm_atomic_helper_wait_for_dependencies(&state->base);
+ 	drm_dp_mst_atomic_wait_for_dependencies(&state->base);
+ 	intel_atomic_global_state_wait_for_dependencies(state);
++	if (state->internal)
++		mboot_gpu_probe_trace(dev->dev, "i915-tail", "DEPENDENCY WAITS RETURNED", 0);
+ 
+ 	/*
+ 	 * During full modesets we write a lot of registers, wait
+@@ -7394,6 +7400,9 @@
+ 			intel_modeset_get_crtc_power_domains(new_crtc_state, &put_domains[crtc->pipe]);
+ 	}
+ 
++	if (state->internal)
++		mboot_gpu_probe_trace(dev->dev, "i915-stop",
++				      "TAIL PREPARED BEFORE MODESET DISABLES", 0);
+ 	intel_commit_modeset_disables(state);
+ 
+ 	intel_dp_tunnel_atomic_alloc_bw(state);
+@@ -7686,10 +7695,6 @@
+ 		return ret;
+ 	}
+ 
+-	if (state->internal && !nonblock)
+-		mboot_gpu_probe_trace(dev->dev, "i915-stop",
+-				      state->modeset ? "SWAP OK BEFORE TAIL MODESET 1" :
+-				      "SWAP OK BEFORE TAIL MODESET 0", 0);
+ 	drm_atomic_state_get(&state->base);
+ 	INIT_WORK(&state->base.commit_work, intel_atomic_commit_work);
+ 
+

@@ -1,0 +1,26 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: checkpoint after GGTT initialization
+
+Advance the opt-in diagnostic stop past GGTT initialization. Record its
+return before cleanup and stop before GT tiles or memory-region probing.
+Normal driver initialization remains unchanged without the diagnostic flag.
+
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -524,12 +524,15 @@
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "FB REMOVE", ret);
+ 	if (ret)
+ 		goto err_ggtt;
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+ 			      "AFTER FB REMOVE BEFORE GGTT INIT", 0);
+ 
+ 	ret = i915_ggtt_init_hw(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "GGTT INIT", ret);
+ 	if (ret)
+ 		goto err_ggtt;
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++			      "AFTER GGTT INIT BEFORE TILES", 0);
+ 
+ 	/*
+ 	 * Make sure we probe lmem before we probe stolen-lmem. The BAR size

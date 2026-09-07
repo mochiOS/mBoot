@@ -2,6 +2,7 @@
 
 #define SYS_WRITE 1
 #define SYS_OPEN 2
+#define SYS_DUP2 33
 #define SYS_NANOSLEEP 35
 #define SYS_PAUSE 34
 #define SYS_FORK 57
@@ -79,8 +80,19 @@ __attribute__((noreturn)) void _start(void)
         log = 1;
 
     write_message(log, starting, sizeof(starting) - 1);
+    /* Renderer and relay diagnostics must enter the same retained kernel log. */
+    syscall5(SYS_DUP2, log, 1, 0, 0, 0);
+    syscall5(SYS_DUP2, log, 2, 0, 0, 0);
     mount_filesystem("proc", "/proc", "proc");
     mount_filesystem("sysfs", "/sys", "sysfs");
+    if (syscall5(SYS_FORK, 0, 0, 0, 0, 0) == 0) {
+        static char *const argv[] = { "/usr/bin/mdriver-log", 0 };
+        static char *const envp[] = { 0 };
+        syscall5(SYS_EXECVE, (long)argv[0], (long)argv, (long)envp, 0, 0);
+        syscall5(SYS_EXIT, 127, 0, 0, 0, 0);
+        for (;;)
+            ;
+    }
     if (syscall5(SYS_FORK, 0, 0, 0, 0, 0) == 0)
         supervise_gpu();
     write_message(log, ready, sizeof(ready) - 1);

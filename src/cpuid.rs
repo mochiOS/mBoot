@@ -4,7 +4,8 @@ pub const MAX_BASIC_LEAF: u32 = 0x0b;
 pub const MAX_EXTENDED_LEAF: u32 = 0x8000_0008;
 pub const MAX_HYPERVISOR_LEAF: u32 = 0x4000_0002;
 
-const CPU_VENDOR: [u8; 12] = *b"MochiOS CPU ";
+const INTEL_CPU_VENDOR: [u8; 12] = *b"GenuineIntel";
+const AMD_CPU_VENDOR: [u8; 12] = *b"AuthenticAMD";
 const HYPERVISOR_VENDOR: [u8; 12] = *b"MochiOSmBoot";
 const CPU_BRAND: [u8; 48] = *b"mochiOS Virtual CPU                             ";
 
@@ -39,7 +40,18 @@ pub fn query(
     grant_window_size: u64,
 ) -> CpuidResult {
     match leaf {
-        0 => vendor_leaf(MAX_BASIC_LEAF, CPU_VENDOR, false),
+        // glibc's unknown-vendor path does not read leaf 1, leaving even
+        // baseline x86-64 ISA features unset. Keep the hardware vendor family;
+        // the independent hypervisor leaf still identifies mBoot.
+        0 => vendor_leaf(
+            MAX_BASIC_LEAF,
+            if hypervisor_backend == mnu_abi::hypervisor::HYPERVISOR_BACKEND_AMD_SVM {
+                AMD_CPU_VENDOR
+            } else {
+                INTEL_CPU_VENDOR
+            },
+            false,
+        ),
         1 => CpuidResult {
             eax: 0x0000_06a0,
             ebx: ((apic_id & 0xff) << 24) | (vcpu_count.clamp(1, 0xff) << 16),
@@ -169,6 +181,20 @@ mod tests {
             0x3ff_0000,
             0x1_0000,
         )
+    }
+
+    #[test]
+    fn cpu_vendor_is_recognized_without_exposing_extra_features() {
+        for (backend, expected) in [(1, INTEL_CPU_VENDOR), (2, AMD_CPU_VENDOR)] {
+            let vendor = test_query(0, 0, 0, 1, 2_400_000, backend);
+            let bytes = [vendor.ebx, vendor.edx, vendor.ecx]
+                .map(u32::to_le_bytes)
+                .concat();
+            assert_eq!(bytes.as_slice(), expected);
+            let features = test_query(1, 0, 0, 1, 2_400_000, backend);
+            assert_eq!(features.edx, LEAF1_EDX_BASELINE);
+            assert_eq!(features.ecx, LEAF1_ECX_X2APIC | LEAF1_ECX_HYPERVISOR);
+        }
     }
 
     #[test]

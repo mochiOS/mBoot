@@ -1,0 +1,55 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: check GEM and retain GT initialization failures
+
+Advance diagnostic boot beyond the repaired initial framebuffer adoption.
+Report GGTT and GT initialization results before GEM's KMS-only -EIO
+recovery can hide GPU submission failure. Stop after GEM before final
+display initialization. No software-rendering fallback is introduced.
+
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -874,13 +874,14 @@
+ 	mboot_gpu_probe_trace(&pdev->dev, "i915-stage", stage, ret);
+ 	if (ret)
+ 		goto out_cleanup_irq;
+-	mboot_gpu_probe_trace(&pdev->dev, "i915-stop",
+-			      "DISPLAY NOGEM OK BEFORE GEM", 0);
+ 
+ 	stage = "I915 GEM";
+ 	ret = i915_gem_init(i915);
++	mboot_gpu_probe_trace(&pdev->dev, "i915-stage", stage, ret);
+ 	if (ret)
+ 		goto out_cleanup_modeset2;
++	mboot_gpu_probe_trace(&pdev->dev, "i915-stop",
++			      "GEM OK BEFORE PXP DISPLAY", 0);
+ 
+ 	ret = intel_pxp_init(i915);
+ 	if (ret && ret != -ENODEV)
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -26,6 +26,7 @@
+  */
+ 
+ #include <linux/dma-fence-array.h>
++#include <linux/mboot_probe.h>
+ #include <linux/kthread.h>
+ #include <linux/dma-resv.h>
+ #include <linux/shmem_fs.h>
+@@ -1170,6 +1171,7 @@
+ 	}
+ 
+ 	ret = i915_init_ggtt(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-gem", "INIT GGTT", ret);
+ 	if (ret) {
+ 		GEM_BUG_ON(ret == -EIO);
+ 		goto err_unlock;
+@@ -1188,6 +1190,8 @@
+ 
+ 	for_each_gt(gt, dev_priv, i) {
+ 		ret = intel_gt_init(gt);
++		/* Preserve -EIO before the KMS-only recovery path can mask it. */
++		mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-gem", "GT INIT", ret);
+ 		if (ret)
+ 			goto err_unlock;
+ 	}
+

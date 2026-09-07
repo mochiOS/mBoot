@@ -1,0 +1,184 @@
+From: mochiOS developers
+Subject: [PATCH] x86/mboot: preserve the first PCI publication failure
+
+Record the failing stage, original errno, requester, IRQ capabilities and
+expected/actual BAR resources in one ConsoleWrite report. Do not replace
+the report with a generic PCI ERROR or retry device attachment.
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -1010,6 +1010,63 @@
+ 	return 0;
+ }
+ 
++static int __init mboot_pci_publish_failure(struct mboot_pci_frontend *device,
++					  const char *stage, int error,
++					  unsigned long detail)
++{
++	char report[2048];
++	struct pci_dev *pdev;
++	unsigned int index;
++	u32 identity = device->config[PCI_VENDOR_ID / 4];
++	u32 class_rev = device->config[PCI_CLASS_REVISION / 4];
++	int len;
++
++	len = scnprintf(report, sizeof(report),
++		"PCI PROBE REPORT\nSTAGE %s ERRNO %d DETAIL %lx\n"
++		"BDF %02x:%02x.%u REQUESTER %04x\n"
++		"ID %04x:%04x REV %02x CLASS %06x COMMAND %04x\n"
++		"IRQ COUNT %u IRQ0 %d IRQ1 %d STATE %u\n",
++		stage, error, detail, device->info.requester >> 8,
++		(device->info.requester >> 3) & 31, device->info.requester & 7,
++		device->info.requester, identity & 0xffff, identity >> 16,
++		class_rev & 0xff, class_rev >> 8,
++		device->config[PCI_COMMAND / 4] & 0xffff,
++		device->irq_count, device->irqs[0], device->irqs[1], device->info.state);
++	pdev = pci_get_domain_bus_and_slot(0, device->info.requester >> 8,
++					 device->info.requester & 0xff);
++	if (pdev) {
++		len += scnprintf(report + len, sizeof(report) - len,
++			"PCI IRQ %u MSI CAP %x MSIX CAP %x MSIX COUNT %d\n",
++			pdev->irq, pdev->msi_cap, pdev->msix_cap, pci_msix_vec_count(pdev));
++	} else {
++		len += scnprintf(report + len, sizeof(report) - len,
++			"PCI DEVICE NOT ENUMERATED\n");
++	}
++	for (index = 0; index < device->resource_count; index++) {
++		const struct mboot_pci_resource *resource = &device->resources[index];
++
++		len += scnprintf(report + len, sizeof(report) - len,
++			"BAR%u EXPECT START %llx SIZE %llx FLAGS %x\n",
++			resource->bar_index, resource->guest_address,
++			resource->length, resource->flags);
++		if (pdev) {
++			const struct resource *actual = &pdev->resource[resource->bar_index];
++
++			len += scnprintf(report + len, sizeof(report) - len,
++				"BAR%u ACTUAL START %llx SIZE %llx FLAGS %lx\n",
++				resource->bar_index, (unsigned long long)actual->start,
++				(unsigned long long)resource_size(actual), actual->flags);
++		}
++	}
++	if (pdev)
++		pci_dev_put(pdev);
++	/* One complete report, never a repeated retry or a modeset request. */
++	mboot_console_write_buffer(report, len, MBOOT_CONSOLE_ERROR | 1);
++	pr_err("mDriver: PCI publication failed: %s requester=%04x errno=%d detail=%lx\n",
++		stage, device->info.requester, error, detail);
++	return error;
++}
++
+ static int __init mboot_pci_publish_frontend(void)
+ {
+ 	unsigned int active = 0;
+@@ -1020,12 +1077,14 @@
+ 	for (index = 0; index < mboot_pci_device_count; index++) {
+ 		struct mboot_pci_frontend *device = &mboot_pci_devices[index];
+ 		u8 bus = device->info.requester >> 8;
++		int error;
+ 
+ 		mboot_boot_device_error("SCAN", device->info.requester);
+ 		if (mboot_pci_buses[bus])
+ 			continue;
+-		if (mboot_pci_scan_bus(bus))
+-			return -EIO;
++		error = mboot_pci_scan_bus(bus);
++		if (error)
++			return mboot_pci_publish_failure(device, "SCAN BUS", error, bus);
+ 		mboot_boot_device_error("SCANNED", device->info.requester);
+ 	}
+ 	for (index = 0; index < mboot_pci_device_count; index++) {
+@@ -1044,17 +1103,17 @@
+ 		mboot_boot_device_error("IRQ", device->info.requester);
+ 		pdev = pci_get_domain_bus_and_slot(0, bus, devfn);
+ 		if (!pdev)
+-			return -ENODEV;
++			return mboot_pci_publish_failure(device, "IRQ LOOKUP", -ENODEV, 0);
+ 		msix_vectors = pci_msix_vec_count(pdev);
+ 		if (msix_vectors < 1 && !pdev->msi_cap) {
+ 			pci_dev_put(pdev);
+-			return -ENODEV;
++			return mboot_pci_publish_failure(device, "NO MSI", -ENODEV, msix_vectors);
+ 		}
+ 		device->irq_count = msix_vectors >= 2 ? 2 : 1;
+ 		device->irqs[0] = mboot_irq_alloc(device, device->irq_count);
+ 		if (device->irqs[0] < 0) {
+ 			pci_dev_put(pdev);
+-			return device->irqs[0];
++			return mboot_pci_publish_failure(device, "IRQ ALLOC", device->irqs[0], device->irq_count);
+ 		}
+ 		device->irqs[1] = device->irq_count == 2 ? device->irqs[0] + 1 : 0;
+ 		config_cfg = irq_cfg(device->irqs[0]);
+@@ -1065,7 +1124,7 @@
+ 		      config_cfg->vector == queue_cfg->vector))) {
+ 			pci_dev_put(pdev);
+ 			irq_domain_free_irqs(device->irqs[0], device->irq_count);
+-			return -EIO;
++			return mboot_pci_publish_failure(device, "IRQ VECTOR", -EIO, 0);
+ 		}
+ 		pdev->irq = device->irqs[0];
+ 		for (resource_index = 0;
+@@ -1078,7 +1137,7 @@
+ 			if (linux_resource->start != resource->guest_address ||
+ 			    resource_size(linux_resource) != resource->length) {
+ 				pci_dev_put(pdev);
+-				return -EIO;
++				return mboot_pci_publish_failure(device, "BAR MATCH", -EIO, resource->bar_index);
+ 			}
+ 			resource_count++;
+ 		}
+@@ -1086,12 +1145,12 @@
+ 		result = mboot_hypercall(MBOOT_HYPERCALL_IRQ_MASK,
+ 					 config_cfg->vector, 1, 0);
+ 		if (result)
+-			return -EIO;
++			return mboot_pci_publish_failure(device, "MASK IRQ0", -EIO, result);
+ 		if (device->irq_count == 2) {
+ 			result = mboot_hypercall(MBOOT_HYPERCALL_IRQ_MASK,
+ 						 queue_cfg->vector, 1, 0);
+ 			if (result)
+-				return -EIO;
++				return mboot_pci_publish_failure(device, "MASK IRQ1", -EIO, result);
+ 		}
+ 		mboot_boot_device_error("ACTIVATE", device->info.requester);
+ 		result = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_ACTIVATE,
+@@ -1099,7 +1158,7 @@
+ 					 config_cfg->vector,
+ 					 queue_cfg ? queue_cfg->vector : 0);
+ 		if (result)
+-			return -EIO;
++			return mboot_pci_publish_failure(device, "ACTIVATE", -EIO, result);
+ 		mboot_boot_device_error("ACTIVE", device->info.requester);
+ 		device->info.state = MBOOT_PCI_STATE_ACTIVE;
+ 		if (device->irq_count == 2)
+@@ -1136,7 +1195,7 @@
+ 						device->info.requester);
+ 			pdev = pci_get_domain_bus_and_slot(0, bus, devfn);
+ 			if (!pdev)
+-				return -ENODEV;
++				return mboot_pci_publish_failure(device, "BIND LOOKUP", -ENODEV, 0);
+ 			if (display) {
+ 				int error = device_create_file(&pdev->dev, &dev_attr_gpu_probe);
+ 
+@@ -4032,14 +4091,15 @@
+ 
+ static int __init mboot_report_ready(void)
+ {
++	int error;
++
+ 	mboot_boot_status("DISPLAY\nMDRIVER DEVICES");
+ 	if (mboot_query_and_claim_devices())
+ 		return -EIO;
+ 	mboot_boot_status("DISPLAY\nMDRIVER PCI");
+-	if (mboot_pci_device_count && mboot_pci_publish_frontend()) {
+-		mboot_boot_status("DISPLAY\nMDRIVER PCI ERROR");
+-		return -EIO;
+-	}
++	error = mboot_pci_device_count ? mboot_pci_publish_frontend() : 0;
++	if (error)
++		return error;
+ 	if (fb_register_client(&mboot_fb_notifier))
+ 		return -EIO;
+ 	if (atomic_read(&mboot_gpu_probe_gate) == 1) {
+

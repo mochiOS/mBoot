@@ -1,0 +1,27 @@
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -7346,6 +7346,7 @@
+ 	struct intel_crtc *crtc;
+ 	struct intel_power_domain_mask put_domains[I915_MAX_PIPES] = {};
+ 	intel_wakeref_t wakeref = 0;
++	unsigned long irq_before = READ_ONCE(dev_priv->pmu.irq_count);
+ 	int i;
+ 
+ 	intel_atomic_commit_fence_wait(state);
+@@ -7468,6 +7469,16 @@
+ 	 *   we don't need out special handling any more.
+ 	 */
+ 	drm_atomic_helper_wait_for_flip_done(dev, &state->base);
++	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
++		struct drm_crtc_commit *commit = state->base.crtcs[i].commit;
++
++		if (commit && !completion_done(&commit->flip_done)) {
++			unsigned long irq_after = READ_ONCE(dev_priv->pmu.irq_count);
++
++			drm_err_once(dev, "flip incomplete pipe %c: GPU IRQs=%lu (+%lu during commit)\n",
++				     pipe_name(crtc->pipe), irq_after, irq_after - irq_before);
++		}
++	}
+ 
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
+ 		if (new_crtc_state->do_async_flip)

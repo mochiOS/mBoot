@@ -1,0 +1,78 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: preserve mBoot-owned physical MSI routing
+
+Synthetic PCI config writes do not reprogram the physical MSI destination.
+Reuse the assigned IRQ without creating native MSI descriptors; native
+hardware retains the existing allocation and cleanup path. Reject missing
+or inconsistent assignments. Continue diagnostic boot through hardware
+probe and stop before display takeover.
+
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -39,6 +39,11 @@
+ #include <linux/vga_switcheroo.h>
+ #include <linux/vt.h>
+ 
++#ifdef CONFIG_X86_MBOOT_GUEST
++#include <asm/hypervisor.h>
++extern int mboot_pci_irq_vector(struct pci_dev *pdev, unsigned int index);
++#endif
++
+ #include <drm/drm_aperture.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_ioctl.h>
+@@ -578,6 +583,20 @@
+ 	 * device. The kernel then disables that interrupt source and so
+ 	 * prevents the other device from working properly.
+ 	 */
++#ifdef CONFIG_X86_MBOOT_GUEST
++	if (hypervisor_is_type(X86_HYPER_MBOOT)) {
++		int irq = mboot_pci_irq_vector(pdev, 0);
++
++		/* mBoot owns physical MSI routing; config writes are shadow-only.
++		 * Do not allocate a native MSI descriptor or free this host IRQ.
++		 */
++		ret = irq > 0 && irq == pdev->irq ? 0 : -ENODEV;
++		mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw",
++				      "MBOOT ASSIGNED IRQ", ret);
++		if (ret)
++			goto err_mem_regions;
++	} else
++#endif
+ 	if (GRAPHICS_VER(dev_priv) >= 5) {
+ 		int msi_ret = pci_enable_msi(pdev);
+ 
+@@ -585,16 +604,19 @@
+ 		if (msi_ret < 0)
+ 			drm_dbg(&dev_priv->drm, "can't enable MSI");
+ 	}
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+ 			      "AFTER MSI SETUP BEFORE GVT OPREGION", 0);
+ 
+ 	ret = intel_gvt_init(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "GVT INIT", ret);
+ 	if (ret)
+ 		goto err_msi;
+ 
+ 	intel_opregion_setup(display);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "OPREGION SETUP RETURNED", 0);
+ 
+ 	ret = i915_pcode_init(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "PCODE INIT", ret);
+ 	if (ret)
+ 		goto err_opregion;
+ 
+@@ -603,8 +625,11 @@
+ 	 * used for memory latency calculation.
+ 	 */
+ 	intel_dram_detect(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "DRAM DETECT RETURNED", 0);
+ 
+ 	intel_bw_init_hw(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++			      "HW PROBE OK BEFORE DISPLAY", 0);
+ 
+ 	return 0;
+ 
+

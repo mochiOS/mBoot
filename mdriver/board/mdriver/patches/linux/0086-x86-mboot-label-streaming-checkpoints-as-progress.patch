@@ -1,0 +1,17 @@
+From: mochiOS developers
+Subject: [PATCH] x86/mboot: label non-stopping checkpoints as progress
+
+Text-console boots continue past the old diagnostic checkpoints. Do not
+print STOP when no stop is requested.
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -830,6 +830,8 @@
+ 	frontend = mboot_pci_find(pdev->bus->number, pdev->devfn);
+ 	if (!frontend)
+ 		return;
++	if (mboot_text_console && !mboot_i915_check && !strcmp(event, "i915-stop"))
++		event = "i915-stage";
+ 	len = scnprintf(line, sizeof(line), "%s %s rc=%d\n",
+ 			event, detail ?: "-", result);
+ 	/* Defer reasons can contain a trailing newline. Keep one event per line. */

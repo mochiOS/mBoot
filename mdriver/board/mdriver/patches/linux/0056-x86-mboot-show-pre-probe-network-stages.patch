@@ -1,0 +1,79 @@
+From: mochiOS developers
+Subject: [PATCH] x86/mboot: expose stages before the log-gated GPU probe
+
+Do not leave the iPXE SAN message as the only visible status while waiting
+for DHCP or the log receiver. Report PCI publication and its actual bound
+driver, and distinguish completion of late initcalls from DHCP startup.
+Only the log-gated boot emits these status pages, before GPU publication.
+No modeset, timeout, or additional driver attach is performed.
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -358,6 +358,15 @@
+ 
+ static void mboot_boot_status(const char *status)
+ {
++	if (atomic_read(&mboot_gpu_probe_gate) == 1 &&
++	    !strncmp(status, "DISPLAY\n", 8)) {
++		char page[256];
++		int len = scnprintf(page, sizeof(page), "BOOT STATUS\n%s", status + 8);
++
++		mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
++				virt_to_phys(page), len, 0);
++		return;
++	}
+ 	mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
+ 			virt_to_phys((void *)status), strlen(status), 0);
+ }
+@@ -1094,8 +1103,27 @@
+ 					continue;
+ 				}
+ 			}
++			if (!display && atomic_read(&mboot_gpu_probe_gate) == 1) {
++				char page[256];
++
++				scnprintf(page, sizeof(page),
++					  "DISPLAY\nMDRIVER PCI BIND ENTER\n%04x %04x:%04x CLASS %06x IRQ %u",
++					  device->info.requester, pdev->vendor, pdev->device,
++					  pdev->class, pdev->irq);
++				mboot_boot_status(page);
++			}
+ 			pci_bus_add_device(pdev);
+ 			device->driver_published = true;
++			if (!display && atomic_read(&mboot_gpu_probe_gate) == 1) {
++				char page[256];
++
++				scnprintf(page, sizeof(page),
++					  "DISPLAY\nMDRIVER PCI BIND RETURN\n%04x DRIVER %s BOUND %u",
++					  device->info.requester,
++					  pdev->dev.driver ? pdev->dev.driver->name : "NONE",
++					  device_is_bound(&pdev->dev));
++				mboot_boot_status(page);
++			}
+ 			if (display)
+ 				mboot_gpu_probe_report(pdev);
+ 			device->driver_matched = pdev->dev.can_match;
+@@ -3971,6 +3999,7 @@
+ 		if (error)
+ 			return error;
+ 		pr_info("mDriver: GPU probe held until the network log receiver acknowledges\n");
++		mboot_boot_status("DISPLAY\nMDRIVER PCI PUBLISHED\nWAIT DHCP / LOG ACK\nGPU PROBE NOT STARTED");
+ 	}
+ 	/* Run after late init returns so a GPU probe cannot block initcalls. */
+ 	mod_delayed_work(system_wq, &mboot_ready_work, msecs_to_jiffies(100));
+@@ -3978,6 +4007,14 @@
+ }
+ late_initcall(mboot_report_ready);
+ 
++static int __init mboot_report_initcalls_done(void)
++{
++	if (atomic_read(&mboot_gpu_probe_gate) == 1)
++		mboot_boot_status("DISPLAY\nMDRIVER INITCALLS DONE\nWAIT LOG RECEIVER ACK\nGPU PROBE NOT STARTED");
++	return 0;
++}
++late_initcall_sync(mboot_report_initcalls_done);
++
+ static void __init mboot_init_platform(void)
+ {
+ 	unsigned long tsc_khz = mboot_tsc_khz();

@@ -577,10 +577,10 @@ static int initialize_dumb_scanout(struct renderer *renderer)
         renderer->fallback.pixels = NULL;
         return -1;
     }
-    dumb_rect(renderer, 0, 0, create.width, create.height, 0x00c8c8c8);
-    msync(renderer->fallback.pixels, renderer->fallback.size, MS_SYNC);
-    drmModeDirtyFB(renderer->drm_fd, renderer->fallback.id, NULL, 0);
-    return present_framebuffer(renderer, renderer->fallback.id);
+    /* Allocate error-reporting storage without taking scanout from fbcon.
+     * Only the successful EGL startup frame should replace the boot console;
+     * otherwise a blank diagnostic buffer hides a stalled GL initialization. */
+    return 0;
 }
 
 static GLuint compile_shader(GLenum type, const char *source)
@@ -986,6 +986,7 @@ int main(void)
     struct renderer renderer = { .drm_fd = -1 };
     unsigned int failure_stage = 0x01;
     unsigned int wait_cycles = 0;
+    dprintf(2, "mDriver GPU: userspace started; waiting for DRM device\n");
     while (open_drm(&renderer, &failure_stage)) {
         wait_cycles++;
         if (wait_cycles >= 50 && wait_cycles % 10 == 0)

@@ -1,0 +1,27 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: isolate initial atomic state preparation
+
+PXP and HDCP setup returned on hardware. Advance the diagnostic stop past
+initial CRTC, plane, connector and fastset state preparation, but before
+drm_atomic_commit, to distinguish lock acquisition from commit execution.
+
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -25,6 +25,7 @@
+  */
+ 
+ #include <linux/dma-resv.h>
++#include <linux/mboot_probe.h>
+ #include <linux/i2c.h>
+ #include <linux/input.h>
+ #include <linux/kernel.h>
+@@ -8241,6 +8242,8 @@
+ 		}
+ 	}
+ 
++	mboot_gpu_probe_trace(dev->dev, "i915-stop",
++			      "INITIAL STATE READY BEFORE ATOMIC COMMIT", 0);
+ 	ret = drm_atomic_commit(state);
+ 
+ out:
+

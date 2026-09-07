@@ -1,0 +1,26 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: checkpoint after conflicting framebuffer removal
+
+Advance only the opt-in diagnostic stop. Record the aperture removal return
+before cleanup, and stop before GGTT initialization on success. Do not add
+any framebuffer removal, modeset, retry, or reset operation.
+
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -517,12 +517,15 @@
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "GGTT PROBE", ret);
+ 	if (ret)
+ 		goto err_perf;
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+ 			      "GGTT PROBE OK BEFORE FB REMOVE", 0);
+ 
+ 	ret = drm_aperture_remove_conflicting_pci_framebuffers(pdev, dev_priv->drm.driver);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "FB REMOVE", ret);
+ 	if (ret)
+ 		goto err_ggtt;
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++			      "AFTER FB REMOVE BEFORE GGTT INIT", 0);
+ 
+ 	ret = i915_ggtt_init_hw(dev_priv);
+ 	if (ret)

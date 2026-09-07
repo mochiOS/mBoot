@@ -1,0 +1,40 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: isolate output discovery from firmware state takeover
+
+The diagnostic display disappears during display nogem. Stop after output
+setup but before hardware state sanitization and initial plane adoption.
+Keep the checkpoint outside modeset locks and retain tunnel setup errors.
+The stop remains restricted to the explicit mBoot diagnostic boot.
+
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <linux/vga_switcheroo.h>
++#include <linux/mboot_probe.h>
+ #include <acpi/video.h>
+ #include <drm/display/drm_dp_mst_helper.h>
+ #include <drm/drm_atomic_helper.h>
+@@ -458,13 +459,20 @@
+ 	/* Just disable it once at startup */
+ 	intel_vga_disable(i915);
+ 	intel_setup_outputs(i915);
++	mboot_gpu_probe_trace(i915->drm.dev, "i915-display",
++			      "OUTPUT SETUP RETURNED", 0);
+ 
+ 	ret = intel_dp_tunnel_mgr_init(display);
++	mboot_gpu_probe_trace(i915->drm.dev, "i915-display",
++			      "DP TUNNEL INIT", ret);
+ 	if (ret)
+ 		goto err_hdcp;
+ 
+ 	intel_display_driver_disable_user_access(i915);
+ 
++	/* Stop outside modeset locks, before sanitization can disable a pipe. */
++	mboot_gpu_probe_trace(i915->drm.dev, "i915-stop",
++			      "OUTPUTS READY BEFORE HW STATE SANITIZE", 0);
+ 	drm_modeset_lock_all(dev);
+ 	intel_modeset_setup_hw_state(i915, dev->mode_config.acquire_ctx);
+ 	intel_acpi_assign_connector_fwnodes(display);
+

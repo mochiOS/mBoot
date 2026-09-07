@@ -57,7 +57,9 @@ image = "mdriver"
 path = '\EFI\MBOOT\MDRIVER.ELF'
 initramfs = "mdriver"
 initramfs_path = '\EFI\MBOOT\MDRIVER.CPIO'
-command_line = "earlycon=uart,io,0x3f8 console=ttyS0 rdinit=/init pci=off acpi=off maxcpus=0 panic=-1"
+# Stream boot logs until Linux fbcon takes over; no diagnostic probe stops.
+# No DHCP or log receiver ACK is required.
+command_line = "console=ttyS0 console=tty0 rdinit=/init pci=off acpi=off maxcpus=0 ip=off mboot.text_console=1"
 autostart = true
 required = true
 restart = "never"
@@ -71,6 +73,14 @@ max_restarts = 0
 segment = 0
 requester = "auto"
 kind = "display"
+domain = 2
+required = false
+
+# The wired NIC is optional diagnostic transport, not a GPU prerequisite.
+[[devices]]
+segment = 0
+requester = "auto"
+kind = "network"
 domain = 2
 required = false
 

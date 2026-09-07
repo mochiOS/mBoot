@@ -1,0 +1,49 @@
+From: mochiOS developers
+Subject: [PATCH] x86/mboot: initialize Intel data stolen resource before GPU probe
+
+pci=off leaves the early Intel stolen resource empty. i915 consequently
+cannot reconstruct the firmware framebuffer. Initialize the resource from
+the authorized synthetic host bridge while still in synchronous init.
+Use BDSM rather than BGSM to exclude GTT storage from the DSM allocator.
+Validate ordering and the same 1 GiB bound used by the mBoot host mapper.
+Do not override a resource already supplied by native early quirks.
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -32,6 +32,7 @@
+ #include <linux/workqueue.h>
+ #include <linux/wait.h>
+ #include <crypto/hash.h>
++#include <drm/intel/i915_drm.h>
+ 
+ #include <asm/apic.h>
+ #include <asm/cpufeature.h>
+@@ -1010,6 +1011,27 @@
+ 			return -EIO;
+ 		device->config[offset / 4] = value;
+ 	}
++	/* pci=off skips the native early stolen-memory quirk. This runs
++	 * synchronously during init, before ro_after_init protection and GPU
++	 * publication. Only consume the host bridge explicitly exposed by mBoot.
++	 * mBoot maps BGSM..TOLUD; i915 must allocate only BDSM..TOLUD (DSM).
++	 */
++	if (mboot_pci_config_only(device) &&
++	    (device->config[PCI_VENDOR_ID / 4] & 0xffff) == PCI_VENDOR_ID_INTEL &&
++	    !resource_size(&intel_graphics_stolen_res)) {
++		u32 bdsm = device->config[0xb0 / 4] & 0xfff00000;
++		u32 bgsm = device->config[0xb4 / 4] & 0xfff00000;
++		u32 top = device->config[0xbc / 4] & 0xfff00000;
++
++		/* Match the host's bounded stolen-range validation, and exclude GTT. */
++		if (!bgsm || bgsm > bdsm || bdsm >= top ||
++		    (u64)top - bgsm > SZ_1G)
++			return -EINVAL;
++		intel_graphics_stolen_res.start = bdsm;
++		intel_graphics_stolen_res.end = (resource_size_t)top - 1;
++		pr_info("mDriver: Intel data stolen memory %pR\n",
++			&intel_graphics_stolen_res);
++	}
+ 	return 0;
+ }
+ 
+

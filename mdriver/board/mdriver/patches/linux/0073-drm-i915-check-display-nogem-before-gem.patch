@@ -1,0 +1,80 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: checkpoint display output and initial plane setup
+
+Advance opt-in diagnostics through display nogem and report its return
+before outer cleanup. Stop before GEM initialization. Remove redundant
+historical boundary markers while retaining actual operation results.
+
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -372,11 +372,7 @@
+ 	}
+ 
+ 	/* As early as possible, scrub existing GPU state before clobbering */
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+-			      "MMIO OK BEFORE GPU RESET", 0);
+ 	sanitize_gpu(dev_priv);
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+-			      "AFTER GPU RESET BEFORE HW PROBE", 0);
+ 
+ 	return 0;
+ 
+@@ -522,22 +518,16 @@
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "GGTT PROBE", ret);
+ 	if (ret)
+ 		goto err_perf;
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+-			      "GGTT PROBE OK BEFORE FB REMOVE", 0);
+ 
+ 	ret = drm_aperture_remove_conflicting_pci_framebuffers(pdev, dev_priv->drm.driver);
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "FB REMOVE", ret);
+ 	if (ret)
+ 		goto err_ggtt;
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+-			      "AFTER FB REMOVE BEFORE GGTT INIT", 0);
+ 
+ 	ret = i915_ggtt_init_hw(dev_priv);
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "GGTT INIT", ret);
+ 	if (ret)
+ 		goto err_ggtt;
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+-			      "AFTER GGTT INIT BEFORE TILES", 0);
+ 
+ 	/*
+ 	 * Make sure we probe lmem before we probe stolen-lmem. The BAR size
+@@ -552,8 +542,6 @@
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "MEMORY REGIONS", ret);
+ 	if (ret)
+ 		goto err_ggtt;
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+-			      "AFTER MEMORY REGIONS BEFORE GGTT ENABLE", 0);
+ 
+ 	ret = i915_ggtt_enable_hw(dev_priv);
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "GGTT ENABLE", ret);
+@@ -604,8 +592,6 @@
+ 		if (msi_ret < 0)
+ 			drm_dbg(&dev_priv->drm, "can't enable MSI");
+ 	}
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+-			      "AFTER MSI SETUP BEFORE GVT OPREGION", 0);
+ 
+ 	ret = intel_gvt_init(dev_priv);
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "GVT INIT", ret);
+@@ -882,13 +868,14 @@
+ 	mboot_gpu_probe_trace(&pdev->dev, "i915-stage", stage, ret);
+ 	if (ret)
+ 		goto out_cleanup_modeset;
+-	mboot_gpu_probe_trace(&pdev->dev, "i915-stop",
+-			      "IRQ INSTALLED BEFORE DISPLAY NOGEM", 0);
+ 
+ 	stage = "I915 DISPLAY NOGEM";
+ 	ret = intel_display_driver_probe_nogem(i915);
++	mboot_gpu_probe_trace(&pdev->dev, "i915-stage", stage, ret);
+ 	if (ret)
+ 		goto out_cleanup_irq;
++	mboot_gpu_probe_trace(&pdev->dev, "i915-stop",
++			      "DISPLAY NOGEM OK BEFORE GEM", 0);
+ 
+ 	stage = "I915 GEM";
+ 	ret = i915_gem_init(i915);
+

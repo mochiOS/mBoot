@@ -1,0 +1,89 @@
+From: mochiOS developers
+Subject: [PATCH] x86/mboot: stream printk through probe until fbcon handoff
+
+Add an opt-in streaming text console independent of diagnostic stops.
+Keep the console active across GPU publication and stop host framebuffer
+writes before Linux fbcon takes ownership. Do not schedule the delayed
+framebuffer diagnostic overlay in text console mode.
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -365,6 +365,16 @@
+ early_param("mboot.mmio_check", mboot_mmio_check_param);
+ 
+ static bool mboot_i915_check;
++static bool mboot_text_console;
++static bool mboot_text_console_active;
++static int __init mboot_text_console_param(char *value)
++{
++	mboot_text_console = true;
++	mboot_text_console_active = true;
++	atomic_set(&mboot_gpu_probe_gate, 1);
++	return 0;
++}
++early_param("mboot.text_console", mboot_text_console_param);
+ static int __init mboot_i915_check_param(char *value)
+ {
+ 	mboot_i915_check = true;
+@@ -579,10 +589,11 @@
+ 				    unsigned int count)
+ {
+ 	char chunk[512];
+-	const char prefix[] = "BOOT LOG\n";
+-	const size_t header = sizeof(prefix) - 1;
++	const char *prefix = mboot_text_console ? "BOOT TEXT\n" : "BOOT LOG\n";
++	const size_t header = strlen(prefix);
+ 
+-	if (atomic_read(&mboot_gpu_probe_gate) != 1)
++	if (mboot_text_console ? !READ_ONCE(mboot_text_console_active) :
++	    atomic_read(&mboot_gpu_probe_gate) != 1)
+ 		return;
+ 	memcpy(chunk, prefix, header);
+ 	while (count) {
+@@ -4118,7 +4129,8 @@
+ 	if (atomic_cmpxchg(&mboot_gpu_probe_gate, 1, 2) != 1)
+ 		return -EALREADY;
+ 	/* No framebuffer diagnostic writes once GPU publication is released. */
+-	unregister_console(&mboot_log_console);
++	if (!mboot_text_console)
++		unregister_console(&mboot_log_console);
+ 	pr_info("mDriver: log receiver acknowledged; starting first GPU probe\n");
+ 	mod_delayed_work(system_wq, &mboot_ready_work, 0);
+ 	return count;
+@@ -4180,7 +4192,7 @@
+ 	mboot_reprobe_display();
+ 	if (!mboot_display_backend_ready()) {
+ 		/* Do not reset the deadline on each 100 ms readiness retry. */
+-		if (!READ_ONCE(mboot_gpu_open))
++		if (!mboot_text_console && !READ_ONCE(mboot_gpu_open))
+ 			schedule_delayed_work(&mboot_gpu_watchdog_work,
+ 					      msecs_to_jiffies(5000));
+ 		/* The DRM framebuffer can appear before the userspace renderer has
+@@ -4201,8 +4213,15 @@
+ static int mboot_fb_event(struct notifier_block *notifier,
+ 			  unsigned long event, void *data)
+ {
+-	if (event == FB_EVENT_FB_REGISTERED)
++	if (event == FB_EVENT_FB_REGISTERED) {
++		if (mboot_text_console && READ_ONCE(mboot_text_console_active)) {
++			const char end[] = "BOOT TEXT END\n";
++
++			WRITE_ONCE(mboot_text_console_active, false);
++			mboot_console_write_buffer(end, sizeof(end) - 1, 0);
++		}
+ 		mod_delayed_work(system_wq, &mboot_ready_work, 0);
++	}
+ 	return NOTIFY_OK;
+ }
+ 
+@@ -4236,7 +4255,8 @@
+ 		mboot_boot_status("DISPLAY\nMDRIVER PCI PUBLISHED\nSTARTING GPU PROBE\nLOG RECEIVER OPTIONAL");
+ 		/* Drivers are registered. Network readiness must not gate the GPU. */
+ 		atomic_set(&mboot_gpu_probe_gate, 2);
+-		unregister_console(&mboot_log_console);
++		if (!mboot_text_console)
++			unregister_console(&mboot_log_console);
+ 		pr_info("mDriver: starting first GPU probe without log receiver ACK\n");
+ 	}
+ 	/* Run after late init returns so a GPU probe cannot block initcalls. */
+

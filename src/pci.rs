@@ -337,6 +337,12 @@ impl AssignmentTable {
         Ok(&self.assignments[slot].descriptor.bars[..descriptor.bar_count])
     }
 
+    pub fn assigned_bar(&self, domain_id: u32, requester: u16, bar_index: u8) -> Option<PciBar> {
+        let assignment = self.assignment(domain_id, requester)?;
+        assignment.descriptor.bars[..assignment.descriptor.bar_count]
+            .iter().find(|bar| bar.index == bar_index).copied()
+    }
+
     pub fn resource(
         &self,
         domain_id: u32,
@@ -597,7 +603,7 @@ pub unsafe fn intel_graphics_stolen_range(requester: u16) -> Option<(u64, u64)> 
 
 /// Returns the firmware ACPI OpRegion used by an Intel integrated display.
 ///
-/// The ASLS register contains a 32-bit, page-aligned SystemMemory address. The
+/// The ASLS register contains a 32-bit SystemMemory byte address. The
 /// caller must still verify that the returned range belongs to firmware-owned
 /// memory before reading it.
 ///
@@ -610,8 +616,18 @@ pub unsafe fn intel_graphics_opregion_address(requester: u16) -> Option<u64> {
     {
         return None;
     }
-    let address = u64::from(unsafe { read_u32(0, 2, 0, INTEL_GRAPHICS_ASLS) });
-    (address != 0 && address & 0xfff == 0).then_some(address)
+    intel_opregion_address_from_asls(unsafe { read_u32(0, 2, 0, INTEL_GRAPHICS_ASLS) })
+}
+
+fn intel_opregion_address_from_asls(asls: u32) -> Option<u64> {
+    // i915 memremap() uses ASLS verbatim. Firmware may place the header
+    // within a page; rounding down would read a different signature/VBT.
+    (asls != 0 && asls != u32::MAX).then_some(u64::from(asls))
+}
+
+pub fn intel_opregion_version(image: &[u8]) -> Option<(u8, u8)> {
+    // OpRegion header: signature[16], size[4], version[4], then BIOS text.
+    Some((*image.get(23)?, *image.get(22)?))
 }
 
 fn intel_graphics_stolen_range_from_registers(
@@ -1032,13 +1048,8 @@ unsafe fn enable_msi(descriptor: &PciDescriptor, address: u64, vector: u8) -> Re
     }
     let mut control = unsafe { read_u16(bus, device, function, capability + 2) };
     control &= !(0b111 << 4 | MSI_ENABLE);
-    let mask_offset = if control & MSI_64_BIT != 0 {
-        0x10
-    } else {
-        0x0c
-    };
     unsafe { write_u16(bus, device, function, capability + 2, control) };
-    if control & MSI_PER_VECTOR_MASK != 0 {
+    if let Some(mask_offset) = msi_mask_offset(control) {
         unsafe { write_u32(bus, device, function, capability + mask_offset, u32::MAX) };
     }
     unsafe {
@@ -1067,6 +1078,21 @@ unsafe fn enable_msi(descriptor: &PciDescriptor, address: u64, vector: u8) -> Re
     Ok(())
 }
 
+const fn msi_mask_offset(control: u16) -> Option<u8> {
+    if control & MSI_PER_VECTOR_MASK == 0 {
+        None
+    } else if control & MSI_64_BIT != 0 {
+        Some(0x10)
+    } else {
+        Some(0x0c)
+    }
+}
+
+const fn msi_vector_mask(current: u32, masked: bool) -> u32 {
+    // mBoot enables exactly one MSI message; preserve all other mask bits.
+    if masked { current | 1 } else { current & !1 }
+}
+
 unsafe fn set_msi_mask(descriptor: &PciDescriptor, masked: bool) -> Result<(), PciError> {
     let (bus, device, function) = requester_parts(descriptor.requester)?;
     let capability = descriptor.msi_capability;
@@ -1074,6 +1100,17 @@ unsafe fn set_msi_mask(descriptor: &PciDescriptor, masked: bool) -> Result<(), P
         return Err(PciError::InterruptUnavailable);
     }
     let control = unsafe { read_u16(bus, device, function, capability + 2) };
+    if let Some(offset) = msi_mask_offset(control) {
+        // MSI Enable alone cannot undo the per-vector mask installed by
+        // enable_msi(). Clear message zero's mask before enabling delivery.
+        let offset = capability + offset;
+        let current = unsafe { read_u32(bus, device, function, offset) };
+        let updated = msi_vector_mask(current, masked);
+        unsafe { write_u32(bus, device, function, offset, updated) };
+        if unsafe { read_u32(bus, device, function, offset) } & 1 != updated & 1 {
+            return Err(PciError::RegisterWriteFailed);
+        }
+    }
     let updated = if masked {
         control & !MSI_ENABLE
     } else {
@@ -1611,6 +1648,34 @@ mod tests {
         assert_eq!(resource.guest_address, 0x8000_0000);
         assert_eq!(resource.length, 0x4000);
         assert_eq!(assignments.resource(3, 0x10, 0), None);
+        let bar = assignments.assigned_bar(2, 0x10, 0).unwrap();
+        assert_eq!(bar.physical_address, 0x8000_0000);
+        assert_eq!(bar.guest_address, resource.guest_address);
+        assert_eq!(assignments.assigned_bar(3, 0x10, 0), None);
+        assert_eq!(assignments.assigned_bar(2, 0x18, 0), None);
+        assert_eq!(assignments.assigned_bar(2, 0x10, 2), None);
+    }
+
+    #[test]
+    fn opregion_version_uses_header_not_bios_text() {
+        let mut header = [0_u8; 32];
+        header[22] = 1;
+        header[23] = 2;
+        header[24..28].copy_from_slice(b"BIOS");
+        assert_eq!(intel_opregion_version(&header), Some((2, 1)));
+        header[22] = 0;
+        assert_eq!(intel_opregion_version(&header), Some((2, 0)));
+        header[23] = 3;
+        assert_eq!(intel_opregion_version(&header), Some((3, 0)));
+        assert_eq!(intel_opregion_version(&header[..23]), None);
+    }
+
+    #[test]
+    fn opregion_asls_preserves_firmware_byte_address() {
+        assert_eq!(intel_opregion_address_from_asls(0x43ab_d018), Some(0x43ab_d018));
+        assert_eq!(intel_opregion_address_from_asls(0x43ab_d000), Some(0x43ab_d000));
+        assert_eq!(intel_opregion_address_from_asls(0), None);
+        assert_eq!(intel_opregion_address_from_asls(u32::MAX), None);
     }
 
     #[test]
@@ -1653,6 +1718,22 @@ mod tests {
         let mut routed = assignments.route_pending(0b01);
         assert_eq!(routed.next(), Some((2, 0x42)));
         assert_eq!(routed.next(), None);
+    }
+
+    #[test]
+    fn msi_mask_layout_requires_per_vector_mask_support() {
+        assert_eq!(msi_mask_offset(0), None);
+        assert_eq!(msi_mask_offset(MSI_64_BIT), None);
+        assert_eq!(msi_mask_offset(MSI_PER_VECTOR_MASK), Some(0x0c));
+        assert_eq!(msi_mask_offset(MSI_PER_VECTOR_MASK | MSI_64_BIT), Some(0x10));
+    }
+
+    #[test]
+    fn msi_unmask_releases_only_the_assigned_message() {
+        assert_eq!(msi_vector_mask(u32::MAX, false), 0xffff_fffe);
+        assert_eq!(msi_vector_mask(0xffff_fffe, true), u32::MAX);
+        assert_eq!(msi_vector_mask(0, false), 0);
+        assert_eq!(msi_vector_mask(0, true), 1);
     }
 
     #[test]

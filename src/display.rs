@@ -9,6 +9,22 @@ static HEIGHT: AtomicUsize = AtomicUsize::new(0);
 static STRIDE: AtomicUsize = AtomicUsize::new(0);
 static ORDER: AtomicU8 = AtomicU8::new(0);
 
+#[path = "console_font.rs"]
+mod console_font;
+
+pub fn text_console_begin() { fill(0); }
+
+pub fn text_console_cell(column: usize, row: usize, byte: u8) {
+    let scale = if WIDTH.load(Ordering::Relaxed) >= 1568 && HEIGHT.load(Ordering::Relaxed) >= 800 { 2 } else { 1 };
+    let glyph = console_font::GLYPHS[(byte.clamp(b' ', b'~') - b' ') as usize];
+    for (y, bits) in glyph.iter().enumerate() {
+        for x in 0..8 {
+            let color = if bits & (0x80 >> x) != 0 { 0x00cc_cccc } else { 0 };
+            rectangle(8 + (column * 8 + x) * scale, 8 + (row * 16 + y) * scale, scale, scale, color);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FramebufferInfo {
     pub address: u64,
@@ -282,47 +298,11 @@ pub fn console_page(message: &[u8]) -> bool {
     if ADDRESS.load(Ordering::Acquire) == 0 || message.is_empty() || message.len() > 4096 {
         return false;
     }
-    let mut line_count = 0_usize;
-    let mut line_length = 0_usize;
-    let mut maximum_length = 0_usize;
-    for &byte in message {
-        if byte == b'\n' {
-            maximum_length = maximum_length.max(line_length);
-            line_length = 0;
-            line_count += 1;
-        } else if (b' '..=b'~').contains(&byte) {
-            line_length += 1;
-        } else {
-            return false;
-        }
-    }
-    if line_length != 0 {
-        maximum_length = maximum_length.max(line_length);
-        line_count += 1;
-    }
-    if line_count == 0 || maximum_length == 0 || line_count > 32 {
-        return false;
-    }
-
-    let width = WIDTH.load(Ordering::Relaxed);
-    let height = HEIGHT.load(Ordering::Relaxed);
-    let width_scale = width / maximum_length.saturating_mul(6).max(1);
-    let height_scale = height / line_count.saturating_mul(10).max(1);
-    let scale = width_scale.min(height_scale).min(4).max(1);
-    let total_height = line_count * 10 * scale - 3 * scale;
-    let mut y = height.saturating_sub(total_height) / 2;
-    fill(0x0017_4F35);
-    for line in message.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let text_width = line.len().saturating_mul(6 * scale).saturating_sub(scale);
-        let x = width.saturating_sub(text_width) / 2;
-        draw_text(line, x, y, scale);
-        y += 10 * scale;
-    }
-    // The GOP framebuffer may be mapped write-combining. Complete every pixel
-    // store before the Hardware Domain is resumed and can reprogram the GPU.
+    // Boot services have ended: use the same fixed-size text style as printk,
+    // not the old centered, green diagnostic page.
+    let mut log = mboot::boot_log::BootLog::new();
+    log.append(message);
+    log.render_console(text_console_begin, text_console_cell);
     core::sync::atomic::fence(Ordering::SeqCst);
     true
 }
@@ -483,7 +463,9 @@ fn line_y(line: usize) -> usize {
 
 #[rustfmt::skip]
 fn glyph(character: u8) -> [u8; 7] {
-    match character {
+    // Reports retain their original case in the log. The boot font uses
+    // capitals so lowercase PCI aliases and errno labels remain readable.
+    match character.to_ascii_uppercase() {
         b'0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
         b'1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
         b'2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
@@ -503,12 +485,14 @@ fn glyph(character: u8) -> [u8; 7] {
         b'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
         b'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
         b'I' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111],
+        b'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100],
         b'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
         b'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
         b'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
         b'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
         b'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
         b'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        b'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
         b'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
         b'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
         b'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
@@ -517,6 +501,15 @@ fn glyph(character: u8) -> [u8; 7] {
         b'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010],
         b'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
         b'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+        b'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+        b'=' => [0, 0, 0b11111, 0, 0b11111, 0, 0],
+        b':' => [0, 0b00100, 0b00100, 0, 0b00100, 0b00100, 0],
+        b'.' => [0, 0, 0, 0, 0, 0b00100, 0b00100],
+        b'_' => [0, 0, 0, 0, 0, 0, 0b11111],
+        b'/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
+        b'(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
+        b')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
+        b'>' => [0, 0b10000, 0b01000, 0b00100, 0b01000, 0b10000, 0],
         b'-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
         _ => [0; 7],
     }

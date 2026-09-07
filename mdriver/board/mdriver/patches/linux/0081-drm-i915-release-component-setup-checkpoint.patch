@@ -1,0 +1,17 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: release the confirmed component setup checkpoint
+
+The state-preparation checkpoint now supersedes the earlier component
+setup checkpoint. Remove the old stop so diagnostic boot reaches it.
+
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c
+@@ -513,8 +513,6 @@
+ 	 * happen during gem/ggtt init.
+ 	 */
+ 	intel_hdcp_component_init(i915);
+-	mboot_gpu_probe_trace(i915->drm.dev, "i915-stop",
+-			      "PXP HDCP RETURNED BEFORE INITIAL COMMIT", 0);
+ 
+ 	/*
+ 	 * Force all active planes to recompute their states. So that on

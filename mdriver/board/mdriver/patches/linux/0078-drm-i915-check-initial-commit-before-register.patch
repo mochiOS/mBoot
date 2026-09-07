@@ -1,0 +1,43 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: check initial modeset before DRM registration
+
+Advance diagnostic boot through optional PXP and final display probe.
+Record initial commit errors before the existing display path ignores them.
+Keep optional PXP failures non-fatal. Stop before publishing DRM nodes.
+
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -880,17 +880,20 @@
+ 	mboot_gpu_probe_trace(&pdev->dev, "i915-stage", stage, ret);
+ 	if (ret)
+ 		goto out_cleanup_modeset2;
+-	mboot_gpu_probe_trace(&pdev->dev, "i915-stop",
+-			      "GEM OK BEFORE PXP DISPLAY", 0);
+ 
+ 	ret = intel_pxp_init(i915);
++	/* PXP is optional; retain its result without making it probe-fatal. */
++	mboot_gpu_probe_trace(&pdev->dev, "pxp", "INIT", ret);
+ 	if (ret && ret != -ENODEV)
+ 		drm_dbg(&i915->drm, "pxp init failed with %d\n", ret);
+ 
+ 	stage = "I915 DISPLAY";
+ 	ret = intel_display_driver_probe(i915);
++	mboot_gpu_probe_trace(&pdev->dev, "i915-stage", stage, ret);
+ 	if (ret)
+ 		goto out_cleanup_gem;
++	mboot_gpu_probe_trace(&pdev->dev, "i915-stop",
++			      "DISPLAY OK BEFORE DRM REGISTER", 0);
+ 
+ 	i915_driver_register(i915);
+ 
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c
+@@ -521,6 +521,7 @@
+ 	 * during bootup.
+ 	 */
+ 	ret = intel_initial_commit(&i915->drm);
++	mboot_gpu_probe_trace(i915->drm.dev, "i915-display", "INITIAL COMMIT", ret);
+ 	if (ret)
+ 		drm_dbg_kms(&i915->drm, "Initial modeset failed, %d\n", ret);
+ 
+

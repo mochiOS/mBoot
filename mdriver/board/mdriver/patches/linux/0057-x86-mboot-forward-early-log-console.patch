@@ -1,0 +1,91 @@
+From: mochiOS developers
+Subject: [PATCH] x86/mboot: retain early printk through the log-gated boot
+
+Activate a pre-enabled printk console during platform initialization only
+when mboot.log is configured. Forward retained and live kernel messages via
+the existing ConsoleWrite hypercall before any PCI or network driver probe.
+Unregister before releasing the first GPU probe. Do not use a physical UART,
+add a timer, or change scanout ownership.
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -4,6 +4,7 @@
+ #include <linux/bits.h>
+ #include <linux/blkdev.h>
+ #include <linux/build_bug.h>
++#include <linux/console.h>
+ #include <linux/crc32.h>
+ #include <linux/delay.h>
+ #include <linux/device/class.h>
+@@ -348,9 +349,9 @@
+ {
+ 	if (value && *value)
+ 		atomic_set(&mboot_gpu_probe_gate, 1);
+-	return 1;
++	return 0;
+ }
+-__setup("mboot.log=", mboot_gpu_wait_for_log);
++early_param("mboot.log", mboot_gpu_wait_for_log);
+ 
+ static unsigned long mboot_hypercall(unsigned long number,
+ 				     unsigned long arg0, unsigned long arg1,
+@@ -535,6 +536,36 @@
+ 	return result;
+ }
+ 
++/* Copy console chunks into a bounded direct-mapped stack buffer. No UART,
++ * allocation, network driver, or display driver is needed for this path. */
++static void mboot_log_console_write(struct console *console, const char *text,
++				    unsigned int count)
++{
++	char chunk[512];
++	const char prefix[] = "BOOT LOG\n";
++	const size_t header = sizeof(prefix) - 1;
++
++	if (atomic_read(&mboot_gpu_probe_gate) != 1)
++		return;
++	memcpy(chunk, prefix, header);
++	while (count) {
++		unsigned int size = min_t(unsigned int, count, sizeof(chunk) - header);
++
++		memcpy(chunk + header, text, size);
++		mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
++				virt_to_phys(chunk), header + size, 0);
++		text += size;
++		count -= size;
++	}
++}
++
++static struct console mboot_log_console = {
++	.name = "mbootlog",
++	.write = mboot_log_console_write,
++	.flags = CON_ENABLED | CON_PRINTBUFFER,
++	.index = -1,
++};
++
+ static bool __init mboot_pci_info_valid(const struct mboot_pci_device_info *info)
+ {
+ 	if (memchr_inv(info->reserved, 0, sizeof(info->reserved)) ||
+@@ -3890,6 +3921,8 @@
+ 		return -EINVAL;
+ 	if (atomic_cmpxchg(&mboot_gpu_probe_gate, 1, 2) != 1)
+ 		return -EALREADY;
++	/* No framebuffer diagnostic writes once GPU publication is released. */
++	unregister_console(&mboot_log_console);
+ 	pr_info("mDriver: log receiver acknowledged; starting first GPU probe\n");
+ 	mod_delayed_work(system_wq, &mboot_ready_work, 0);
+ 	return count;
+@@ -4019,6 +4052,11 @@
+ {
+ 	unsigned long tsc_khz = mboot_tsc_khz();
+ 
++	if (atomic_read(&mboot_gpu_probe_gate) == 1) {
++		register_console(&mboot_log_console);
++		pr_info("mDriver: early hypercall log console active; GPU probe held\n");
++	}
++
+ 	smp_found_config = 1;
+ 	if (tsc_khz) {
+ 		x86_platform.calibrate_cpu = mboot_tsc_khz;
+

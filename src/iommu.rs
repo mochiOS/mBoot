@@ -462,6 +462,11 @@ pub const fn deny_all_table_pages(kind: IommuKind) -> usize {
 }
 
 impl DmaRemapper {
+    /// Firmware identity ranges retained when assigning their requester.
+    pub fn reserved_mappings(&self) -> &[ReservedMapping] {
+        self.topology.reserved_mappings()
+    }
+
     /// Captures the small VT-d register set needed to diagnose a failed
     /// requester transition. The values are read only and do not acknowledge
     /// or clear faults.

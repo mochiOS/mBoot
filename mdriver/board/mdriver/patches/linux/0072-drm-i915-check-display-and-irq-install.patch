@@ -1,0 +1,43 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: check display preparation and assigned IRQ install
+
+Advance the opt-in checkpoint through display noirq preparation and IRQ
+handler installation. Record each result before outer probe cleanup.
+Stop before output setup and firmware plane reconstruction in nogem.
+
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -628,8 +628,6 @@
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "DRAM DETECT RETURNED", 0);
+ 
+ 	intel_bw_init_hw(dev_priv);
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
+-			      "HW PROBE OK BEFORE DISPLAY", 0);
+ 
+ 	return 0;
+ 
+@@ -869,18 +867,23 @@
+ 
+ 	stage = "I915 HW";
+ 	ret = i915_driver_hw_probe(i915);
++	mboot_gpu_probe_trace(&pdev->dev, "i915-stage", stage, ret);
+ 	if (ret < 0)
+ 		goto out_cleanup_mmio;
+ 
+ 	stage = "I915 DISPLAY NOIRQ";
+ 	ret = intel_display_driver_probe_noirq(i915);
++	mboot_gpu_probe_trace(&pdev->dev, "i915-stage", stage, ret);
+ 	if (ret < 0)
+ 		goto out_cleanup_hw;
+ 
+ 	stage = "I915 IRQ";
+ 	ret = intel_irq_install(i915);
++	mboot_gpu_probe_trace(&pdev->dev, "i915-stage", stage, ret);
+ 	if (ret)
+ 		goto out_cleanup_modeset;
++	mboot_gpu_probe_trace(&pdev->dev, "i915-stop",
++			      "IRQ INSTALLED BEFORE DISPLAY NOGEM", 0);
+ 
+ 	stage = "I915 DISPLAY NOGEM";
+ 	ret = intel_display_driver_probe_nogem(i915);
+

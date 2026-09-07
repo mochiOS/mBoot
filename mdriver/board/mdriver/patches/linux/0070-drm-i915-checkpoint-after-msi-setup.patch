@@ -1,0 +1,55 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: retain MSI setup result and checkpoint before GVT
+
+Advance the explicit diagnostic checkpoint past GGTT enable and MSI setup.
+Record the actual PCI MSI state and IRQ vector alongside mBoot's assigned
+vector, and preserve a negative setup result before subsequent operations.
+
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -547,10 +547,11 @@
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "MEMORY REGIONS", ret);
+ 	if (ret)
+ 		goto err_ggtt;
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+ 			      "AFTER MEMORY REGIONS BEFORE GGTT ENABLE", 0);
+ 
+ 	ret = i915_ggtt_enable_hw(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "GGTT ENABLE", ret);
+ 	if (ret) {
+ 		drm_err(&dev_priv->drm, "failed to enable GGTT\n");
+ 		goto err_mem_regions;
+@@ -578,9 +579,14 @@
+ 	 * prevents the other device from working properly.
+ 	 */
+ 	if (GRAPHICS_VER(dev_priv) >= 5) {
+-		if (pci_enable_msi(pdev) < 0)
++		int msi_ret = pci_enable_msi(pdev);
++
++		mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "MSI ENABLE", msi_ret);
++		if (msi_ret < 0)
+ 			drm_dbg(&dev_priv->drm, "can't enable MSI");
+ 	}
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++			      "AFTER MSI SETUP BEFORE GVT OPREGION", 0);
+ 
+ 	ret = intel_gvt_init(dev_priv);
+ 	if (ret)
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -907,6 +907,14 @@
+ 			"IRQ%u linux=%d vector=%x\n", i, frontend->irqs[i],
+ 			cfg ? cfg->vector : 0);
+ 	}
++	{
++		struct irq_cfg *cfg = irq_cfg(pdev->irq);
++
++		len += scnprintf(buf + len, PAGE_SIZE - len,
++			"PCI MSI_ENABLED=%u MSIX_ENABLED=%u CURRENT_IRQ=%u VECTOR=%x\n",
++			pdev->msi_enabled, pdev->msix_enabled, pdev->irq,
++			cfg ? cfg->vector : 0);
++	}
+ 	spin_lock_irqsave(&mboot_probe_lock, flags);
+ 	len += scnprintf(buf + len, PAGE_SIZE - len, "%s", frontend->probe_trace);
+ 	spin_unlock_irqrestore(&mboot_probe_lock, flags);

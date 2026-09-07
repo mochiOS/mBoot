@@ -1,0 +1,108 @@
+From: mochiOS developers
+Subject: [PATCH] x86/mboot: copy console messages into a valid GPA buffer
+
+CONFIG_VMAP_STACK invalidates virt_to_phys() on local diagnostic buffers.
+Use one bounded direct-mapped buffer protected against concurrent and
+recursive writers for all ConsoleWrite messages.
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -26,6 +26,7 @@
+ #include <linux/pci.h>
+ #include <linux/random.h>
+ #include <linux/slab.h>
++#include <linux/spinlock.h>
+ #include <linux/string.h>
+ #include <linux/unaligned.h>
+ #include <linux/workqueue.h>
+@@ -357,6 +358,27 @@
+ 				     unsigned long arg0, unsigned long arg1,
+ 				     unsigned long arg2);
+ 
++/* ConsoleWrite takes a GPA, not a vmalloc address. CONFIG_VMAP_STACK makes
++ * virt_to_phys(local_buffer) invalid after the early boot stack is left.
++ * Serialize one direct-mapped buffer; never wait on a recursive console. */
++static DEFINE_RAW_SPINLOCK(mboot_console_lock);
++static char mboot_console_buffer[4096];
++
++static void mboot_console_write_buffer(const char *text, size_t len,
++				       unsigned long detail)
++{
++	unsigned long flags;
++
++	if (len > sizeof(mboot_console_buffer))
++		return;
++	if (!raw_spin_trylock_irqsave(&mboot_console_lock, flags))
++		return;
++	memcpy(mboot_console_buffer, text, len);
++	mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
++			virt_to_phys(mboot_console_buffer), len, detail);
++	raw_spin_unlock_irqrestore(&mboot_console_lock, flags);
++}
++
+ static void mboot_boot_status(const char *status)
+ {
+ 	if (atomic_read(&mboot_gpu_probe_gate) == 1 &&
+@@ -364,18 +386,15 @@
+ 		char page[256];
+ 		int len = scnprintf(page, sizeof(page), "BOOT STATUS\n%s", status + 8);
+ 
+-		mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
+-				virt_to_phys(page), len, 0);
++		mboot_console_write_buffer(page, len, 0);
+ 		return;
+ 	}
+-	mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
+-			virt_to_phys((void *)status), strlen(status), 0);
++	mboot_console_write_buffer(status, strlen(status), 0);
+ }
+ 
+ void mboot_boot_device_status(const char *operation, u16 requester)
+ {
+-	mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
+-			virt_to_phys((void *)operation), strlen(operation),
++	mboot_console_write_buffer(operation, strlen(operation),
+ 			(unsigned long)requester + 1);
+ }
+ #define mboot_boot_device_error mboot_boot_device_status
+@@ -385,8 +404,7 @@
+ void mboot_boot_driver_error(const char *operation, u16 error)
+ {
+ 	mboot_display_probe_error = true;
+-	mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
+-			virt_to_phys((void *)operation), strlen(operation),
++	mboot_console_write_buffer(operation, strlen(operation),
+ 			MBOOT_CONSOLE_ERROR | ((unsigned long)error + 1));
+ }
+ 
+@@ -536,7 +554,7 @@
+ 	return result;
+ }
+ 
+-/* Copy console chunks into a bounded direct-mapped stack buffer. No UART,
++/* Copy console chunks into the bounded GPA transport buffer. No UART,
+  * allocation, network driver, or display driver is needed for this path. */
+ static void mboot_log_console_write(struct console *console, const char *text,
+ 				    unsigned int count)
+@@ -552,8 +570,7 @@
+ 		unsigned int size = min_t(unsigned int, count, sizeof(chunk) - header);
+ 
+ 		memcpy(chunk + header, text, size);
+-		mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
+-				virt_to_phys(chunk), header + size, 0);
++		mboot_console_write_buffer(chunk, header + size, 0);
+ 		text += size;
+ 		count -= size;
+ 	}
+@@ -876,8 +893,7 @@
+ 	pr_info("mDriver: %s", report);
+ 	/* Existing error channel; never request a modeset or a scanout change. */
+ 	if (!device_is_bound(&pdev->dev))
+-		mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
+-				virt_to_phys(report), len, MBOOT_CONSOLE_ERROR | 1);
++		mboot_console_write_buffer(report, len, MBOOT_CONSOLE_ERROR | 1);
+ 	free_page((unsigned long)report);
+ }
+ 
+

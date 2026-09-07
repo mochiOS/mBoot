@@ -1,0 +1,35 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: checkpoint after tiles and memory regions
+
+Advance the opt-in diagnostic stop through GT tile and memory-region
+initialization. Preserve either failure before cleanup and stop before
+GGTT enable on success. No new modeset, reset or retry is added.
+
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -531,7 +531,7 @@
+ 	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "GGTT INIT", ret);
+ 	if (ret)
+ 		goto err_ggtt;
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+ 			      "AFTER GGTT INIT BEFORE TILES", 0);
+ 
+ 	/*
+@@ -539,12 +539,16 @@
+ 	 * might be different due to bar resizing.
+ 	 */
+ 	ret = intel_gt_tiles_init(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "GT TILES", ret);
+ 	if (ret)
+ 		goto err_ggtt;
+ 
+ 	ret = intel_memory_regions_hw_probe(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-hw", "MEMORY REGIONS", ret);
+ 	if (ret)
+ 		goto err_ggtt;
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++			      "AFTER MEMORY REGIONS BEFORE GGTT ENABLE", 0);
+ 
+ 	ret = i915_ggtt_enable_hw(dev_priv);
+ 	if (ret) {

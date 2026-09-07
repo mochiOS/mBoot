@@ -1,0 +1,58 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: check commit preparation before tail execution
+
+Atomic validation completed on hardware. Record runtime PM, prepare,
+setup and swap results for the internal synchronous commit. Stop before
+scheduling or flushing commit work and before hardware tail execution.
+
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -7622,10 +7622,9 @@
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+ 	int ret = 0;
+ 
+-	if (state->internal && !nonblock)
+-		mboot_gpu_probe_trace(dev->dev, "i915-stop",
+-				      "ATOMIC CHECK OK BEFORE COMMIT PREPARE", 0);
+ 	state->wakeref = intel_runtime_pm_get(&dev_priv->runtime_pm);
++	if (state->internal && !nonblock)
++		mboot_gpu_probe_trace(dev->dev, "i915-commit", "RUNTIME PM RETURNED", 0);
+ 
+ 	/*
+ 	 * The intel_legacy_cursor_update() fast path takes care
+@@ -7656,6 +7655,8 @@
+ 	}
+ 
+ 	ret = intel_atomic_prepare_commit(state);
++	if (state->internal && !nonblock)
++		mboot_gpu_probe_trace(dev->dev, "i915-commit", "PREPARE", ret);
+ 	if (ret) {
+ 		drm_dbg_atomic(&dev_priv->drm,
+ 			       "Preparing state failed with %i\n", ret);
+@@ -7664,8 +7665,13 @@
+ 	}
+ 
+ 	ret = intel_atomic_setup_commit(state, nonblock);
+-	if (!ret)
++	if (state->internal && !nonblock)
++		mboot_gpu_probe_trace(dev->dev, "i915-commit", "SETUP", ret);
++	if (!ret) {
+ 		ret = intel_atomic_swap_state(state);
++		if (state->internal && !nonblock)
++			mboot_gpu_probe_trace(dev->dev, "i915-commit", "SWAP STATE", ret);
++	}
+ 
+ 	if (ret) {
+ 		struct intel_crtc_state *new_crtc_state;
+@@ -7680,6 +7686,10 @@
+ 		return ret;
+ 	}
+ 
++	if (state->internal && !nonblock)
++		mboot_gpu_probe_trace(dev->dev, "i915-stop",
++				      state->modeset ? "SWAP OK BEFORE TAIL MODESET 1" :
++				      "SWAP OK BEFORE TAIL MODESET 0", 0);
+ 	drm_atomic_state_get(&state->base);
+ 	INIT_WORK(&state->base.commit_work, intel_atomic_commit_work);
+ 
+

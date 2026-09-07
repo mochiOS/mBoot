@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod arch;
+pub mod boot_log;
 pub mod bundle;
 pub mod cpuid;
 pub mod device;

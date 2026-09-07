@@ -1,0 +1,113 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: report destructive firmware takeover decisions
+
+Continue output setup and stop diagnostic boot immediately before the
+sanitizer disables an active CRTC or failed BIOS framebuffer adoption
+disables the primary plane. Preserve routing reasons and initial plane
+memory evidence without skipping cleanup in normal boot.
+
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c
+@@ -470,15 +470,16 @@
+ 
+ 	intel_display_driver_disable_user_access(i915);
+ 
+-	/* Stop outside modeset locks, before sanitization can disable a pipe. */
+-	mboot_gpu_probe_trace(i915->drm.dev, "i915-stop",
+-			      "OUTPUTS READY BEFORE HW STATE SANITIZE", 0);
+ 	drm_modeset_lock_all(dev);
+ 	intel_modeset_setup_hw_state(i915, dev->mode_config.acquire_ctx);
+ 	intel_acpi_assign_connector_fwnodes(display);
+ 	drm_modeset_unlock_all(dev);
+ 
++	mboot_gpu_probe_trace(i915->drm.dev, "i915-display",
++			      "HW STATE SANITIZE RETURNED", 0);
+ 	intel_initial_plane_config(i915);
++	mboot_gpu_probe_trace(i915->drm.dev, "i915-display",
++			      "INITIAL PLANE CONFIG RETURNED", 0);
+ 
+ 	/*
+ 	 * Make sure hardware watermarks really match the state we read out.
+--- a/drivers/gpu/drm/i915/display/intel_modeset_setup.c
++++ b/drivers/gpu/drm/i915/display/intel_modeset_setup.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <drm/drm_atomic_uapi.h>
++#include <linux/mboot_probe.h>
+ #include <drm/drm_atomic_state_helper.h>
+ 
+ #include "i915_drv.h"
+@@ -507,6 +508,15 @@
+ 	if (!needs_link_reset && intel_crtc_has_encoders(crtc))
+ 		return false;
+ 
++	{
++		char reason[96];
++
++		scnprintf(reason, sizeof(reason),
++			  "BEFORE CRTC DISABLE PIPE %c LINK_RESET %u ENCODERS %u",
++			  pipe_name(crtc->pipe), needs_link_reset,
++			  !!intel_crtc_has_encoders(crtc));
++		mboot_gpu_probe_trace(i915->drm.dev, "i915-stop", reason, 0);
++	}
+ 	intel_crtc_disable_noatomic(crtc, ctx);
+ 
+ 	/*
+--- a/drivers/gpu/drm/i915/display/intel_plane_initial.c
++++ b/drivers/gpu/drm/i915/display/intel_plane_initial.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "gem/i915_gem_lmem.h"
++#include <linux/mboot_probe.h>
+ #include "gem/i915_gem_region.h"
+ #include "i915_drv.h"
+ #include "intel_atomic_plane.h"
+@@ -112,6 +113,8 @@
+ 
+ 	mem = i915->mm.stolen_region;
+ 	if (!mem) {
++		mboot_gpu_probe_trace(i915->drm.dev, "initial-plane",
++				      "NO STOLEN REGION", -ENODEV);
+ 		drm_dbg_kms(&i915->drm,
+ 			    "Initial plane memory region not initialized\n");
+ 		return false;
+@@ -176,6 +179,8 @@
+ 					       I915_BO_ALLOC_USER |
+ 					       I915_BO_PREALLOC);
+ 	if (IS_ERR(obj)) {
++		mboot_gpu_probe_trace(i915->drm.dev, "initial-plane",
++				      "CREATE REGION OBJECT", PTR_ERR(obj));
+ 		drm_dbg_kms(&i915->drm, "Failed to preallocate initial FB in %s\n",
+ 			    mem->region.name);
+ 		return NULL;
+@@ -337,6 +342,18 @@
+ 	if (!plane_config->fb)
+ 		return;
+ 
++	{
++		char info[144];
++		struct intel_memory_region *mem = dev_priv->mm.stolen_region;
++
++		scnprintf(info, sizeof(info),
++			  "PIPE %c GGTT %x SIZE %x STOLEN %u RANGE %llx..%llx",
++			  pipe_name(crtc->pipe), plane_config->base,
++			  plane_config->size, !!mem,
++			  mem ? (unsigned long long)mem->region.start : 0ULL,
++			  mem ? (unsigned long long)mem->region.end : 0ULL);
++		mboot_gpu_probe_trace(dev_priv->drm.dev, "initial-plane", info, 0);
++	}
+ 	if (intel_alloc_initial_plane_obj(crtc, plane_config)) {
+ 		fb = &plane_config->fb->base;
+ 		vma = plane_config->vma;
+@@ -357,6 +374,8 @@
+ 	 * simplest solution is to just disable the primary plane now and
+ 	 * pretend the BIOS never had it enabled.
+ 	 */
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++			      "BIOS FB REBUILD FAILED BEFORE PRIMARY DISABLE", 0);
+ 	intel_plane_disable_noatomic(crtc, plane);
+ 
+ 	return;
+

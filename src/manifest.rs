@@ -464,6 +464,7 @@ impl<'a> LaunchManifest<'a> {
                             | ManifestDeviceKind::Nvme
                             | ManifestDeviceKind::Vmd
                             | ManifestDeviceKind::Usb
+                            | ManifestDeviceKind::Network
                     )))
             || (block_device
                 && usize::from(device.is_ephemeral())
@@ -726,6 +727,19 @@ mod tests {
         assert_eq!(device.requester, AUTO_REQUESTER);
         assert_eq!(device.kind, ManifestDeviceKind::Display);
         assert!(device.is_required());
+    }
+
+    #[test]
+    fn parses_an_automatic_network_policy() {
+        let mut bytes = manifest_with_device();
+        let offset = MANIFEST_HEADER_SIZE + 2 * DOMAIN_ENTRY_SIZE;
+        bytes[offset + 2..offset + 4].copy_from_slice(&AUTO_REQUESTER.to_le_bytes());
+        bytes[offset + 4..offset + 6]
+            .copy_from_slice(&(ManifestDeviceKind::Network as u16).to_le_bytes());
+        bytes[offset + 6..offset + 8].copy_from_slice(&DEVICE_FLAG_REQUIRED.to_le_bytes());
+        let digest = Sha256::digest(&bytes).into();
+        let manifest = LaunchManifest::parse(&bytes, digest).unwrap();
+        assert_eq!(manifest.device(0).unwrap().kind, ManifestDeviceKind::Network);
     }
 
     #[test]

@@ -1,0 +1,37 @@
+From: mochiOS developers
+Subject: [PATCH] x86/mboot: include guest ASLS in fixed MMIO report
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -903,6 +903,7 @@
+ 		char report[768];
+ 		u16 command = 0;
+ 		u32 first = 0, second = 0;
++		u32 asls = 0;
+ 		int len;
+ 
+ 		if (device->info.class != PCI_BASE_CLASS_DISPLAY)
+@@ -917,6 +918,7 @@
+ 		}
+ 		found = true;
+ 		pci_read_config_word(pdev, PCI_COMMAND, &command);
++		pci_read_config_dword(pdev, 0xfc, &asls);
+ 		if ((command & PCI_COMMAND_MEMORY) &&
+ 		    (pci_resource_flags(pdev, 0) & IORESOURCE_MEM) &&
+ 		    pci_resource_len(pdev, 0) >= 0xa18c)
+@@ -929,13 +931,13 @@
+ 		len = scnprintf(report, sizeof(report),
+ 			"GPU MMIO CHECK\nSTOPPED BEFORE I915 / NO KMS\n"
+ 			"BDF %s ID %04x:%04x REV %02x\n"
+-			"LINUX COMMAND %04x\n"
++			"LINUX COMMAND %04x ASLS %08x\n"
+ 			"LINUX BAR0 GPA %llx SIZE %llx FLAGS %lx\n"
+ 			"LINUX BAR2 GPA %llx SIZE %llx FLAGS %lx\n"
+ 			"LINUX FORCEWAKE_MT OFFSET 0000a188\n"
+ 			"LINUX READ_VALID %u VALUES %08x %08x\n",
+ 			pci_name(pdev), pdev->vendor, pdev->device, pdev->revision,
+-			command, (u64)pci_resource_start(pdev, 0),
++			command, asls, (u64)pci_resource_start(pdev, 0),
+ 			(u64)pci_resource_len(pdev, 0), pci_resource_flags(pdev, 0),
+ 			(u64)pci_resource_start(pdev, 2),
+ 			(u64)pci_resource_len(pdev, 2), pci_resource_flags(pdev, 2),

@@ -1,0 +1,32 @@
+From: mochiOS developers
+Subject: [PATCH] PCI: scan isolated PCI functions in mBoot guests
+
+mBoot exposes assigned PCI functions only. Function zero of a physical
+slot may remain outside the guest while function six is assigned. Treat
+mBoot like the existing isolated-function hypervisors so pci_scan_slot()
+does not stop at an absent function zero. The config backend continues
+to deny access to all functions not assigned to this domain.
+
+diff --git a/include/linux/hypervisor.h b/include/linux/hypervisor.h
+--- a/include/linux/hypervisor.h
++++ b/include/linux/hypervisor.h
+@@ -9,6 +9,7 @@
+ 
+ #ifdef CONFIG_X86
+ 
++#include <asm/hypervisor.h>
+ #include <asm/jailhouse_para.h>
+ #include <asm/x86_init.h>
+ 
+@@ -34,6 +35,11 @@
+ 
+ static inline bool hypervisor_isolated_pci_functions(void)
+ {
++#ifdef CONFIG_X86
++	if (hypervisor_is_type(X86_HYPER_MBOOT))
++		return true;
++#endif
++
+ 	if (IS_ENABLED(CONFIG_S390))
+ 		return true;
+ 

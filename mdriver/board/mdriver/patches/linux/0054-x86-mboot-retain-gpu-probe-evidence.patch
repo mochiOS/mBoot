@@ -1,0 +1,465 @@
+From: mochiOS developers
+Subject: [PATCH] x86/mboot: retain PCI matching and GPU probe evidence
+
+Record the initial attach return, PCI match, bus and driver probe results,
+defer reasons, and i915 MMIO substage failures. Expose a bounded report in
+sysfs and through the existing boot error console without changing scanout.
+
+diff --git a/arch/x86/kernel/cpu/mboot.c b/arch/x86/kernel/cpu/mboot.c
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -19,6 +19,7 @@
+ #include <linux/kthread.h>
+ #include <linux/miscdevice.h>
+ #include <linux/mm.h>
++#include <linux/mboot_probe.h>
+ #include <linux/numa.h>
+ #include <linux/overflow.h>
+ #include <linux/pci.h>
+@@ -329,6 +330,8 @@
+ 	unsigned int irq_count;
+ 	bool driver_matched;
+ 	bool driver_bound;
++	char probe_trace[2048];
++	size_t probe_trace_len;
+ };
+ 
+ static struct mboot_pci_frontend mboot_pci_devices[MBOOT_MAX_ASSIGNED_DEVICES];
+@@ -706,6 +709,126 @@
+ 	.write = mboot_pci_config_write,
+ };
+ 
++static DEFINE_SPINLOCK(mboot_probe_lock);
++
++void mboot_gpu_probe_trace(struct device *dev, const char *event,
++			   const char *detail, int result)
++{
++	struct mboot_pci_frontend *frontend;
++	struct pci_dev *pdev;
++	unsigned long flags;
++	char line[192];
++	size_t len;
++
++	if (!dev_is_pci(dev))
++		return;
++	pdev = to_pci_dev(dev);
++	if (pdev->bus->ops != &mboot_pci_ops ||
++	    pdev->class >> 16 != PCI_BASE_CLASS_DISPLAY)
++		return;
++	frontend = mboot_pci_find(pdev->bus->number, pdev->devfn);
++	if (!frontend)
++		return;
++	len = scnprintf(line, sizeof(line), "%s %s rc=%d\n",
++			event, detail ?: "-", result);
++	/* Defer reasons can contain a trailing newline. Keep one event per line. */
++	for (size_t i = 0; i + 1 < len; i++)
++		if (line[i] < ' ' || line[i] > '~')
++			line[i] = ' ';
++	pr_info("mDriver GPU %s: %s", pci_name(pdev), line);
++	spin_lock_irqsave(&mboot_probe_lock, flags);
++	/* Preserve the first attempt; do not let readiness polling erase it. */
++	if (frontend->probe_trace_len + len < sizeof(frontend->probe_trace)) {
++		memcpy(frontend->probe_trace + frontend->probe_trace_len, line, len + 1);
++		frontend->probe_trace_len += len;
++	}
++	spin_unlock_irqrestore(&mboot_probe_lock, flags);
++}
++
++static ssize_t gpu_probe_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct mboot_pci_frontend *frontend =
++		mboot_pci_find(pdev->bus->number, pdev->devfn);
++	unsigned long flags;
++	u32 opregion = 0, bdsm = 0, bgsm = 0;
++	u16 command = 0;
++	unsigned long physical_command;
++	size_t len = 0;
++	unsigned int i;
++
++	pci_read_config_word(pdev, PCI_COMMAND, &command);
++	pci_read_config_dword(pdev, 0xfc, &opregion);
++	pci_read_config_dword(pdev, 0x5c, &bdsm);
++	pci_read_config_dword(pdev, 0x70, &bgsm);
++	physical_command = mboot_hypercall(MBOOT_HYPERCALL_DEVICE_CONFIG_READ,
++					  frontend->info.requester, PCI_COMMAND, 0);
++	len += scnprintf(buf + len, PAGE_SIZE - len,
++		"GPU PROBE REPORT %s\n"
++		"id=%04x:%04x rev=%02x class=%06x command=%04x (guest shadow)\n"
++		"pci:v%08Xd%08Xsv%08Xsd%08Xbc%02Xsc%02Xi%02X\n"
++		"bound=%u driver=%s can_match=%u match_driver=%u\n",
++		pci_name(pdev), pdev->vendor, pdev->device, pdev->revision,
++		pdev->class, command, pdev->vendor, pdev->device,
++		pdev->subsystem_vendor, pdev->subsystem_device,
++		pdev->class >> 16, (pdev->class >> 8) & 0xff, pdev->class & 0xff,
++		device_is_bound(dev), dev_driver_string(dev), dev->can_match,
++		pdev->match_driver);
++	len += scnprintf(buf + len, PAGE_SIZE - len,
++		"i915_registered=%u physical_config=%lx (command=low16; error if >ffffffff)\n",
++		!!driver_find("i915", &pci_bus_type), physical_command);
++	if (pdev->vendor == PCI_VENDOR_ID_INTEL && frontend->info.requester == 0x10) {
++		struct mboot_pci_frontend *bridge = mboot_pci_find(0, 0);
++
++		if (bridge)
++			len += scnprintf(buf + len, PAGE_SIZE - len,
++				"host bridge BDSM=%08x BGSM=%08x TOLUD=%08x (raw)\n",
++				bridge->config[0xb0 / 4], bridge->config[0xb4 / 4],
++				bridge->config[0xbc / 4]);
++	}
++	for (i = 0; i <= 2; i += 2)
++		len += scnprintf(buf + len, PAGE_SIZE - len,
++			"BAR%u start=%llx size=%llx flags=%lx\n", i,
++			(unsigned long long)pci_resource_start(pdev, i),
++			(unsigned long long)pci_resource_len(pdev, i),
++			pci_resource_flags(pdev, i));
++	len += scnprintf(buf + len, PAGE_SIZE - len,
++		"OpRegion=%08x address_set=%u BDSM=%08x BGSM=%08x (raw)\n"
++		"IRQ transport=%s linux_irq=%u vectors=%u\n",
++		opregion, opregion && opregion != ~0U, bdsm, bgsm,
++		pci_msix_vec_count(pdev) > 0 ? "MSI-X" : "MSI", pdev->irq,
++		frontend->irq_count);
++	for (i = 0; i < frontend->irq_count; i++) {
++		struct irq_cfg *cfg = irq_cfg(frontend->irqs[i]);
++
++		len += scnprintf(buf + len, PAGE_SIZE - len,
++			"IRQ%u linux=%d vector=%x\n", i, frontend->irqs[i],
++			cfg ? cfg->vector : 0);
++	}
++	spin_lock_irqsave(&mboot_probe_lock, flags);
++	len += scnprintf(buf + len, PAGE_SIZE - len, "%s", frontend->probe_trace);
++	spin_unlock_irqrestore(&mboot_probe_lock, flags);
++	return len;
++}
++static DEVICE_ATTR_RO(gpu_probe);
++
++static void mboot_gpu_probe_report(struct pci_dev *pdev)
++{
++	char *report = (char *)get_zeroed_page(GFP_KERNEL);
++	ssize_t len;
++
++	if (!report)
++		return;
++	len = gpu_probe_show(&pdev->dev, NULL, report);
++	pr_info("mDriver: %s", report);
++	/* Existing error channel; never request a modeset or a scanout change. */
++	if (!device_is_bound(&pdev->dev))
++		mboot_hypercall(MBOOT_HYPERCALL_CONSOLE_WRITE,
++				virt_to_phys(report), len, MBOOT_CONSOLE_ERROR | 1);
++	free_page((unsigned long)report);
++}
++
+ static int __init mboot_pci_load_config(struct mboot_pci_frontend *device)
+ {
+ 	unsigned int offset;
+@@ -947,6 +1070,13 @@
+ 			if (!pdev)
+ 				return -ENODEV;
+ 			pci_bus_add_device(pdev);
++			if (display) {
++				int error = device_create_file(&pdev->dev, &dev_attr_gpu_probe);
++
++				if (error)
++					pci_warn(pdev, "gpu_probe sysfs failed: %d\n", error);
++				mboot_gpu_probe_report(pdev);
++			}
+ 			device->driver_matched = pdev->dev.can_match;
+ 			device->driver_bound = device_is_bound(&pdev->dev);
+ 			pci_dev_put(pdev);
+@@ -3736,15 +3866,14 @@
+ 			mboot_boot_device_error("GPU RETRY",
+ 						device->info.requester);
+ 			result = device_attach(&pdev->dev);
++			mboot_gpu_probe_trace(&pdev->dev, "attach-late", NULL, result);
+ 			pr_info("mDriver: display %04x reprobe result=%d\n",
+ 				device->info.requester, result);
+ 		}
+ 		device->driver_matched = pdev->dev.can_match;
+ 		device->driver_bound = device_is_bound(&pdev->dev);
++		mboot_gpu_probe_report(pdev);
+ 		pci_dev_put(pdev);
+-		if (!device->driver_bound && !mboot_display_probe_error)
+-			mboot_boot_device_error("GPU UNBOUND",
+-						device->info.requester);
+ 	}
+ }
+ 
+diff --git a/drivers/pci/bus.c b/drivers/pci/bus.c
+--- a/drivers/pci/bus.c
++++ b/drivers/pci/bus.c
+@@ -7,6 +7,7 @@
+  *	Ivan Kokshaysky (ink@jurassic.park.msu.ru)
+  */
+ #include <linux/module.h>
++#include <linux/mboot_probe.h>
+ #include <linux/kernel.h>
+ #include <linux/pci.h>
+ #include <linux/errno.h>
+@@ -348,6 +349,7 @@
+ 
+ 	dev->match_driver = !dn || of_device_is_available(dn);
+ 	retval = device_attach(&dev->dev);
++	mboot_gpu_probe_trace(&dev->dev, "attach-initial", NULL, retval);
+ 	if (retval < 0 && retval != -EPROBE_DEFER)
+ 		pci_warn(dev, "device attach failed (%d)\n", retval);
+ 
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/pci.h>
++#include <linux/mboot_probe.h>
+ #include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/device.h>
+@@ -330,7 +331,9 @@
+ 	 */
+ 	pm_runtime_get_sync(dev);
+ 	pci_dev->driver = pci_drv;
++	mboot_gpu_probe_trace(dev, "probe-enter", pci_drv->name, 0);
+ 	rc = pci_drv->probe(pci_dev, ddi->id);
++	mboot_gpu_probe_trace(dev, "probe-exit", pci_drv->name, rc);
+ 	if (!rc)
+ 		return rc;
+ 	if (rc < 0) {
+@@ -1527,6 +1530,8 @@
+ 
+ 	pci_drv = (struct pci_driver *)to_pci_driver(drv);
+ 	found_id = pci_match_device(pci_drv, pci_dev);
++	if (found_id || !strcmp(drv->name, "i915"))
++		mboot_gpu_probe_trace(dev, "match", drv->name, !!found_id);
+ 	if (found_id)
+ 		return 1;
+ 
+diff --git a/drivers/base/dd.c b/drivers/base/dd.c
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -28,6 +28,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/pinctrl/devinfo.h>
+ #include <linux/slab.h>
++#include <linux/mboot_probe.h>
+ 
+ #include "base.h"
+ #include "power/power.h"
+@@ -73,6 +74,9 @@
+ {
+ 	kfree(dev->p->deferred_probe_reason);
+ 	dev->p->deferred_probe_reason = reason;
++	if (reason)
++		mboot_gpu_probe_trace((struct device *)dev, "defer-reason", reason,
++				      -EPROBE_DEFER);
+ }
+ 
+ /*
+@@ -632,11 +636,14 @@
+ {
+ 	int ret = 0;
+ 
++	mboot_gpu_probe_trace(dev, "bus-probe-enter", drv->name, 0);
++
+ 	if (dev->bus->probe)
+ 		ret = dev->bus->probe(dev);
+ 	else if (drv->probe)
+ 		ret = drv->probe(dev);
+ 
++	mboot_gpu_probe_trace(dev, "bus-probe-exit", drv->name, ret);
+ 	switch (ret) {
+ 	case 0:
+ 		break;
+@@ -906,6 +913,8 @@
+ 
+ 	atomic_inc(&probe_count);
+ 	ret = __driver_probe_device(drv, dev);
++	/* Includes core failures before the bus callback; positive is inverted errno. */
++	mboot_gpu_probe_trace(dev, "core-exit-raw", drv->name, ret);
+ 	if (ret == -EPROBE_DEFER || ret == EPROBE_DEFER) {
+ 		driver_deferred_probe_add(dev);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -108,10 +108,13 @@
+ 
+ extern void mboot_boot_driver_error(const char *operation, u16 error);
+ 
+-static void i915_mboot_probe_error(const char *stage, int error)
++#include <linux/mboot_probe.h>
++
++static void i915_mboot_probe_error(struct pci_dev *pdev, const char *stage, int error)
+ {
+ 	unsigned int code = error < 0 ? -error : error;
+ 
++	mboot_gpu_probe_trace(&pdev->dev, "i915-error", stage, error);
+ 	mboot_boot_driver_error(stage, min(code, 0xffffU));
+ }
+ 
+@@ -323,19 +326,25 @@
+ 		return -ENODEV;
+ 
+ 	ret = intel_gmch_bridge_setup(dev_priv);
+-	if (ret < 0)
++	if (ret < 0) {
++		mboot_gpu_probe_trace(dev_priv->drm.dev, "mmio-error", "gmch-bridge", ret);
+ 		return ret;
++	}
+ 
+ 	for_each_gt(gt, dev_priv, i) {
+ 		ret = intel_uncore_init_mmio(gt->uncore);
+-		if (ret)
++		if (ret) {
++			mboot_gpu_probe_trace(dev_priv->drm.dev, "mmio-error", "uncore-init", ret);
+ 			return ret;
++		}
+ 
+ 		ret = drmm_add_action_or_reset(&dev_priv->drm,
+ 					       intel_uncore_fini_mmio,
+ 					       gt->uncore);
+-		if (ret)
++		if (ret) {
++			mboot_gpu_probe_trace(dev_priv->drm.dev, "mmio-error", "uncore-action", ret);
+ 			return ret;
++		}
+ 	}
+ 
+ 	/* Try to make sure MCHBAR is enabled before poking at it */
+@@ -345,8 +354,10 @@
+ 
+ 	for_each_gt(gt, dev_priv, i) {
+ 		ret = intel_gt_init_mmio(gt);
+-		if (ret)
++		if (ret) {
++			mboot_gpu_probe_trace(dev_priv->drm.dev, "mmio-error", "gt-init", ret);
+ 			goto err_uncore;
++		}
+ 	}
+ 
+ 	/* As early as possible, scrub existing GPU state before clobbering */
+@@ -765,7 +776,7 @@
+ 	ret = pci_enable_device(pdev);
+ 	if (ret) {
+ 		pr_err("Failed to enable graphics device: %pe\n", ERR_PTR(ret));
+-		i915_mboot_probe_error(stage, ret);
++		i915_mboot_probe_error(pdev, stage, ret);
+ 		return ret;
+ 	}
+ 
+@@ -774,7 +785,7 @@
+ 	if (IS_ERR(i915)) {
+ 		ret = PTR_ERR(i915);
+ 		pci_disable_device(pdev);
+-		i915_mboot_probe_error(stage, ret);
++		i915_mboot_probe_error(pdev, stage, ret);
+ 		return ret;
+ 	}
+ 
+@@ -869,7 +880,7 @@
+ out_pci_disable:
+ 	pci_disable_device(pdev);
+ 	i915_probe_error(i915, "Device initialization failed (%d)\n", ret);
+-	i915_mboot_probe_error(stage, ret);
++	i915_mboot_probe_error(pdev, stage, ret);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_pci.c b/drivers/gpu/drm/i915/i915_pci.c
+--- a/drivers/gpu/drm/i915/i915_pci.c
++++ b/drivers/gpu/drm/i915/i915_pci.c
+@@ -39,10 +39,13 @@
+ 
+ extern void mboot_boot_driver_error(const char *operation, u16 error);
+ 
+-static int i915_mboot_reject(const char *stage, int error)
++#include <linux/mboot_probe.h>
++
++static int i915_mboot_reject(struct pci_dev *pdev, const char *stage, int error)
+ {
+ 	unsigned int code = error < 0 ? -error : error;
+ 
++	mboot_gpu_probe_trace(&pdev->dev, "i915-reject", stage, error);
+ 	mboot_boot_driver_error(stage, min(code, 0xffffU));
+ 	return error;
+ }
+@@ -971,6 +974,7 @@
+ 		(struct intel_device_info *) ent->driver_data;
+ 	int err;
+ 
++	mboot_gpu_probe_trace(&pdev->dev, "i915-pci-enter", "i915", 0);
+ 	if (intel_info->require_force_probe && !id_forced(pdev->device)) {
+ 		dev_info(&pdev->dev,
+ 			 "Your graphics device %04x is not properly supported by i915 in this\n"
+@@ -978,13 +982,13 @@
+ 			 "module parameter or CONFIG_DRM_I915_FORCE_PROBE=%04x configuration option,\n"
+ 			 "or (recommended) check for kernel updates.\n",
+ 			 pdev->device, pdev->device, pdev->device);
+-		return i915_mboot_reject("I915 UNSUPPORTED", -ENODEV);
++		return i915_mboot_reject(pdev, "I915 UNSUPPORTED", -ENODEV);
+ 	}
+ 
+ 	if (id_blocked(pdev->device)) {
+ 		dev_info(&pdev->dev, "I915 probe blocked for Device ID %04x.\n",
+ 			 pdev->device);
+-		return i915_mboot_reject("I915 BLOCKED", -ENODEV);
++		return i915_mboot_reject(pdev, "I915 BLOCKED", -ENODEV);
+ 	}
+ 
+ 	if (intel_info->require_force_probe) {
+@@ -999,14 +1003,14 @@
+ 	 * functions have the same PCI-ID!
+ 	 */
+ 	if (PCI_FUNC(pdev->devfn))
+-		return i915_mboot_reject("I915 FUNCTION", -ENODEV);
++		return i915_mboot_reject(pdev, "I915 FUNCTION", -ENODEV);
+ 
+ 	if (!intel_mmio_bar_valid(pdev, intel_info))
+-		return i915_mboot_reject("I915 BAR", -ENXIO);
++		return i915_mboot_reject(pdev, "I915 BAR", -ENXIO);
+ 
+ 	/* Detect if we need to wait for other drivers early on */
+ 	if (intel_display_driver_probe_defer(pdev))
+-		return i915_mboot_reject("I915 DEFER", -EPROBE_DEFER);
++		return i915_mboot_reject(pdev, "I915 DEFER", -EPROBE_DEFER);
+ 
+ 	err = i915_driver_probe(pdev, ent);
+ 	if (err)
+diff --git a/drivers/gpu/drm/i915/intel_uncore.c b/drivers/gpu/drm/i915/intel_uncore.c
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -2463,6 +2463,8 @@
+ 	return 0;
+ }
+ 
++#include <linux/mboot_probe.h>
++
+ static int sanity_check_mmio_access(struct intel_uncore *uncore)
+ {
+ 	struct drm_i915_private *i915 = uncore->i915;
+@@ -2486,6 +2488,8 @@
+ 	 */
+ #define COND (__raw_uncore_read32(uncore, FORCEWAKE_MT) != ~0)
+ 	if (wait_for(COND, 2000) == -ETIMEDOUT) {
++		mboot_gpu_probe_trace(i915->drm.dev, "mmio-sanity",
++				      "FORCEWAKE_MT=ffffffff timeout", -EIO);
+ 		drm_err(&i915->drm, "Device is non-operational; MMIO access returns 0xFFFFFFFF!\n");
+ 		return -EIO;
+ 	}
+diff --git a/include/linux/mboot_probe.h b/include/linux/mboot_probe.h
+--- a/include/linux/mboot_probe.h
++++ b/include/linux/mboot_probe.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_MBOOT_PROBE_H
++#define _LINUX_MBOOT_PROBE_H
++#include <linux/device.h>
++#include <linux/kconfig.h>
++
++#if IS_ENABLED(CONFIG_X86_MBOOT_GUEST)
++void mboot_gpu_probe_trace(struct device *dev, const char *event,
++			   const char *detail, int result);
++#else
++static inline void mboot_gpu_probe_trace(struct device *dev, const char *event,
++					 const char *detail, int result) {}
++#endif
++#endif

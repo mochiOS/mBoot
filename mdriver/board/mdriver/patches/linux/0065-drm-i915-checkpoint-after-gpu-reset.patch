@@ -1,0 +1,38 @@
+From: mochiOS developers
+Subject: [PATCH] drm/i915: checkpoint after reset and retain its return value
+
+Move the explicit mBoot diagnostic stop past sanitize_gpu, before HW probe.
+Record reset failures rather than treating a void helper return as success.
+Normal boot reset/cleanup policy remains unchanged.
+
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -212,8 +212,14 @@
+ 		struct intel_gt *gt;
+ 		unsigned int i;
+ 
+-		for_each_gt(gt, i915, i)
+-			intel_gt_reset_all_engines(gt);
++		for_each_gt(gt, i915, i) {
++			int ret = intel_gt_reset_all_engines(gt);
++
++			mboot_gpu_probe_trace(i915->drm.dev, "i915-reset", "all-engines", ret);
++		}
++	} else {
++		mboot_gpu_probe_trace(i915->drm.dev, "i915-reset-skipped",
++				      "reset clobbers display", 0);
+ 	}
+ }
+ 
+@@ -361,9 +367,11 @@
+ 	}
+ 
+ 	/* As early as possible, scrub existing GPU state before clobbering */
+-	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stage",
+ 			      "MMIO OK BEFORE GPU RESET", 0);
+ 	sanitize_gpu(dev_priv);
++	mboot_gpu_probe_trace(dev_priv->drm.dev, "i915-stop",
++			      "AFTER GPU RESET BEFORE HW PROBE", 0);
+ 
+ 	return 0;

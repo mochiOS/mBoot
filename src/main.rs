@@ -110,6 +110,7 @@ struct BootMemoryMap {
 }
 
 struct PreparedDomain {
+    opregion_storage: Vec<u8>,
     id: u32,
     role: DomainRole,
     capabilities: u64,
@@ -139,6 +140,7 @@ enum ResumeKind {
 }
 
 struct RuntimeDomain {
+    opregion_storage: Vec<u8>,
     domain: Domain,
     virtualization: Virtualization,
     guest: GuestConfig,
@@ -161,12 +163,14 @@ struct RuntimeDomain {
     command_line: String,
     entropy_root: [u8; 32],
     intel_graphics_opregion: Option<IntelGraphicsOpRegion>,
+    opregion_report: mboot::boot_log::ProbeReport,
+    boot_log: mboot::boot_log::BootLog,
 }
 
 struct IntelGraphicsOpRegion {
     requester: u16,
     guest_address: u64,
-    image: Vec<u8>,
+    image_size: usize,
 }
 
 impl BootMemoryMap {
@@ -249,6 +253,8 @@ impl BootMemoryMap {
 
 #[entry]
 unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
+    // Leave evidence of EFI entry even when the machine has no working UART.
+    let _ = system_table.stdout().output_string(uefi::cstr16!("\r\nMBOOT EFI ENTERED\r\n"));
     serial::init();
     log!("starting independent hypervisor");
     if let Err(error) = uefi::helpers::init(&mut system_table) {
@@ -257,6 +263,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
     let has_display = display::initialize(system_table.boot_services());
     log!("boot display available={}", has_display);
+    let _ = system_table.stdout().output_string(uefi::cstr16!("Checking platform...\r\n"));
 
     let rsdp_address = system_table
         .config_table()
@@ -331,6 +338,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         log!("IOMMU description unavailable; device assignment remains disabled");
     }
 
+    let _ = system_table.stdout().output_string(uefi::cstr16!("Loading manifest and domains...\r\n"));
     let boot_services = system_table.boot_services();
     let Some(boot_entropy) = collect_boot_entropy(boot_services) else {
         log!("no secure boot entropy source is available");
@@ -520,6 +528,13 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             }
         };
         prepared_domains.push(PreparedDomain {
+            // Boot Services still own the allocator here. Keep this capacity
+            // through all post-exit success and failure paths.
+            opregion_storage: if role == DomainRole::Hardware {
+                Vec::with_capacity(DEVICE_WINDOW_BYTES as usize)
+            } else {
+                Vec::new()
+            },
             id: config.id,
             role,
             capabilities: config.capabilities,
@@ -578,6 +593,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         }
     }
 
+    let _ = system_table.stdout().output_string(uefi::cstr16!("Domains verified. Exiting boot services...\r\n"));
     // SAFETY: All required firmware allocations are complete and no boot service
     // is used after this call.
     let (_runtime, firmware_map) =
@@ -600,6 +616,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
     // SAFETY: Firmware I/O has ended, interrupts are disabled, and mBoot is the
     // sole PCI configuration-space owner from this point onward.
+    let _ = display::console_page(b"MBOOT BOOT SERVICES EXITED\nPCI ISOLATION");
     let quarantine = unsafe { pci::quarantine_segment_zero() };
     log!(
         "PCI DMA quarantine: {} function(s), {} bus master(s) disabled, {} still active",
@@ -890,9 +907,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             } else {
                 (0, 0)
             };
+        let mut opregion_storage = prepared.opregion_storage;
+        let mut opregion_report = mboot::boot_log::ProbeReport::new();
         let intel_graphics_opregion = if prepared.role == DomainRole::Hardware {
             deferred_display.and_then(|requester| {
-                prepare_intel_graphics_opregion(&nested, &memory_map, requester)
+                prepare_intel_graphics_opregion(&nested, &memory_map, requester,
+                    &mut opregion_report, &mut opregion_storage)
             })
         } else {
             None
@@ -1037,6 +1057,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             command_line: prepared.command_line,
             entropy_root: prepared.entropy_root,
             intel_graphics_opregion,
+            opregion_report,
+            opregion_storage,
+            boot_log: mboot::boot_log::BootLog::new(),
         });
     }
 
@@ -1166,6 +1189,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             }
         } else {
             runtime.started = true;
+            if runtime.domain.role() == DomainRole::Hardware {
+                let _ = display::console_page(b"MBOOT STARTING MDRIVER LINUX");
+            }
             // SAFETY: This is the first entry into the stopped, fully prepared vCPU.
             unsafe { runtime.virtualization.run(runtime.guest) }
         };
@@ -1426,6 +1452,14 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                         })
                         .map(|opregion| opregion.guest_address)
                         .unwrap_or_else(|| {
+                            // Do not expose an uncopied host SystemMemory pointer
+                            // as a guest address. Other devices/config offsets are unchanged.
+                            if requester == 0x10 && offset == 0xfc
+                                && unsafe { pci::config_read(requester, 0) }
+                                    .is_ok_and(|id| id & 0xffff == 0x8086)
+                            {
+                                return 0;
+                            }
                             unsafe { pci::config_read(requester, offset) }
                                 .map_or(HYPERCALL_INVALID_ARGUMENT, u64::from)
                         })
@@ -2037,6 +2071,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 vm_exit.arg0,
                 vm_exit.arg1,
                 vm_exit.arg2,
+                &devices,
+                &pci_assignments,
+                dma_remapper.as_ref(),
+                runtime.intel_graphics_opregion.as_ref(),
+                &runtime.opregion_report,
+                &mut runtime.boot_log,
             ),
             number if number == HypercallNumber::Yield as u64 => {
                 runtime.yield_count += 1;
@@ -2363,7 +2403,7 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
             (0, 0)
         };
     if let Some(opregion) = runtime.intel_graphics_opregion.as_ref() {
-        install_intel_graphics_opregion(runtime.domain.nested_pages(), opregion);
+        install_intel_graphics_opregion(runtime.domain.nested_pages(), opregion, &runtime.opregion_storage);
     }
     runtime.restart_count = runtime.restart_count.saturating_add(1);
     let backend = match runtime.domain.backend() {
@@ -2510,6 +2550,12 @@ fn handle_console_write(
     address: u64,
     len: u64,
     detail: u64,
+    devices: &DeviceTable,
+    assignments: &pci::AssignmentTable,
+    remapper: Option<&iommu::DmaRemapper>,
+    opregion: Option<&IntelGraphicsOpRegion>,
+    opregion_report: &mboot::boot_log::ProbeReport,
+    boot_log: &mut mboot::boot_log::BootLog,
 ) -> u64 {
     if len > MAX_CONSOLE_WRITE {
         return HYPERCALL_INVALID_ARGUMENT;
@@ -2520,12 +2566,49 @@ fn handle_console_write(
     // SAFETY: `guest_host_address` checked the complete immutable guest range and
     // the vCPU is stopped for the duration of this read.
     let bytes = unsafe { core::slice::from_raw_parts(host_address as *const u8, len as usize) };
+    if allow_display && allow_device_status {
+        if bytes == b"BOOT TEXT END\n" && detail == 0 {
+            boot_log.finish_console();
+            return HYPERCALL_SUCCESS;
+        }
+        let text = bytes.strip_prefix(b"BOOT TEXT\n").filter(|_| detail == 0);
+        if text.is_some() || boot_log.console_started() || boot_log.console_finished() {
+            let streamed = text.is_some();
+            let text = text.unwrap_or_else(|| bytes.strip_prefix(b"BOOT STATUS\n").unwrap_or(bytes));
+            crate::serial::print(format_args!("[Domain {}] {}", domain_id.get(),
+                core::str::from_utf8(text).unwrap_or("[non-UTF8 log]\n")));
+            if !boot_log.console_finished() {
+                boot_log.append(text);
+                if !streamed && !text.ends_with(b"\n") { boot_log.append(b"\n"); }
+                boot_log.render_console(crate::display::text_console_begin, crate::display::text_console_cell);
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
+            return HYPERCALL_SUCCESS;
+        }
+    }
+    if let Some(report) = bytes.strip_prefix(b"BOOT LOG\n")
+        .filter(|_| allow_display && allow_device_status && detail == 0)
+    {
+        boot_log.append(report);
+        if boot_log.take_failure() {
+            let _ = crate::display::console_page(boot_log.text());
+        }
+        crate::serial::print(format_args!("[Domain {}] {}", domain_id.get(),
+            core::str::from_utf8(report).unwrap_or("[non-UTF8 log chunk]\n")));
+        return HYPERCALL_SUCCESS;
+    }
     let Ok(message) = core::str::from_utf8(bytes) else {
         return HYPERCALL_INVALID_ARGUMENT;
     };
     crate::serial::print(format_args!("[Domain {}] {}", domain_id.get(), message));
     if allow_display {
-        if let Some(report) = bytes
+        if let Some(report) = bytes.strip_prefix(b"BOOT STATUS\n")
+            .filter(|_| allow_device_status && detail == 0)
+        {
+            if !boot_log.failure_shown() {
+                let _ = crate::display::console_page(report);
+            }
+        } else if let Some(report) = bytes
             .strip_prefix(b"DISPLAY\n")
             .filter(|_| !allow_device_status)
         {
@@ -2533,7 +2616,88 @@ fn handle_console_write(
         } else if allow_device_status && detail & (1_u64 << 63) != 0 {
             let error = detail & !(1_u64 << 63);
             if (1..=u64::from(u16::MAX) + 1).contains(&error) {
-                crate::display::mdriver_claim_failure((error - 1) as u16, bytes);
+                if bytes.starts_with(b"PCI PROBE REPORT\n") {
+                    boot_log.mark_failure_shown();
+                    let _ = crate::display::console_page(bytes);
+                } else if bytes.starts_with(b"GPU PROBE REPORT ") || bytes.starts_with(b"GPU MMIO CHECK\n") {
+                    boot_log.mark_failure_shown();
+                    use core::fmt::Write;
+                    // Boot Services have ended: diagnostics must not allocate.
+                    let mut report = mboot::boot_log::ProbeReport::new();
+                    let _ = report.write_str(message);
+                    // Only inspect display functions already assigned to this
+                    // caller; no guest-provided address selects a host read.
+                    let mut device_index = 0;
+                    while let Some(info) = devices.query(domain_id.get(), device_index) {
+                        device_index += 1;
+                        if info.class != 3 || info.owner_domain != domain_id.get() {
+                            continue;
+                        }
+                        if bytes.starts_with(b"GPU MMIO CHECK\n") && info.requester == 0x10 {
+                            // Only the stopped caller's assigned Intel GPU and a fixed,
+                            // read-only sanity register; never use a guest-supplied address.
+                            let id = unsafe { assignments.config_read(domain_id.get(), info.requester, 0) };
+                            if id.is_ok_and(|value| value & 0xffff == 0x8086) {
+                                if let Some(bar) = assignments.assigned_bar(domain_id.get(), info.requester, 0) {
+                                    let command = unsafe { assignments.config_read(domain_id.get(), info.requester, 4) };
+                                    let _ = writeln!(report, "HOST BAR0 HPA {:x} GPA {:x} SIZE {:x}",
+                                        bar.physical_address, bar.guest_address, bar.length);
+                                    let _ = writeln!(report, "HOST PCI COMMAND {:?}", command.map(|value| value & 0xffff));
+                                    if bar.length >= 0xa18c && command.is_ok_and(|value| value & 2 != 0) {
+                                        // SAFETY: this assigned BAR has already been mapped for host
+                                        // MMIO during claim; offset is aligned and within its extent.
+                                        let reg = (bar.physical_address + 0xa188) as *const u32;
+                                        let first = unsafe { core::ptr::read_volatile(reg) };
+                                        let second = unsafe { core::ptr::read_volatile(reg) };
+                                        let _ = writeln!(report, "HOST FORCEWAKE_MT {:08x} {:08x}", first, second);
+                                    } else {
+                                        let _ = writeln!(report, "HOST READ SKIPPED: BAR RANGE / MEMORY DECODE");
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(remapper) = remapper {
+                            use core::fmt::Write;
+                            let _ = writeln!(
+                                report,
+                                "mBoot {:04x} DMA IOVA=0..{:x} HPA={:x}..{:x} (end exclusive)",
+                                info.requester,
+                                memory.guest_memory_size(),
+                                memory.guest_base(),
+                                memory.guest_base() + memory.guest_memory_size()
+                            );
+                            for mapping in remapper.reserved_mappings().iter().filter(|mapping| {
+                                mapping.segment == 0 && mapping.requester == info.requester
+                            })
+                            {
+                                let _ = writeln!(
+                                    report, "DMA identity={:x}..={:x}", mapping.base, mapping.limit
+                                );
+                            }
+                            // SAFETY: mBoot owns configuration access and the
+                            // stopped caller owns this display function.
+                            if let Some((base, limit)) = unsafe {
+                                pci::intel_graphics_stolen_range(info.requester)
+                            } {
+                                let _ = writeln!(report, "Intel stolen={:x}..={:x}", base, limit);
+                            } else {
+                                let _ = writeln!(report, "Intel stolen=none");
+                            }
+                            let copied = opregion.filter(|region| region.requester == info.requester);
+                            let _ = writeln!(report, "mBoot OpRegion copied={} guest={:x}",
+                                copied.is_some(), copied.map_or(0, |region| region.guest_address));
+                        }
+                    }
+                    if opregion_report.text().is_empty() {
+                        let _ = writeln!(report, "OPREGION PREPARE NOT ATTEMPTED");
+                    } else {
+                        let _ = report.write_str(opregion_report.text());
+                    }
+                    crate::serial::print(format_args!("{}", &report.text()[message.len()..]));
+                    let _ = crate::display::console_page(report.text().as_bytes());
+                } else if !boot_log.failure_shown() {
+                    crate::display::mdriver_claim_failure((error - 1) as u16, bytes);
+                }
             }
         }
     }
@@ -2769,6 +2933,14 @@ fn claim_pci_device(
         return false;
     }
     let firmware_display = devices.is_firmware_deferred(requester);
+    log!(
+        "PCI {:04x} IOMMU mapped: domain={} IOVA=0..{:#x} -> HPA={:#x}..{:#x} (end exclusive)",
+        requester,
+        domain_id,
+        guest_size,
+        guest_base,
+        guest_base + guest_size
+    );
     if devices.claim(domain_id, requester).is_err() {
         if unsafe { remapper.detach(0, requester, domain_id) }.is_err() {
             halt_with_error("PCI DMA rollback", mboot::Error::InvalidState)
@@ -2906,19 +3078,37 @@ fn prepare_intel_graphics_opregion(
     memory: &NestedPageTable,
     memory_map: &BootMemoryMap,
     requester: u16,
+    report: &mut mboot::boot_log::ProbeReport,
+    image: &mut Vec<u8>,
 ) -> Option<IntelGraphicsOpRegion> {
+    use core::fmt::Write;
+    // SAFETY: serialized PCI access for the firmware display selected by mBoot.
+    let raw_asls = unsafe { pci::config_read(requester, 0xfc) };
+    let _ = writeln!(report, "OPREGION HOST ASLS {:08x}", raw_asls.unwrap_or(u32::MAX));
     // SAFETY: PCI configuration ownership belongs exclusively to mBoot here.
     let Some(host_address) = (unsafe { pci::intel_graphics_opregion_address(requester) }) else {
+        let _ = writeln!(report, "OPREGION STOP: ABSENT / INVALID ASLS OR DEVICE");
         return None;
     };
     if !memory_map.contains_firmware_memory(host_address, pci::INTEL_GRAPHICS_OPREGION_SIZE) {
+        let _ = writeln!(report, "OPREGION STOP: SOURCE NOT FIRMWARE MEMORY");
+        for region in memory_map.regions[..memory_map.len].iter().filter(|region| {
+            host_address < region.start.saturating_add(region.len)
+                && host_address.saturating_add(pci::INTEL_GRAPHICS_OPREGION_SIZE) > region.start
+        }).take(2) {
+            let _ = writeln!(report, "SOURCE REGION {:x}+{:x} USABLE {} MMIO {}",
+                region.start, region.len, region.usable, region.mmio);
+        }
         log!(
             "Intel graphics OpRegion {:#x} is not contained in firmware-owned SystemMemory",
             host_address
         );
         return None;
     }
-    let mut image = Vec::with_capacity(pci::INTEL_GRAPHICS_OPREGION_SIZE as usize);
+    if image.capacity() < DEVICE_WINDOW_BYTES as usize {
+        let _ = writeln!(report, "OPREGION STOP: PREALLOCATED STORAGE MISSING");
+        return None;
+    }
     image.resize(pci::INTEL_GRAPHICS_OPREGION_SIZE as usize, 0);
     // SAFETY: The firmware memory map contains this complete reserved range and
     // mBoot retains the boot-time identity mapping after ExitBootServices.
@@ -2930,31 +3120,40 @@ fn prepare_intel_graphics_opregion(
         )
     };
     if image.get(..16) != Some(b"IntelGraphicsMem") {
+        let _ = writeln!(report, "OPREGION STOP: BAD SIGNATURE {:02x?}", &image[..16]);
         log!(
             "Intel graphics OpRegion at {:#x} has an invalid signature",
             host_address
         );
         return None;
     }
+    let version = pci::intel_opregion_version(&image).unwrap_or((0, 0));
+    let _ = writeln!(report, "OPREGION VERSION {}.{} MBOX {:08x}",
+        version.0, version.1, read_u32_le(&image, 88).unwrap_or(0));
     if !copy_external_intel_vbt(
-        &mut image,
+        image,
         host_address,
         device_window_start(memory),
         memory_map,
+        report,
     ) {
         return None;
     }
     let opregion = IntelGraphicsOpRegion {
         requester,
         guest_address: device_window_start(memory),
-        image,
+        image_size: image.len(),
     };
-    install_intel_graphics_opregion(memory, &opregion);
+    install_intel_graphics_opregion(memory, &opregion, image);
+    let _ = writeln!(report, "OPREGION COPY OK GPA {:x} HPA {:x} SIZE {:x}",
+        opregion.guest_address,
+        memory.guest_host_address(opregion.guest_address, opregion.image_size as u64).unwrap_or(0),
+        opregion.image_size);
     log!(
         "Intel graphics OpRegion copied for Hardware Domain: host={:#x} guest={:#x} size={}",
         host_address,
         opregion.guest_address,
-        opregion.image.len()
+        opregion.image_size
     );
     Some(opregion)
 }
@@ -2964,18 +3163,15 @@ fn copy_external_intel_vbt(
     host_opregion: u64,
     guest_opregion: u64,
     memory_map: &BootMemoryMap,
+    report: &mut mboot::boot_log::ProbeReport,
 ) -> bool {
-    const VERSION_MINOR_OFFSET: usize = 26;
-    const VERSION_MAJOR_OFFSET: usize = 27;
+    use core::fmt::Write;
     const MAILBOXES_OFFSET: usize = 88;
     const MAILBOX_ASLE: u32 = 1 << 2;
     const ASLE_RVDA_OFFSET: usize = 0x3ba;
     const ASLE_RVDS_OFFSET: usize = 0x3c2;
 
-    let Some(major) = image.get(VERSION_MAJOR_OFFSET).copied() else {
-        return false;
-    };
-    let Some(minor) = image.get(VERSION_MINOR_OFFSET).copied() else {
+    let Some((major, minor)) = pci::intel_opregion_version(image) else {
         return false;
     };
     let Some(mailboxes) = read_u32_le(image, MAILBOXES_OFFSET) else {
@@ -2990,6 +3186,7 @@ fn copy_external_intel_vbt(
     let Some(rvds) = read_u32_le(image, ASLE_RVDS_OFFSET).map(u64::from) else {
         return false;
     };
+    let _ = writeln!(report, "VBT RVDA {:x} RVDS {:x}", rvda, rvds);
     if rvda == 0 || rvds == 0 {
         return true;
     }
@@ -2997,10 +3194,12 @@ fn copy_external_intel_vbt(
     let relative = major > 2 || minor >= 1;
     let (host_vbt, guest_offset) = if relative {
         if rvda < pci::INTEL_GRAPHICS_OPREGION_SIZE {
+            let _ = writeln!(report, "VBT STOP: RELATIVE OFFSET OVERLAPS OPREGION");
             log!("Intel graphics relative VBT overlaps its OpRegion");
             return false;
         }
         let Some(host_vbt) = host_opregion.checked_add(rvda) else {
+            let _ = writeln!(report, "VBT STOP: HOST ADDRESS OVERFLOW");
             return false;
         };
         (host_vbt, rvda)
@@ -3008,11 +3207,15 @@ fn copy_external_intel_vbt(
         (rvda, pci::INTEL_GRAPHICS_OPREGION_SIZE)
     };
     let Some(guest_end) = guest_offset.checked_add(rvds) else {
+        let _ = writeln!(report, "VBT STOP: GUEST RANGE OVERFLOW");
         return false;
     };
     if guest_end > DEVICE_WINDOW_BYTES
         || !memory_map.contains_firmware_memory(host_vbt, rvds)
     {
+        let _ = writeln!(report, "VBT STOP: WINDOW_OK {} FIRMWARE_MEMORY {}",
+            guest_end <= DEVICE_WINDOW_BYTES, memory_map.contains_firmware_memory(host_vbt, rvds));
+        let _ = writeln!(report, "VBT HOST {:x} GUEST OFFSET {:x} SIZE {:x}", host_vbt, guest_offset, rvds);
         log!(
             "Intel graphics external VBT rejected: host={:#x} offset={:#x} size={}",
             host_vbt,
@@ -3027,6 +3230,10 @@ fn copy_external_intel_vbt(
     let Ok(guest_end) = usize::try_from(guest_end) else {
         return false;
     };
+    if guest_end > image.capacity() {
+        let _ = writeln!(report, "VBT STOP: PREALLOCATED STORAGE TOO SMALL");
+        return false;
+    }
     image.resize(guest_end, 0);
     // SAFETY: The complete VBT source lies in firmware-owned SystemMemory and
     // the destination is the validated, exclusively owned Vec range.
@@ -3038,6 +3245,7 @@ fn copy_external_intel_vbt(
         )
     };
     if image.get(guest_offset..guest_offset + 4) != Some(b"$VBT") {
+        let _ = writeln!(report, "VBT STOP: BAD SIGNATURE");
         log!("Intel graphics external VBT has an invalid signature");
         return false;
     }
@@ -3067,10 +3275,11 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
 fn install_intel_graphics_opregion(
     memory: &NestedPageTable,
     opregion: &IntelGraphicsOpRegion,
+    storage: &[u8],
 ) {
     let Some(destination) = memory.guest_host_address(
         opregion.guest_address,
-        opregion.image.len() as u64,
+        opregion.image_size as u64,
     ) else {
         halt_with_error("Intel graphics OpRegion", mboot::Error::InvalidPage)
     };
@@ -3078,9 +3287,9 @@ fn install_intel_graphics_opregion(
     // image, stack, boot-module, and Grant allocations.
     unsafe {
         copy_nonoverlapping(
-            opregion.image.as_ptr(),
+            storage[..opregion.image_size].as_ptr(),
             destination as *mut u8,
-            opregion.image.len(),
+            opregion.image_size,
         )
     };
 }

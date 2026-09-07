@@ -88,11 +88,14 @@ impl DeviceTable {
                         | ManifestDeviceKind::Nvme
                         | ManifestDeviceKind::Vmd
                         | ManifestDeviceKind::Usb
+                        | ManifestDeviceKind::Network
                 )
             {
                 let mut matched = 0;
                 for record in &mut table.devices[..table.count] {
-                    if !kind_matches(record.info, policy.kind) {
+                    if !kind_matches(record.info, policy.kind)
+                        || (policy.kind == ManifestDeviceKind::Network && record.info.subclass != 0)
+                    {
                         continue;
                     }
                     if record.allowed_domain != 0 {
@@ -391,6 +394,34 @@ mod tests {
             table.query(2, 0).unwrap().state,
             PCI_DEVICE_STATE_QUARANTINED
         );
+    }
+
+    #[test]
+    fn automatic_network_policy_assigns_only_ethernet_to_its_domain() {
+        let functions = [
+            PciFunction { requester: 0x0100, class: 2, subclass: 0, ..PciFunction::default() },
+            PciFunction { requester: 0x0200, class: 2, subclass: 0x80, ..PciFunction::default() },
+            PciFunction { requester: 0x0010, class: 3, subclass: 0, ..PciFunction::default() },
+        ];
+        let mut table = DeviceTable::from_pci(
+            &functions, None, &[policy(AUTO_REQUESTER, ManifestDeviceKind::Network)],
+        ).unwrap();
+        assert!(table.can_claim(2, 0x0100).is_ok());
+        assert_eq!(table.can_claim(3, 0x0100), Err(DeviceError::PermissionDenied));
+        assert_eq!(table.can_claim(2, 0x0200), Err(DeviceError::PermissionDenied));
+        assert_eq!(table.can_claim(2, 0x0010), Err(DeviceError::PermissionDenied));
+        table.claim(2, 0x0100).unwrap();
+        assert_eq!(table.query(2, 0).unwrap().owner_domain, 2);
+    }
+
+    #[test]
+    fn required_automatic_network_rejects_wifi_only_machine() {
+        let functions = [PciFunction {
+            requester: 0x0200, class: 2, subclass: 0x80, ..PciFunction::default()
+        }];
+        assert!(matches!(DeviceTable::from_pci(
+            &functions, None, &[policy(AUTO_REQUESTER, ManifestDeviceKind::Network)],
+        ), Err(DeviceError::DeviceUnavailable)));
     }
 
     #[test]
