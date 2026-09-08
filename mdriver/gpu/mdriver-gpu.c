@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <gbm.h>
+#include <math.h>
 #include <linux/fb.h>
 #include <poll.h>
 #include <stdint.h>
@@ -18,6 +19,7 @@
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include "timing.h"
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 #define MAX_TEXTURES 64
@@ -29,6 +31,7 @@
 #define SCENE_HEADER_LEN 64
 #define TEXTURE_DESC_LEN 40
 #define BATCH_DESC_LEN 16
+#define CURSOR_MAGIC 0x55434b56u /* VKCU, u32 operation + four u32 arguments */
 
 struct gpu_request {
     uint64_t generation;
@@ -65,22 +68,22 @@ struct dumb_framebuffer {
     uint8_t *pixels;
 };
 
+enum plane_property {
+    PLANE_FB, PLANE_CRTC, PLANE_SRC_X, PLANE_SRC_Y, PLANE_SRC_W, PLANE_SRC_H,
+    PLANE_X, PLANE_Y, PLANE_W, PLANE_H, PLANE_PROPERTY_COUNT
+};
+
+struct kms_plane {
+    uint32_t id;
+    uint32_t properties[PLANE_PROPERTY_COUNT];
+};
+
 struct kms_properties {
-    uint32_t plane_id;
+    struct kms_plane primary;
     uint32_t mode_blob_id;
     uint32_t connector_crtc_id;
     uint32_t crtc_mode_id;
     uint32_t crtc_active;
-    uint32_t plane_fb_id;
-    uint32_t plane_crtc_id;
-    uint32_t plane_src_x;
-    uint32_t plane_src_y;
-    uint32_t plane_src_w;
-    uint32_t plane_src_h;
-    uint32_t plane_crtc_x;
-    uint32_t plane_crtc_y;
-    uint32_t plane_crtc_w;
-    uint32_t plane_crtc_h;
     int active;
 };
 
@@ -102,10 +105,21 @@ struct renderer {
     GLint scene_uv;
     GLint scene_color;
     GLint scene_sampler;
+    GLint scene_native;
+    GLuint retained_texture;
+    GLuint retained_framebuffer;
+    int retained_valid;
     struct texture textures[MAX_TEXTURES];
     struct gbm_bo *front_bo;
+    struct gbm_bo *cursor_bo;
+    uint32_t cursor_hot_x, cursor_hot_y;
+    int cursor_visible;
+    struct gbm_bo *pending_bo;
+    int flip_pending;
     struct dumb_framebuffer fallback;
     struct kms_properties kms;
+    struct frame_timing timing;
+    GLuint timing_texture;
     uint32_t width;
     uint32_t height;
 };
@@ -335,6 +349,23 @@ static int plane_supports_format(const drmModePlane *plane, uint32_t format)
     return 0;
 }
 
+static int initialize_plane(int fd, struct kms_plane *plane)
+{
+    static const char *const names[PLANE_PROPERTY_COUNT] = {
+        "FB_ID", "CRTC_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H",
+        "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H"
+    };
+    if (!plane->id)
+        return -ENOTSUP;
+    for (size_t i = 0; i < ARRAY_LEN(names); i++) {
+        plane->properties[i] = property_id(fd, plane->id,
+            DRM_MODE_OBJECT_PLANE, names[i], NULL);
+        if (!plane->properties[i])
+            return -ENOTSUP;
+    }
+    return 0;
+}
+
 static int initialize_atomic_kms(struct renderer *renderer)
 {
     struct kms_properties *kms = &renderer->kms;
@@ -351,24 +382,24 @@ static int initialize_atomic_kms(struct renderer *renderer)
         if (!plane)
             continue;
         if ((plane->possible_crtcs & (1u << renderer->crtc_index)) &&
-            plane_supports_format(plane, DRM_FORMAT_XRGB8888) &&
             property_id(renderer->drm_fd, plane->plane_id, DRM_MODE_OBJECT_PLANE,
-                        "type", &type) && type == DRM_PLANE_TYPE_PRIMARY) {
+                        "type", &type) && type == DRM_PLANE_TYPE_PRIMARY &&
+            plane_supports_format(plane, DRM_FORMAT_XRGB8888)) {
             if (!available_primary)
                 available_primary = plane->plane_id;
             /* i915 fbdev already has a working mode and scanout plane.  Keep
              * that complete state and later replace only its FB_ID. */
             if (plane->crtc_id == renderer->crtc_id && plane->fb_id) {
-                kms->plane_id = plane->plane_id;
+                kms->primary.id = plane->plane_id;
                 kms->active = renderer->saved_crtc && renderer->saved_crtc->mode_valid;
             }
         }
         drmModeFreePlane(plane);
     }
     drmModeFreePlaneResources(planes);
-    if (!kms->plane_id)
-        kms->plane_id = available_primary;
-    if (!kms->plane_id)
+    if (!kms->primary.id)
+        kms->primary.id = available_primary;
+    if (initialize_plane(renderer->drm_fd, &kms->primary))
         return -1;
 
     if (drmModeCreatePropertyBlob(renderer->drm_fd, &renderer->mode,
@@ -380,32 +411,7 @@ static int initialize_atomic_kms(struct renderer *renderer)
         DRM_MODE_OBJECT_CRTC, "MODE_ID", NULL);
     kms->crtc_active = property_id(renderer->drm_fd, renderer->crtc_id,
         DRM_MODE_OBJECT_CRTC, "ACTIVE", NULL);
-    kms->plane_fb_id = property_id(renderer->drm_fd, kms->plane_id,
-        DRM_MODE_OBJECT_PLANE, "FB_ID", NULL);
-    kms->plane_crtc_id = property_id(renderer->drm_fd, kms->plane_id,
-        DRM_MODE_OBJECT_PLANE, "CRTC_ID", NULL);
-    kms->plane_src_x = property_id(renderer->drm_fd, kms->plane_id,
-        DRM_MODE_OBJECT_PLANE, "SRC_X", NULL);
-    kms->plane_src_y = property_id(renderer->drm_fd, kms->plane_id,
-        DRM_MODE_OBJECT_PLANE, "SRC_Y", NULL);
-    kms->plane_src_w = property_id(renderer->drm_fd, kms->plane_id,
-        DRM_MODE_OBJECT_PLANE, "SRC_W", NULL);
-    kms->plane_src_h = property_id(renderer->drm_fd, kms->plane_id,
-        DRM_MODE_OBJECT_PLANE, "SRC_H", NULL);
-    kms->plane_crtc_x = property_id(renderer->drm_fd, kms->plane_id,
-        DRM_MODE_OBJECT_PLANE, "CRTC_X", NULL);
-    kms->plane_crtc_y = property_id(renderer->drm_fd, kms->plane_id,
-        DRM_MODE_OBJECT_PLANE, "CRTC_Y", NULL);
-    kms->plane_crtc_w = property_id(renderer->drm_fd, kms->plane_id,
-        DRM_MODE_OBJECT_PLANE, "CRTC_W", NULL);
-    kms->plane_crtc_h = property_id(renderer->drm_fd, kms->plane_id,
-        DRM_MODE_OBJECT_PLANE, "CRTC_H", NULL);
-
-    return !(kms->connector_crtc_id && kms->crtc_mode_id && kms->crtc_active &&
-             kms->plane_fb_id && kms->plane_crtc_id && kms->plane_src_x &&
-             kms->plane_src_y && kms->plane_src_w && kms->plane_src_h &&
-             kms->plane_crtc_x && kms->plane_crtc_y && kms->plane_crtc_w &&
-             kms->plane_crtc_h) ? -1 : 0;
+    return !(kms->connector_crtc_id && kms->crtc_mode_id && kms->crtc_active) ? -1 : 0;
 }
 
 static int open_drm(struct renderer *renderer, unsigned int *failure_stage)
@@ -437,16 +443,18 @@ static int add_atomic_property(drmModeAtomicReq *request, uint32_t object_id,
         ? 0 : -1;
 }
 
-static int present_framebuffer(struct renderer *renderer, uint32_t framebuffer)
+static int present_framebuffer(struct renderer *renderer, uint32_t framebuffer,
+                               int nonblocking)
 {
     struct kms_properties *kms = &renderer->kms;
     drmModeAtomicReq *request = drmModeAtomicAlloc();
     if (!request)
         return -1;
 
-    int result = add_atomic_property(request, kms->plane_id,
-                                     kms->plane_fb_id, framebuffer);
-    uint32_t flags = 0;
+    int result = add_atomic_property(request, kms->primary.id,
+                                     kms->primary.properties[PLANE_FB], framebuffer);
+    uint32_t flags = nonblocking
+        ? DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT : 0;
     if (!kms->active) {
         result |= add_atomic_property(request, renderer->connector_id,
                                       kms->connector_crtc_id, renderer->crtc_id);
@@ -454,24 +462,19 @@ static int present_framebuffer(struct renderer *renderer, uint32_t framebuffer)
                                       kms->crtc_mode_id, kms->mode_blob_id);
         result |= add_atomic_property(request, renderer->crtc_id,
                                       kms->crtc_active, 1);
-        result |= add_atomic_property(request, kms->plane_id,
-                                      kms->plane_crtc_id, renderer->crtc_id);
-        result |= add_atomic_property(request, kms->plane_id, kms->plane_src_x, 0);
-        result |= add_atomic_property(request, kms->plane_id, kms->plane_src_y, 0);
-        result |= add_atomic_property(request, kms->plane_id, kms->plane_src_w,
-                                      (uint64_t)renderer->mode.hdisplay << 16);
-        result |= add_atomic_property(request, kms->plane_id, kms->plane_src_h,
-                                      (uint64_t)renderer->mode.vdisplay << 16);
-        result |= add_atomic_property(request, kms->plane_id, kms->plane_crtc_x, 0);
-        result |= add_atomic_property(request, kms->plane_id, kms->plane_crtc_y, 0);
-        result |= add_atomic_property(request, kms->plane_id, kms->plane_crtc_w,
-                                      renderer->mode.hdisplay);
-        result |= add_atomic_property(request, kms->plane_id, kms->plane_crtc_h,
-                                      renderer->mode.vdisplay);
+        const uint64_t values[PLANE_PROPERTY_COUNT] = {
+            framebuffer, renderer->crtc_id, 0, 0,
+            (uint64_t)renderer->mode.hdisplay << 16,
+            (uint64_t)renderer->mode.vdisplay << 16, 0, 0,
+            renderer->mode.hdisplay, renderer->mode.vdisplay
+        };
+        for (size_t i = PLANE_CRTC; i < PLANE_PROPERTY_COUNT; i++)
+            result |= add_atomic_property(request, kms->primary.id,
+                                           kms->primary.properties[i], values[i]);
         flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
     }
     if (!result)
-        result = drmModeAtomicCommit(renderer->drm_fd, request, flags, NULL);
+        result = drmModeAtomicCommit(renderer->drm_fd, request, flags, renderer);
     drmModeAtomicFree(request);
     if (!result)
         kms->active = 1;
@@ -531,7 +534,7 @@ static void show_dumb_status(struct renderer *renderer, unsigned int stage,
     dumb_hex_digit(renderer, x + scale * 7, y, scale, stage, 0x00ffffff);
     msync(renderer->fallback.pixels, renderer->fallback.size, MS_SYNC);
     drmModeDirtyFB(renderer->drm_fd, renderer->fallback.id, NULL, 0);
-    present_framebuffer(renderer, renderer->fallback.id);
+    present_framebuffer(renderer, renderer->fallback.id, 0);
 }
 
 static void show_dumb_failure(struct renderer *renderer, unsigned int stage)
@@ -640,6 +643,30 @@ static int choose_egl_config(EGLDisplay display, const EGLint *attributes,
     return -1;
 }
 
+static int initialize_scene_program(struct renderer *renderer)
+{
+    static const char scene_vertex[] =
+        "attribute vec3 position; attribute vec2 uv; attribute vec4 color;"
+        "varying vec2 v_uv; varying vec4 v_color;"
+        "void main(){gl_Position=vec4(position.x,-position.y,position.z,1.0);"
+        "v_uv=uv;v_color=color;}";
+    static const char scene_fragment[] =
+        "precision mediump float; varying vec2 v_uv; varying vec4 v_color;"
+        "uniform sampler2D image; uniform bool native_rgba;"
+        "void main(){vec4 p=texture2D(image,v_uv);"
+        "gl_FragColor=(native_rgba?p:vec4(p.b,p.g,p.r,p.a))*v_color;}";
+    renderer->scene_program = make_program(scene_vertex, scene_fragment);
+    if (!renderer->scene_program)
+        return 0x0d;
+    renderer->scene_position = glGetAttribLocation(renderer->scene_program, "position");
+    renderer->scene_uv = glGetAttribLocation(renderer->scene_program, "uv");
+    renderer->scene_color = glGetAttribLocation(renderer->scene_program, "color");
+    renderer->scene_sampler = glGetUniformLocation(renderer->scene_program, "image");
+    renderer->scene_native = glGetUniformLocation(renderer->scene_program, "native_rgba");
+    glGenBuffers(1, &renderer->vertex_buffer);
+    return 0;
+}
+
 static int initialize_gl(struct renderer *renderer)
 {
     static const EGLint config_attributes[] = {
@@ -651,15 +678,6 @@ static int initialize_gl(struct renderer *renderer)
     static const EGLint context_attributes[] = {
         EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE,
     };
-    static const char scene_vertex[] =
-        "attribute vec3 position; attribute vec2 uv; attribute vec4 color;"
-        "varying vec2 v_uv; varying vec4 v_color;"
-        "void main(){gl_Position=vec4(position.x,-position.y,position.z,1.0);"
-        "v_uv=uv;v_color=color;}";
-    static const char scene_fragment[] =
-        "precision mediump float; varying vec2 v_uv; varying vec4 v_color;"
-        "uniform sampler2D image; void main(){vec4 p=texture2D(image,v_uv);"
-        "gl_FragColor=vec4(p.b,p.g,p.r,p.a)*v_color;}";
     EGLConfig config;
 
     renderer->gbm = gbm_create_device(renderer->drm_fd);
@@ -702,14 +720,9 @@ static int initialize_gl(struct renderer *renderer)
     }
     dprintf(2, "mDriver GPU: renderer=%s\n", gpu_name);
 
-    renderer->scene_program = make_program(scene_vertex, scene_fragment);
-    if (!renderer->scene_program)
-        return 0x0d;
-    renderer->scene_position = glGetAttribLocation(renderer->scene_program, "position");
-    renderer->scene_uv = glGetAttribLocation(renderer->scene_program, "uv");
-    renderer->scene_color = glGetAttribLocation(renderer->scene_program, "color");
-    renderer->scene_sampler = glGetUniformLocation(renderer->scene_program, "image");
-    glGenBuffers(1, &renderer->vertex_buffer);
+    int result = initialize_scene_program(renderer);
+    if (result)
+        return result;
     renderer->width = renderer->mode.hdisplay;
     renderer->height = renderer->mode.vdisplay;
     /* KMS page flips below provide the single frame-rate boundary. */
@@ -834,19 +847,19 @@ static uint32_t framebuffer_for_bo(struct renderer *renderer, struct gbm_bo *bo)
     framebuffer->fd = renderer->drm_fd;
     int result;
     if (modifier == DRM_FORMAT_MOD_INVALID) {
-        result = drmModeAddFB2(renderer->drm_fd, renderer->width,
-                               renderer->height, gbm_bo_get_format(bo), handles,
+        result = drmModeAddFB2(renderer->drm_fd, gbm_bo_get_width(bo),
+                               gbm_bo_get_height(bo), gbm_bo_get_format(bo), handles,
                                pitches, offsets, &framebuffer->id, 0);
     } else {
-        result = drmModeAddFB2WithModifiers(renderer->drm_fd, renderer->width,
-                                             renderer->height,
+        result = drmModeAddFB2WithModifiers(renderer->drm_fd, gbm_bo_get_width(bo),
+                                             gbm_bo_get_height(bo),
                                              gbm_bo_get_format(bo), handles,
                                              pitches, offsets, modifiers,
                                              &framebuffer->id,
                                              DRM_MODE_FB_MODIFIERS);
         if (result && modifier == DRM_FORMAT_MOD_LINEAR)
-            result = drmModeAddFB2(renderer->drm_fd, renderer->width,
-                                   renderer->height, gbm_bo_get_format(bo),
+            result = drmModeAddFB2(renderer->drm_fd, gbm_bo_get_width(bo),
+                                   gbm_bo_get_height(bo), gbm_bo_get_format(bo),
                                    handles, pitches, offsets,
                                    &framebuffer->id, 0);
     }
@@ -858,10 +871,112 @@ static uint32_t framebuffer_for_bo(struct renderer *renderer, struct gbm_bo *bo)
     return framebuffer->id;
 }
 
-static int show_frame(struct renderer *renderer)
+static void bind_vertices(struct renderer *renderer, const void *vertices, size_t length)
 {
-    /* Do not hand KMS a buffer until rendering into it has completed. */
-    glFinish();
+    glUseProgram(renderer->scene_program);
+    glBindBuffer(GL_ARRAY_BUFFER, renderer->vertex_buffer);
+    glBufferData(GL_ARRAY_BUFFER, length, vertices, GL_STREAM_DRAW);
+    glEnableVertexAttribArray(renderer->scene_position);
+    glEnableVertexAttribArray(renderer->scene_uv);
+    glEnableVertexAttribArray(renderer->scene_color);
+    glVertexAttribPointer(renderer->scene_position, 3, GL_FLOAT, GL_FALSE, VERTEX_STRIDE, (void *)0);
+    glVertexAttribPointer(renderer->scene_uv, 2, GL_FLOAT, GL_FALSE, VERTEX_STRIDE, (void *)12);
+    glVertexAttribPointer(renderer->scene_color, 4, GL_FLOAT, GL_FALSE, VERTEX_STRIDE, (void *)20);
+    glUniform1i(renderer->scene_sampler, 0);
+    glUniform1i(renderer->scene_native, 0);
+}
+
+static void show_timing(struct renderer *renderer)
+{
+    uint32_t pixels[TIMING_WIDTH * TIMING_HEIGHT];
+    timing_pixels(&renderer->timing, pixels);
+    glActiveTexture(GL_TEXTURE0);
+    if (!renderer->timing_texture) {
+        glGenTextures(1, &renderer->timing_texture);
+        glBindTexture(GL_TEXTURE_2D, renderer->timing_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, TIMING_WIDTH, TIMING_HEIGHT,
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, renderer->timing_texture);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, TIMING_WIDTH, TIMING_HEIGHT,
+                       GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    }
+    float left = 1.0f - 2.0f * (TIMING_WIDTH * 2 + 8) / renderer->width;
+    float right = 1.0f - 16.0f / renderer->width;
+    float top = -1.0f + 16.0f / renderer->height;
+    float bottom = -1.0f + 2.0f * (TIMING_HEIGHT * 2 + 8) / renderer->height;
+    const GLfloat vertices[][9] = {
+        {left, top, 0, 0, 0, 1, 1, 1, 1}, {right, top, 0, 1, 0, 1, 1, 1, 1},
+        {left, bottom, 0, 0, 1, 1, 1, 1, 1}, {right, top, 0, 1, 0, 1, 1, 1, 1},
+        {right, bottom, 0, 1, 1, 1, 1, 1, 1}, {left, bottom, 0, 0, 1, 1, 1, 1, 1},
+    };
+    bind_vertices(renderer, vertices, sizeof(vertices));
+    glDisable(GL_BLEND);
+    glDrawArrays(GL_TRIANGLES, 0, ARRAY_LEN(vertices));
+}
+
+static void flip_complete(int fd, unsigned int sequence, unsigned int seconds,
+                          unsigned int microseconds, void *data)
+{
+    (void)fd;
+    (void)sequence;
+    (void)seconds;
+    (void)microseconds;
+    struct renderer *renderer = data;
+    renderer->flip_pending = 0;
+}
+
+static int finish_flip(struct renderer *renderer)
+{
+    drmEventContext events = { .version = 2, .page_flip_handler = flip_complete };
+    const uint64_t start = timing_now();
+    while (renderer->flip_pending) {
+        uint64_t elapsed = timing_elapsed(start) / 1000000;
+        if (elapsed >= 1000)
+            return -ETIMEDOUT;
+        struct pollfd fd = { .fd = renderer->drm_fd, .events = POLLIN };
+        int result = poll(&fd, 1, (int)(1000 - elapsed));
+        if (result < 0) {
+            if (errno == EINTR)
+                continue;
+            return -errno;
+        }
+        if (!result)
+            return -ETIMEDOUT;
+        if (fd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            return -EIO;
+        if ((fd.revents & POLLIN) && drmHandleEvent(renderer->drm_fd, &events))
+            return -EIO;
+    }
+    if (renderer->pending_bo) {
+        if (renderer->front_bo)
+            gbm_surface_release_buffer(renderer->surface, renderer->front_bo);
+        renderer->front_bo = renderer->pending_bo;
+        renderer->pending_bo = NULL;
+    }
+    return 0;
+}
+
+static int show_frame(struct renderer *renderer, uint64_t draw_time, uint64_t flip_wait)
+{
+    uint64_t times[TIMING_COUNT] = { draw_time };
+    times[TIMING_KMS] = flip_wait;
+    uint64_t start = renderer->timing.enabled ? timing_now() : 0;
+    if (renderer->timing.enabled) {
+        start = timing_now();
+        show_timing(renderer);
+        times[TIMING_DRAW] += timing_elapsed(start);
+        start = timing_now();
+    }
+    /* EGL swap submits rendering; i915 imports the BO's implicit fence. */
+    if (renderer->timing.enabled) {
+        times[TIMING_GPU] = timing_elapsed(start);
+        start = timing_now();
+    }
     if (glGetError() != GL_NO_ERROR)
         return -EIO;
     if (!eglSwapBuffers(renderer->egl_display, renderer->egl_surface))
@@ -874,15 +989,28 @@ static int show_frame(struct renderer *renderer)
         gbm_surface_release_buffer(renderer->surface, bo);
         return errno ? -errno : -EIO;
     }
-    int result = present_framebuffer(renderer, fb);
+    if (renderer->timing.enabled) {
+        times[TIMING_SWAP] = timing_elapsed(start);
+        start = timing_now();
+    }
+    // Keep the startup readiness check synchronous. Normal frames acknowledge
+    // accepted scanout submission, allowing the shared control ring to proceed.
+    int nonblocking = renderer->front_bo != NULL;
+    int result = present_framebuffer(renderer, fb, nonblocking);
+    if (renderer->timing.enabled) {
+        times[TIMING_KMS] += timing_elapsed(start);
+        timing_record(&renderer->timing, times);
+    }
     if (result) {
         gbm_surface_release_buffer(renderer->surface, bo);
         return -errno;
     }
-    if (renderer->front_bo) {
-        gbm_surface_release_buffer(renderer->surface, renderer->front_bo);
+    if (nonblocking) {
+        renderer->pending_bo = bo;
+        renderer->flip_pending = 1;
+    } else {
+        renderer->front_bo = bo;
     }
-    renderer->front_bo = bo;
     return 0;
 }
 
@@ -905,10 +1033,57 @@ static int show_startup_frame(struct renderer *renderer)
         sample[1] < 190 || sample[1] > 210 ||
         sample[2] < 190 || sample[2] > 210)
         return -EIO;
-    return show_frame(renderer);
+    return show_frame(renderer, 0, 0);
 }
 
-static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t length)
+static int bind_retained_framebuffer(struct renderer *renderer)
+{
+    if (!renderer->retained_texture) {
+        glGenTextures(1, &renderer->retained_texture);
+        glBindTexture(GL_TEXTURE_2D, renderer->retained_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, renderer->width, renderer->height,
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glGenFramebuffers(1, &renderer->retained_framebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, renderer->retained_framebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                               renderer->retained_texture, 0);
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, renderer->retained_framebuffer);
+    }
+    return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
+        glGetError() == GL_NO_ERROR ? 0 : -EIO;
+}
+
+/* The first opaque quad is the replacement rectangle, in v1 scene coordinates. */
+static int replacement_rect(const uint8_t *vertices, uint32_t width, uint32_t height,
+                             uint32_t rect[4], GLfloat color[4])
+{
+    const unsigned int offsets[] = {0, 4, 2 * VERTEX_STRIDE, 2 * VERTEX_STRIDE + 4};
+    for (unsigned int i = 0; i < 4; i++) {
+        GLfloat value;
+        memcpy(&value, vertices + offsets[i], sizeof(value));
+        uint32_t limit = i % 2 ? height : width;
+        value = (value + 1.0f) * 0.5f * limit;
+        if (!isfinite(value) || value < -0.25f || value > limit + 0.25f)
+            return -EINVAL;
+        rect[i] = (uint32_t)((value < 0 ? 0 : value) + 0.5f);
+    }
+    if (rect[2] <= rect[0] || rect[3] <= rect[1] || rect[2] > width || rect[3] > height)
+        return -EINVAL;
+    rect[2] -= rect[0];
+    rect[3] -= rect[1];
+    memcpy(color, vertices + 20, sizeof(GLfloat) * 4);
+    for (unsigned int i = 0; i < 4; i++)
+        if (!isfinite(color[i]) || color[i] < 0 || color[i] > 1)
+            return -EINVAL;
+    return color[3] == 1.0f ? 0 : -EINVAL;
+}
+
+static int draw_scene(struct renderer *renderer, const uint8_t *scene, size_t length)
 {
     if (length < SCENE_HEADER_LEN || get_u32(scene) != SCENE_MAGIC ||
         get_u16(scene + 4) != SCENE_VERSION || get_u16(scene + 6) != SCENE_HEADER_LEN ||
@@ -935,29 +1110,27 @@ static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t 
     if (result)
         return result;
 
-    /* The compositor submits a complete scene, so render it straight into the
-     * EGL back buffer which becomes the next KMS scanout.  An intermediate
-     * RGBA framebuffer and full-screen copy added a redundant GPU pass and
-     * could silently produce a black scanout on physical drivers. */
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    uint32_t rect[4];
+    GLfloat background[4];
+    if (vertex_count < 6 || get_u64(scene + batch_offset) != UINT64_MAX - 1 ||
+        get_u32(scene + batch_offset + 8) != 0 || get_u32(scene + batch_offset + 12) != 6 ||
+        replacement_rect(scene + vertex_offset, renderer->width, renderer->height, rect, background))
+        return -EINVAL;
+    if (!renderer->retained_valid) {
+        rect[0] = rect[1] = 0;
+        rect[2] = renderer->width;
+        rect[3] = renderer->height;
+    }
+    result = bind_retained_framebuffer(renderer);
+    if (result)
+        return result;
+    renderer->retained_valid = 0;
     glViewport(0, 0, renderer->width, renderer->height);
-    glDisable(GL_SCISSOR_TEST);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(rect[0], renderer->height - rect[1] - rect[3], rect[2], rect[3]);
+    glClearColor(background[0], background[1], background[2], background[3]);
     glClear(GL_COLOR_BUFFER_BIT);
-    glUseProgram(renderer->scene_program);
-    glBindBuffer(GL_ARRAY_BUFFER, renderer->vertex_buffer);
-    glBufferData(GL_ARRAY_BUFFER, (size_t)vertex_count * VERTEX_STRIDE,
-                 scene + vertex_offset, GL_STREAM_DRAW);
-    glEnableVertexAttribArray(renderer->scene_position);
-    glEnableVertexAttribArray(renderer->scene_uv);
-    glEnableVertexAttribArray(renderer->scene_color);
-    glVertexAttribPointer(renderer->scene_position, 3, GL_FLOAT, GL_FALSE,
-                          VERTEX_STRIDE, (void *)0);
-    glVertexAttribPointer(renderer->scene_uv, 2, GL_FLOAT, GL_FALSE,
-                          VERTEX_STRIDE, (void *)12);
-    glVertexAttribPointer(renderer->scene_color, 4, GL_FLOAT, GL_FALSE,
-                          VERTEX_STRIDE, (void *)20);
-    glUniform1i(renderer->scene_sampler, 0);
+    bind_vertices(renderer, scene + vertex_offset, (size_t)vertex_count * VERTEX_STRIDE);
     for (uint32_t index = 0; index < batch_count; index++) {
         const uint8_t *batch = scene + batch_offset + index * BATCH_DESC_LEN;
         uint64_t key = get_u64(batch);
@@ -978,12 +1151,139 @@ static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t 
 
     if (glGetError() != GL_NO_ERROR)
         return -EIO;
-    return show_frame(renderer);
+    /* Copy retained RGBA pixels without the BGRA upload swizzle or a Y flip.
+     * Swapchain preservation is not required, even when its contents are lost. */
+    static const GLfloat quad[][9] = {
+        {-1,-1,0, 0,1, 1,1,1,1}, {1,-1,0, 1,1, 1,1,1,1},
+        {1,1,0, 1,0, 1,1,1,1}, {-1,-1,0, 0,1, 1,1,1,1},
+        {1,1,0, 1,0, 1,1,1,1}, {-1,1,0, 0,0, 1,1,1,1},
+    };
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    bind_vertices(renderer, quad, sizeof(quad));
+    glUniform1i(renderer->scene_native, 1);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, renderer->retained_texture);
+    glDrawArrays(GL_TRIANGLES, 0, ARRAY_LEN(quad));
+    if (glGetError() != GL_NO_ERROR)
+        return -EIO;
+    renderer->retained_valid = 1;
+    return 0;
+}
+
+static int set_cursor(struct renderer *renderer, struct gbm_bo *bo,
+                      uint32_t hot_x, uint32_t hot_y, int visible)
+{
+    if (visible && !bo)
+        return -EINVAL;
+    if (!visible && !renderer->cursor_visible)
+        return 0;
+    int result = drmModeSetCursor2(renderer->drm_fd, renderer->crtc_id,
+        visible ? gbm_bo_get_handle(bo).u32 : 0,
+        bo ? gbm_bo_get_width(bo) : 0, bo ? gbm_bo_get_height(bo) : 0, hot_x, hot_y);
+    return result ? -errno : 0;
+}
+
+static int cursor_command(struct renderer *renderer, const uint8_t *packet, size_t length)
+{
+    if (length < 24)
+        return -EINVAL;
+    // Retire primary scanout before changing the cursor plane.
+    int completed = finish_flip(renderer);
+    if (completed)
+        return completed;
+    uint32_t operation = get_u32(packet + 4);
+    uint32_t a = get_u32(packet + 8), b = get_u32(packet + 12);
+    uint32_t c = get_u32(packet + 16), d = get_u32(packet + 20);
+    if (operation == 1) {
+        uint64_t width = 64, height = 64;
+        if (!a || !b || a > 256 || b > 256 || c >= a || d >= b ||
+            length != 24 + (uint64_t)a * b * 4)
+            return -EINVAL;
+        if (drmGetCap(renderer->drm_fd, DRM_CAP_CURSOR_WIDTH, &width) ||
+            drmGetCap(renderer->drm_fd, DRM_CAP_CURSOR_HEIGHT, &height) ||
+            width < a || height < b || width > 256 || height > 256)
+            return -ENOTSUP;
+        struct gbm_bo *bo = gbm_bo_create(renderer->gbm, width, height,
+            GBM_FORMAT_ARGB8888, GBM_BO_USE_CURSOR | GBM_BO_USE_WRITE);
+        if (!bo)
+            return -ENOMEM;
+        uint32_t stride = gbm_bo_get_stride(bo);
+        if (stride < width * 4 || stride > 4096) {
+            gbm_bo_destroy(bo);
+            return -EINVAL;
+        }
+        uint8_t *pixels = calloc(height, stride);
+        if (!pixels) {
+            gbm_bo_destroy(bo);
+            return -ENOMEM;
+        }
+        // The IPC image is premultiplied RGBA; ARGB8888 memory is BGRA.
+        for (uint32_t y = 0; y < b; y++) {
+            for (uint32_t x = 0; x < a; x++) {
+                const uint8_t *source = packet + 24 + (y * a + x) * 4;
+                uint8_t *target = pixels + y * stride + x * 4;
+                target[0] = source[2]; target[1] = source[1];
+                target[2] = source[0]; target[3] = source[3];
+            }
+        }
+        int result = gbm_bo_write(bo, pixels, height * stride) ? -EIO : 0;
+        free(pixels);
+        if (!result)
+            result = set_cursor(renderer, bo, c, d, renderer->cursor_visible);
+        if (result) {
+            gbm_bo_destroy(bo);
+            return result;
+        }
+        if (renderer->cursor_bo)
+            gbm_bo_destroy(renderer->cursor_bo);
+        renderer->cursor_bo = bo;
+        renderer->cursor_hot_x = c;
+        renderer->cursor_hot_y = d;
+        return 0;
+    }
+    if (operation != 2 || length != 24 || c > 1 || d ||
+        a > INT32_MAX || b > INT32_MAX)
+        return -EINVAL;
+    int result = 0;
+    if (c) {
+        if (!renderer->cursor_bo)
+            return -EINVAL;
+        result = drmModeMoveCursor(renderer->drm_fd, renderer->crtc_id,
+            (int32_t)a - (int32_t)renderer->cursor_hot_x,
+            (int32_t)b - (int32_t)renderer->cursor_hot_y) ? -errno : 0;
+    }
+    if (!result && renderer->cursor_visible != (int)c)
+        result = set_cursor(renderer, renderer->cursor_bo,
+            renderer->cursor_hot_x, renderer->cursor_hot_y, c);
+    if (!result)
+        renderer->cursor_visible = c;
+    return result;
+}
+
+static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t length)
+{
+    uint64_t start = renderer->timing.enabled ? timing_now() : 0;
+    /* EGL may acquire a back buffer on the first default-framebuffer draw,
+     * not just at swap. Retire the previous flip before any GL rendering so
+     * a two-buffer surface cannot wait for a BO we still hold ourselves.
+     * The producer can still prepare this scene while the flip is pending. */
+    int result = finish_flip(renderer);
+    if (result)
+        return result;
+    uint64_t flip_wait = renderer->timing.enabled ? timing_elapsed(start) : 0;
+    start = renderer->timing.enabled ? timing_now() : 0;
+    result = draw_scene(renderer, scene, length);
+    return result ? result : show_frame(renderer,
+        renderer->timing.enabled ? timing_elapsed(start) : 0, flip_wait);
 }
 
 int main(void)
 {
     struct renderer renderer = { .drm_fd = -1 };
+    const char *timing = getenv("MDRIVER_GPU_TIMING");
+    renderer.timing.enabled = timing && !strcmp(timing, "1");
     unsigned int failure_stage = 0x01;
     unsigned int wait_cycles = 0;
     dprintf(2, "mDriver GPU: userspace started; waiting for DRM device\n");
@@ -1033,9 +1333,17 @@ int main(void)
             mapped_size = request.buffer_size;
             mapping = mmap(NULL, mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, control, 0);
         }
-        int status = mapping == MAP_FAILED ? -errno :
+        int cursor = mapping != MAP_FAILED && request.scene_length >= 4 &&
+            get_u32(mapping) == CURSOR_MAGIC;
+        int status = mapping == MAP_FAILED ? -errno : cursor ?
+            cursor_command(&renderer, mapping, request.scene_length) :
             render_scene(&renderer, mapping, request.scene_length);
-        if (status)
+        if (status && cursor && !renderer.flip_pending) {
+            if (!set_cursor(&renderer, renderer.cursor_bo,
+                            renderer.cursor_hot_x, renderer.cursor_hot_y, 0))
+                renderer.cursor_visible = 0;
+        }
+        if (status && !cursor)
             hold_drm_failure(&renderer, status == -EINVAL ? 0x11 : 0x12);
         if (write_response(control, request.generation, status))
             hold_drm_failure(&renderer, 0x15);

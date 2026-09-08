@@ -1,0 +1,44 @@
+--- a/arch/x86/kernel/cpu/mboot_input.h
++++ b/arch/x86/kernel/cpu/mboot_input.h
+@@ -126,6 +126,18 @@
+ 	.id_table = mboot_pointer_ids,
+ };
+ 
++static bool mboot_pointer_axis_mergeable(s32 a, s32 b)
++{
++	s64 sum = (s64)a + b;
++
++	/* Preserve reversals (including screen-edge clamping) and avoid overflow. */
++	return (!a || !b || (a < 0) == (b < 0)) &&
++	       sum >= S32_MIN && sum <= S32_MAX;
++}
++
++/* Protected by mboot_pointer_lock, like the report queue. */
++static u32 mboot_pointer_delivered_buttons;
++
+ static void mboot_control_read_pointer(const struct mboot_control_request *request,
+ 				      struct mboot_control_response *response)
+ {
+@@ -141,6 +153,22 @@
+ 		return;
+ 	}
+ 	report = mboot_pointer_reports[mboot_pointer_tail++ % MBOOT_POINTER_SLOTS];
++	/* Never move a button transition or a wheel event to a later position. */
++	if (report.buttons == mboot_pointer_delivered_buttons && !report.wheel) {
++		while (mboot_pointer_tail != mboot_pointer_head) {
++			const struct mboot_pointer_report *next =
++				&mboot_pointer_reports[mboot_pointer_tail % MBOOT_POINTER_SLOTS];
++
++			if (next->buttons != report.buttons || next->wheel ||
++			    !mboot_pointer_axis_mergeable(report.dx, next->dx) ||
++			    !mboot_pointer_axis_mergeable(report.dy, next->dy))
++				break;
++			report.dx += next->dx;
++			report.dy += next->dy;
++			mboot_pointer_tail++;
++		}
++	}
++	mboot_pointer_delivered_buttons = report.buttons;
+ 	spin_unlock_irqrestore(&mboot_pointer_lock, flags);
+ 	response->values[0] = (u32)report.dx;
+ 	response->values[1] = (u32)report.dy;

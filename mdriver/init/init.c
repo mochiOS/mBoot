@@ -45,6 +45,7 @@ __attribute__((noreturn)) static void supervise_gpu(void)
     static char *const envp[] = {
         "EGL_PLATFORM=gbm",
         "LIBGL_DRIVERS_PATH=/usr/lib/dri",
+        "MDRIVER_GPU_TIMING=1",
         0,
     };
     static const struct kernel_timespec retry_delay = {

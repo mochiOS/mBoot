@@ -1,0 +1,171 @@
+--- /dev/null
++++ b/arch/x86/kernel/cpu/mboot_input.h
+@@ -0,0 +1,155 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Relative HID reports owned by the mDriver domain. */
++#include <linux/input.h>
++
++#define MBOOT_CONTROL_READ_POINTER 26
++#define MBOOT_POINTER_SLOTS 128
++
++struct mboot_pointer_report {
++	s32 dx, dy, wheel;
++	u32 buttons;
++};
++struct mboot_pointer {
++	struct input_handle handle;
++	s64 delta[3];
++	u8 buttons;
++};
++static DEFINE_SPINLOCK(mboot_pointer_lock);
++static struct mboot_pointer_report mboot_pointer_reports[MBOOT_POINTER_SLOTS];
++static unsigned int mboot_pointer_head, mboot_pointer_tail;
++static unsigned int mboot_pointer_buttons[3];
++
++static void mboot_pointer_publish(struct mboot_pointer *pointer)
++{
++	struct mboot_pointer_report *report;
++	unsigned int i, buttons = 0;
++
++	for (i = 0; i < 3; i++)
++		if (mboot_pointer_buttons[i])
++			buttons |= BIT(i);
++	if (mboot_pointer_head - mboot_pointer_tail == MBOOT_POINTER_SLOTS)
++		mboot_pointer_tail++;
++	report = &mboot_pointer_reports[mboot_pointer_head++ % MBOOT_POINTER_SLOTS];
++	report->dx = clamp_t(s64, pointer->delta[0], S32_MIN, S32_MAX);
++	report->dy = clamp_t(s64, pointer->delta[1], S32_MIN, S32_MAX);
++	report->wheel = clamp_t(s64, pointer->delta[2], S32_MIN, S32_MAX);
++	report->buttons = buttons;
++	memset(pointer->delta, 0, sizeof(pointer->delta));
++}
++
++static void mboot_pointer_event(struct input_handle *handle,
++			       unsigned int type, unsigned int code, int value)
++{
++	struct mboot_pointer *pointer = container_of(handle, struct mboot_pointer, handle);
++	unsigned long flags;
++	int axis = code == REL_X ? 0 : code == REL_Y ? 1 : code == REL_WHEEL ? 2 : -1;
++
++	spin_lock_irqsave(&mboot_pointer_lock, flags);
++	if (type == EV_REL && axis >= 0)
++		pointer->delta[axis] += value;
++	else if (type == EV_KEY && code >= BTN_LEFT && code <= BTN_MIDDLE && value <= 1) {
++		unsigned int bit = code - BTN_LEFT;
++		bool held = pointer->buttons & BIT(bit);
++
++		if (held != !!value) {
++			if (value) {
++				pointer->buttons |= BIT(bit);
++				mboot_pointer_buttons[bit]++;
++			} else {
++				pointer->buttons &= ~BIT(bit);
++				mboot_pointer_buttons[bit]--;
++			}
++		}
++	} else if (type == EV_SYN && code == SYN_REPORT)
++		mboot_pointer_publish(pointer);
++	spin_unlock_irqrestore(&mboot_pointer_lock, flags);
++}
++
++static int mboot_pointer_connect(struct input_handler *handler,
++				struct input_dev *dev, const struct input_device_id *id)
++{
++	struct mboot_pointer *pointer;
++	int err;
++
++	pointer = kzalloc(sizeof(*pointer), GFP_KERNEL);
++	if (!pointer)
++		return -ENOMEM;
++	pointer->handle.dev = dev;
++	pointer->handle.handler = handler;
++	pointer->handle.name = "mboot-pointer";
++	err = input_register_handle(&pointer->handle);
++	if (err)
++		goto free;
++	err = input_open_device(&pointer->handle);
++	if (!err)
++		return 0;
++	input_unregister_handle(&pointer->handle);
++free:
++	kfree(pointer);
++	return err;
++}
++
++static void mboot_pointer_disconnect(struct input_handle *handle)
++{
++	struct mboot_pointer *pointer = container_of(handle, struct mboot_pointer, handle);
++	unsigned long flags;
++	unsigned int i;
++
++	input_close_device(handle);
++	spin_lock_irqsave(&mboot_pointer_lock, flags);
++	for (i = 0; i < 3; i++)
++		if (pointer->buttons & BIT(i))
++			mboot_pointer_buttons[i]--;
++	mboot_pointer_publish(pointer);
++	spin_unlock_irqrestore(&mboot_pointer_lock, flags);
++	input_unregister_handle(handle);
++	kfree(pointer);
++}
++
++static const struct input_device_id mboot_pointer_ids[] = {
++	{
++		.flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_RELBIT,
++		.evbit = { BIT_MASK(EV_REL) },
++		.relbit = { BIT_MASK(REL_X) | BIT_MASK(REL_Y) },
++	},
++	{ }
++};
++static struct input_handler mboot_pointer_handler = {
++	.event = mboot_pointer_event,
++	.connect = mboot_pointer_connect,
++	.disconnect = mboot_pointer_disconnect,
++	.name = "mboot-pointer",
++	.id_table = mboot_pointer_ids,
++};
++
++static void mboot_control_read_pointer(const struct mboot_control_request *request,
++				      struct mboot_control_response *response)
++{
++	struct mboot_pointer_report report;
++	unsigned long flags;
++
++	if (request->device_id || request->arguments[0] || request->arguments[1] ||
++	    request->arguments[2] || request->arguments[3])
++		return;
++	spin_lock_irqsave(&mboot_pointer_lock, flags);
++	if (mboot_pointer_head == mboot_pointer_tail) {
++		response->status = MBOOT_CONTROL_STATUS_END;
++		spin_unlock_irqrestore(&mboot_pointer_lock, flags);
++		return;
++	}
++	report = mboot_pointer_reports[mboot_pointer_tail++ % MBOOT_POINTER_SLOTS];
++	spin_unlock_irqrestore(&mboot_pointer_lock, flags);
++	response->values[0] = (u32)report.dx;
++	response->values[1] = (u32)report.dy;
++	response->values[2] = (u32)report.wheel;
++	response->values[3] = report.buttons;
++	response->status = MBOOT_CONTROL_STATUS_OK;
++}
++
++static int __init mboot_pointer_init(void)
++{
++	if (!hypervisor_is_type(X86_HYPER_MBOOT))
++		return 0;
++	return input_register_handler(&mboot_pointer_handler);
++}
++late_initcall(mboot_pointer_init);
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -3426,2 +3426,4 @@
++#include "mboot_input.h"
++
+ static void mboot_control_handle(const struct mboot_control_request *request,
+ 				 struct mboot_control_response *response)
+@@ -3466,2 +3468,5 @@
+ 	switch (request->operation) {
++	case MBOOT_CONTROL_READ_POINTER:
++		mboot_control_read_pointer(request, response);
++		return;
+ 	case MBOOT_CONTROL_INSTALL_PARTITION:

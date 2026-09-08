@@ -82,7 +82,9 @@ include!(concat!(env!("OUT_DIR"), "/launch_manifest_digest.rs"));
 
 macro_rules! log {
     ($($arg:tt)*) => {
-        crate::serial::print(format_args!("[mBoot] {}\n", format_args!($($arg)*)))
+        if cfg!(debug_assertions) {
+            crate::serial::print(format_args!("[mBoot] {}\n", format_args!($($arg)*)))
+        }
     };
 }
 
@@ -2563,6 +2565,9 @@ fn handle_console_write(
     let Some(host_address) = memory.guest_host_address(address, len) else {
         return HYPERCALL_INVALID_ARGUMENT;
     };
+    if !cfg!(debug_assertions) {
+        return HYPERCALL_SUCCESS;
+    }
     // SAFETY: `guest_host_address` checked the complete immutable guest range and
     // the vCPU is stopped for the duration of this read.
     let bytes = unsafe { core::slice::from_raw_parts(host_address as *const u8, len as usize) };

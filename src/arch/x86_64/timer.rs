@@ -28,7 +28,7 @@ static TSC_DEADLINE_INTERVAL: AtomicU64 = AtomicU64::new(0);
 
 /// Starts a Local APIC timer for vCPU time slicing.
 ///
-/// A calibrated TSC deadline supplies 10 ms slices when the CPU reports enough
+/// A calibrated TSC deadline supplies 1 ms slices when the CPU reports enough
 /// frequency information. Older CPUs use a conservative periodic APIC count.
 pub unsafe fn initialize() -> bool {
     let apic_base = unsafe { read_msr(IA32_APIC_BASE) };
@@ -95,7 +95,7 @@ fn initialize_tsc_deadline(x2apic: bool) -> bool {
     let Some(frequency) = tsc_frequency_hz() else {
         return false;
     };
-    let interval = frequency / 100;
+    let interval = frequency / 1_000;
     if interval == 0 {
         return false;
     }

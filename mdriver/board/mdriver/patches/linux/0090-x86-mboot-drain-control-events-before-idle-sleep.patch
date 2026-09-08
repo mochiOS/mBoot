@@ -1,0 +1,21 @@
+From: mochiOS <dev@mochios.local>
+Subject: [PATCH] x86/mboot: drain control events before idle sleep
+
+Do not impose an idle polling delay after each serviced event. The
+control and block rings share this worker; let queued requests progress
+while retaining a scheduler yield and the existing no-work sleep.
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -4015,7 +4015,10 @@ static int mboot_control_worker(void *unused)
+ 		} else if (result != MBOOT_EVENT_NO_EVENT) {
+ 			break;
+ 		}
+-		msleep_interruptible(10);
++		if (result == MBOOT_EVENT_NO_EVENT)
++			msleep_interruptible(10);
++		else
++			cond_resched();
+ 	}
+ 	mboot_block_queue_close();
+ 	mboot_block_close();

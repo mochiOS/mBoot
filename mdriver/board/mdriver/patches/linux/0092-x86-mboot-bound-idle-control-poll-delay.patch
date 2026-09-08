@@ -1,0 +1,19 @@
+From: mochiOS <dev@mochios.local>
+Subject: [PATCH] x86/mboot: poll idle control rings after one scheduler tick
+
+The control ring carries synchronous display and input requests. Sleeping
+10 ms after finding it empty adds that delay to the next arriving request.
+Sleep for one tick (1 ms with the board configuration), without busy polling
+or blocking the vCPU while other Linux tasks have work to do.
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -4016,7 +4016,7 @@ static int mboot_control_worker(void *unused)
+ 			break;
+ 		}
+ 		if (result == MBOOT_EVENT_NO_EVENT)
+-			msleep_interruptible(10);
++			schedule_timeout_interruptible(1);
+ 		else
+ 			cond_resched();
+ 	}
