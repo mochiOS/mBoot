@@ -26,7 +26,7 @@ use mboot::manifest::{
 };
 use mboot::memory::{NestedPageResources, NestedPageTable};
 use mboot::pci;
-use mboot::scheduler::CooperativeScheduler;
+use mboot::scheduler::{CooperativeScheduler, WaitState};
 use mboot::{
     cpuid, image, BackendKind, CpuidResult, GuestBootMode, GuestConfig, Virtualization,
     VirtualizationResources, VmExitReason,
@@ -151,7 +151,7 @@ struct RuntimeDomain {
     yield_count: u64,
     preemption_count: u64,
     ready: bool,
-    waiting: bool,
+    waiting: WaitState,
     resume_kind: ResumeKind,
     event_irq_enabled: bool,
     interrupts: VirtualLocalApic,
@@ -1041,7 +1041,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             yield_count: 0,
             preemption_count: 0,
             ready: false,
-            waiting: false,
+            waiting: WaitState::Running,
             resume_kind: ResumeKind::Hypercall,
             event_irq_enabled: false,
             interrupts: if prepared.image_format == ManifestImageFormat::LinuxPvh {
@@ -1093,6 +1093,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
 
     let mut scheduler = CooperativeScheduler::new();
+    let slice_ticks = timer::tsc_frequency_hz().unwrap_or(0) / 1_000;
     loop {
         let pending_devices = pci::take_pending_device_interrupts();
         for (domain_id, vector) in pci_assignments.route_pending(pending_devices) {
@@ -1105,10 +1106,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             if runtime_domains[target].interrupts.raise(vector).is_err() {
                 halt_with_error("PCI IRQ routing", mboot::Error::InvalidState)
             }
-            runtime_domains[target].waiting = false;
-            runnable[target] = true;
+            if runtime_domains[target].waiting.wake_for_interrupt() {
+                runnable[target] = true;
+            }
         }
-        let Some(index) = scheduler.next(&runnable) else {
+        let Some(index) = scheduler.next_in_slice(&runnable, timer::now(), slice_ticks) else {
             if pci_assignments.has_active() {
                 // SAFETY: The mBoot IDT owns every enabled device vector. STI is
                 // immediately followed by HLT, and the handler returns with IF clear.
@@ -1231,6 +1233,16 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             }
             Err(error) => halt_with_error("vCPU entry", error),
         };
+        if matches!(
+            vm_exit.reason,
+            VmExitReason::InterruptWindow
+                | VmExitReason::MsrRead
+                | VmExitReason::MsrWrite
+                | VmExitReason::Cpuid
+                | VmExitReason::ControlRegisterWrite
+        ) {
+            scheduler.resume_after_emulation(index);
+        }
         if vm_exit.reason == VmExitReason::Preempted {
             // VMX acknowledges the interrupt during VM exit and reports its
             // vector here. SVM dispatches the pending interrupt through the
@@ -1871,12 +1883,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     );
                 }
                 if let Some(target_index) = target_index {
-                    if runtime_domains[target_index].waiting {
+                    if runtime_domains[target_index].waiting != WaitState::Running {
                         let port = event_channels
                             .receive(delivery.domain)
                             .unwrap_or(delivery.port);
                         runtime_domains[target_index].pending_result = u64::from(port);
-                        runtime_domains[target_index].waiting = false;
+                        runtime_domains[target_index].waiting = WaitState::Running;
                         runnable[target_index] = true;
                     } else if runtime_domains[target_index].event_irq_enabled {
                         if runtime_domains[target_index]
@@ -1996,6 +2008,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 } else {
                     HYPERCALL_INVALID_ARGUMENT
                 };
+            // Poll is non-blocking: return its result within the remaining
+            // slice instead of charging a Domain switch to every ring check.
+            // Explicit Yield/EventWait still surrender the slice, and repeated
+            // polls cannot renew the scheduler's fixed time budget.
+            scheduler.resume_after_emulation(index);
             continue;
         }
         if vm_exit.hypercall_number == HypercallNumber::EventWait as u64 {
@@ -2010,7 +2027,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                     .cancel_pending(EVENT_CHANNEL_VECTOR);
                 runtime_domains[index].pending_result = u64::from(port);
             } else {
-                runtime_domains[index].waiting = true;
+                runtime_domains[index].waiting = WaitState::EventChannel;
                 runnable[index] = false;
             }
             continue;
@@ -2122,7 +2139,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 if runtime.domain.role() == DomainRole::System && !runtime.ready {
                     HYPERCALL_INVALID_ARGUMENT
                 } else {
-                    runtime.waiting = true;
+                    runtime.waiting = WaitState::Interrupt;
                     runnable[index] = false;
                     HYPERCALL_SUCCESS
                 }
@@ -2132,7 +2149,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
     let waiting_domains = runtime_domains
         .iter()
-        .filter(|domain| domain.waiting)
+        .filter(|domain| domain.waiting != WaitState::Running)
         .count();
     let crashed_domains = runtime_domains
         .iter()
@@ -2230,7 +2247,7 @@ fn isolate_crashed_domain(
     if let Err(error) = runtime_domains[index].domain.mark_crashed() {
         halt_with_error("Domain crash transition", error)
     }
-    runtime_domains[index].waiting = false;
+    runtime_domains[index].waiting = WaitState::Running;
     runnable[index] = false;
     let next_restart_count = runtime_domains[index].restart_count.saturating_add(1);
     runtime_domains[index].crash_info = Some(DomainCrashInfo::new(
@@ -2466,7 +2483,7 @@ fn restart_domain(index: usize, runtime_domains: &mut [RuntimeDomain], runnable:
     runtime.yield_count = 0;
     runtime.preemption_count = 0;
     runtime.ready = false;
-    runtime.waiting = false;
+    runtime.waiting = WaitState::Running;
     runtime.resume_kind = ResumeKind::Hypercall;
     runtime.event_irq_enabled = false;
     runtime.interrupts = if runtime.image_format == ManifestImageFormat::LinuxPvh {

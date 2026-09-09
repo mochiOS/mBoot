@@ -82,6 +82,12 @@ int main(void)
         int right = (x > old_x ? x : old_x) + 8, bottom = (y > old_y ? y : old_y) + 8;
         packet(a, x, y, (int[]){0,0,W,H});
         packet(b, x, y, (int[]){left,top,right-left,bottom-top});
+        /* Timing metadata must not affect geometry or retained rendering. */
+        if (frame % 2) {
+            uint16_t version = SCENE_TIMED_VERSION;
+            memcpy(b + 4, &version, sizeof(version));
+            put32(b + 52, 8); put32(b + 56, 1000); put32(b + 60, 800);
+        }
         read_frame(&full, a, expected);
         read_frame(&dirty, b, actual);
         assert(!memcmp(actual, expected, sizeof(actual)));

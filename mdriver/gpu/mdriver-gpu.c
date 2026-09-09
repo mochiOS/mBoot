@@ -28,6 +28,7 @@
 #define VERTEX_STRIDE 36
 #define SCENE_MAGIC 0x43474b56u
 #define SCENE_VERSION 1
+#define SCENE_TIMED_VERSION 2
 #define SCENE_HEADER_LEN 64
 #define TEXTURE_DESC_LEN 40
 #define BATCH_DESC_LEN 16
@@ -961,26 +962,19 @@ static int finish_flip(struct renderer *renderer)
     return 0;
 }
 
-static int show_frame(struct renderer *renderer, uint64_t draw_time, uint64_t flip_wait)
+static int show_frame(struct renderer *renderer, uint64_t times[TIMING_COUNT])
 {
-    uint64_t times[TIMING_COUNT] = { draw_time };
-    times[TIMING_KMS] = flip_wait;
     uint64_t start = renderer->timing.enabled ? timing_now() : 0;
     if (renderer->timing.enabled) {
-        start = timing_now();
         show_timing(renderer);
-        times[TIMING_DRAW] += timing_elapsed(start);
-        start = timing_now();
+        times[TIMING_DRAW] += timing_lap(&renderer->timing, &start);
     }
     /* EGL swap submits rendering; i915 imports the BO's implicit fence. */
-    if (renderer->timing.enabled) {
-        times[TIMING_GPU] = timing_elapsed(start);
-        start = timing_now();
-    }
     if (glGetError() != GL_NO_ERROR)
         return -EIO;
     if (!eglSwapBuffers(renderer->egl_display, renderer->egl_surface))
         return -EIO;
+    times[TIMING_SWAP] = timing_lap(&renderer->timing, &start);
     struct gbm_bo *bo = gbm_surface_lock_front_buffer(renderer->surface);
     if (!bo)
         return -EIO;
@@ -989,18 +983,12 @@ static int show_frame(struct renderer *renderer, uint64_t draw_time, uint64_t fl
         gbm_surface_release_buffer(renderer->surface, bo);
         return errno ? -errno : -EIO;
     }
-    if (renderer->timing.enabled) {
-        times[TIMING_SWAP] = timing_elapsed(start);
-        start = timing_now();
-    }
+    times[TIMING_GBM] = timing_lap(&renderer->timing, &start);
     // Keep the startup readiness check synchronous. Normal frames acknowledge
     // accepted scanout submission, allowing the shared control ring to proceed.
     int nonblocking = renderer->front_bo != NULL;
     int result = present_framebuffer(renderer, fb, nonblocking);
-    if (renderer->timing.enabled) {
-        times[TIMING_KMS] += timing_elapsed(start);
-        timing_record(&renderer->timing, times);
-    }
+    times[TIMING_KMS] = timing_lap(&renderer->timing, &start);
     if (result) {
         gbm_surface_release_buffer(renderer->surface, bo);
         return -errno;
@@ -1010,6 +998,10 @@ static int show_frame(struct renderer *renderer, uint64_t draw_time, uint64_t fl
         renderer->flip_pending = 1;
     } else {
         renderer->front_bo = bo;
+    }
+    if (renderer->timing.enabled) {
+        timing_record(&renderer->timing, times);
+        renderer->timing.completed_at = timing_now();
     }
     return 0;
 }
@@ -1033,7 +1025,8 @@ static int show_startup_frame(struct renderer *renderer)
         sample[1] < 190 || sample[1] > 210 ||
         sample[2] < 190 || sample[2] > 210)
         return -EIO;
-    return show_frame(renderer, 0, 0);
+    uint64_t times[TIMING_COUNT] = { 0 };
+    return show_frame(renderer, times);
 }
 
 static int bind_retained_framebuffer(struct renderer *renderer)
@@ -1086,7 +1079,8 @@ static int replacement_rect(const uint8_t *vertices, uint32_t width, uint32_t he
 static int draw_scene(struct renderer *renderer, const uint8_t *scene, size_t length)
 {
     if (length < SCENE_HEADER_LEN || get_u32(scene) != SCENE_MAGIC ||
-        get_u16(scene + 4) != SCENE_VERSION || get_u16(scene + 6) != SCENE_HEADER_LEN ||
+        (get_u16(scene + 4) != SCENE_VERSION && get_u16(scene + 4) != SCENE_TIMED_VERSION) ||
+        get_u16(scene + 6) != SCENE_HEADER_LEN ||
         get_u32(scene + 8) != length || get_u32(scene + 12) != renderer->width ||
         get_u32(scene + 16) != renderer->height || get_u32(scene + 24) != VERTEX_STRIDE)
         return -EINVAL;
@@ -1189,10 +1183,9 @@ static int cursor_command(struct renderer *renderer, const uint8_t *packet, size
 {
     if (length < 24)
         return -EINVAL;
-    // Retire primary scanout before changing the cursor plane.
-    int completed = finish_flip(renderer);
-    if (completed)
-        return completed;
+    /* Cursor ioctls synchronize their own plane in i915. Keep primary BOs
+     * pinned until render_scene retires the flip, without blocking input
+     * on an unrelated primary-plane completion here. */
     uint32_t operation = get_u32(packet + 4);
     uint32_t a = get_u32(packet + 8), b = get_u32(packet + 12);
     uint32_t c = get_u32(packet + 16), d = get_u32(packet + 20);
@@ -1264,6 +1257,10 @@ static int cursor_command(struct renderer *renderer, const uint8_t *packet, size
 
 static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t length)
 {
+    uint64_t times[TIMING_COUNT] = { 0 };
+    if (renderer->timing.enabled)
+        times[TIMING_GAP] = timing_elapsed(renderer->timing.completed_at);
+    times[TIMING_CURSOR] = renderer->timing.last[TIMING_CURSOR];
     uint64_t start = renderer->timing.enabled ? timing_now() : 0;
     /* EGL may acquire a back buffer on the first default-framebuffer draw,
      * not just at swap. Retire the previous flip before any GL rendering so
@@ -1272,11 +1269,15 @@ static int render_scene(struct renderer *renderer, const uint8_t *scene, size_t 
     int result = finish_flip(renderer);
     if (result)
         return result;
-    uint64_t flip_wait = renderer->timing.enabled ? timing_elapsed(start) : 0;
-    start = renderer->timing.enabled ? timing_now() : 0;
+    times[TIMING_WAIT] = timing_lap(&renderer->timing, &start);
     result = draw_scene(renderer, scene, length);
-    return result ? result : show_frame(renderer,
-        renderer->timing.enabled ? timing_elapsed(start) : 0, flip_wait);
+    times[TIMING_DRAW] = timing_lap(&renderer->timing, &start);
+    if (!result && get_u16(scene + 4) == SCENE_TIMED_VERSION) {
+        times[TIMING_MAKE] = (uint64_t)get_u32(scene + 52) * 1000000;
+        times[TIMING_IPC] = (uint64_t)get_u32(scene + 56) * 1000000;
+        times[TIMING_CONTROL] = (uint64_t)get_u32(scene + 60) * 1000000;
+    }
+    return result ? result : show_frame(renderer, times);
 }
 
 int main(void)
@@ -1335,9 +1336,12 @@ int main(void)
         }
         int cursor = mapping != MAP_FAILED && request.scene_length >= 4 &&
             get_u32(mapping) == CURSOR_MAGIC;
+        uint64_t cursor_start = cursor && renderer.timing.enabled ? timing_now() : 0;
         int status = mapping == MAP_FAILED ? -errno : cursor ?
             cursor_command(&renderer, mapping, request.scene_length) :
             render_scene(&renderer, mapping, request.scene_length);
+        if (cursor_start)
+            timing_sample(&renderer.timing, TIMING_CURSOR, timing_elapsed(cursor_start));
         if (status && cursor && !renderer.flip_pending) {
             if (!set_cursor(&renderer, renderer.cursor_bo,
                             renderer.cursor_hot_x, renderer.cursor_hot_y, 0))
