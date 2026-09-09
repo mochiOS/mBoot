@@ -6,6 +6,7 @@ extern crate alloc;
 mod display;
 mod panic;
 mod serial;
+mod smp;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -28,7 +29,7 @@ use mboot::memory::{NestedPageResources, NestedPageTable};
 use mboot::pci;
 use mboot::scheduler::{CooperativeScheduler, WaitState};
 use mboot::{
-    cpuid, image, BackendKind, CpuidResult, GuestBootMode, GuestConfig, Virtualization,
+    cpuid, image, BackendKind, GuestBootMode, GuestConfig,
     VirtualizationResources, VmExitReason,
 };
 use mnu_abi::hypervisor::{
@@ -41,6 +42,7 @@ use mnu_abi::hypervisor::{
     HYPERVISOR_BACKEND_AMD_SVM, HYPERVISOR_BACKEND_INTEL_VMX,
 };
 use sha2::{Digest, Sha256};
+use smp::{PinnedVirtualization as Virtualization, ResumeKind};
 use uefi::fs::Error as FsError;
 use uefi::prelude::*;
 #[cfg(feature = "uefi-net")]
@@ -129,17 +131,6 @@ struct PreparedDomain {
     entropy_root: [u8; 32],
 }
 
-#[derive(Clone, Copy)]
-enum ResumeKind {
-    Hypercall,
-    WithoutAdvance,
-    Halted,
-    MsrRead(u64),
-    MsrWrite,
-    Cpuid(CpuidResult),
-    ControlRegisterWrite { register: u8, value: u64 },
-    GeneralProtection,
-}
 
 struct RuntimeDomain {
     opregion_storage: Vec<u8>,
@@ -167,6 +158,47 @@ struct RuntimeDomain {
     intel_graphics_opregion: Option<IntelGraphicsOpRegion>,
     opregion_report: mboot::boot_log::ProbeReport,
     boot_log: mboot::boot_log::BootLog,
+}
+
+fn prepare_entry(runtime: &mut RuntimeDomain) -> smp::Entry {
+    if runtime.interrupts.update_timer(timer::now()).is_err() {
+        halt_with_error("Virtual APIC timer", mboot::Error::InvalidState)
+    }
+    if !matches!(runtime.resume_kind, ResumeKind::GeneralProtection) {
+        if let Some(vector) = runtime.interrupts.next_pending() {
+            let can_inject = match unsafe { runtime.virtualization.can_inject_interrupt() } {
+                Ok(can_inject) => can_inject,
+                Err(error) => halt_with_error("Event IRQ readiness", error),
+            };
+            if can_inject {
+                if let Err(error) =
+                    unsafe { runtime.virtualization.set_interrupt_window(false) }
+                {
+                    halt_with_error("Interrupt window disable", error)
+                }
+                if let Err(error) = unsafe { runtime.virtualization.inject_interrupt(vector) } {
+                    halt_with_error("Event IRQ injection", error)
+                }
+                if runtime.interrupts.accept(vector).is_err() {
+                    halt_with_error("Virtual APIC accept", mboot::Error::InvalidState)
+                }
+            } else if let Err(error) =
+                unsafe { runtime.virtualization.set_interrupt_window(true) }
+            {
+                halt_with_error("Interrupt window enable", error)
+            }
+        }
+    }
+    let start = if runtime.started {
+        None
+    } else {
+        runtime.started = true;
+        if runtime.domain.role() == DomainRole::Hardware {
+            let _ = display::console_page(b"MBOOT STARTING MDRIVER LINUX");
+        }
+        Some(runtime.guest)
+    };
+    smp::Entry { start, resume: runtime.resume_kind, result: runtime.pending_result }
 }
 
 struct IntelGraphicsOpRegion {
@@ -595,6 +627,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         }
     }
 
+    let host_cpus = match smp::HostCpus::prepare(boot_services) {
+        Ok(cpus) => cpus,
+        Err(status) => return status,
+    };
+    let host_tables = alloc::boxed::Box::leak(alloc::boxed::Box::new(descriptor::HostTables::new()));
     let _ = system_table.stdout().output_string(uefi::cstr16!("Domains verified. Exiting boot services...\r\n"));
     // SAFETY: All required firmware allocations are complete and no boot service
     // is used after this call.
@@ -614,7 +651,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     // interrupt and descriptor-table policy.
     unsafe {
         asm!("cli", options(nomem, nostack));
-        descriptor::install();
+        descriptor::install(host_tables);
     }
     // SAFETY: Firmware I/O has ended, interrupts are disabled, and mBoot is the
     // sole PCI configuration-space owner from this point onward.
@@ -799,6 +836,12 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     } else {
         None
     };
+    // SAFETY: Firmware teardown and DMA quarantine are complete. AP resources
+    // remain reserved and each AP enters its own descriptor tables and stack.
+    match unsafe { host_cpus.start() } {
+        Ok(count) => log!("host CPUs online: {} (APs parked)", count),
+        Err(_) => halt_with_error("host AP startup", mboot::Error::InvalidState),
+    }
     let preemption_timer = unsafe { timer::initialize() };
     log!(
         "vCPU preemption timer {}",
@@ -919,9 +962,14 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         } else {
             None
         };
-        // SAFETY: Control pages are exclusive, execution is pinned to the BSP,
+        // SAFETY: Control pages are exclusive; each backend runs on its owner CPU,
         // interrupts are disabled, and this code runs at CPL0.
-        let virtualization = if index == 0 {
+        let virtualization = if let Some(result) = unsafe { host_cpus.create_vcpu(index, prepared.vcpu_control_page) } {
+            match result {
+                Ok(virtualization) => virtualization,
+                Err(error) => halt_with_error("AP vCPU creation", error),
+            }
+        } else if index == 0 {
             // SAFETY: The preconditions above apply to the BSP's first vCPU.
             match unsafe {
                 Virtualization::enable(VirtualizationResources {
@@ -1093,6 +1141,11 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
 
     let mut scheduler = CooperativeScheduler::new();
+    let mut owners = [None; mboot::manifest::MAX_DOMAIN_COUNT];
+    for (slot, runtime) in owners.iter_mut().zip(&runtime_domains) {
+        *slot = runtime.virtualization.owner();
+    }
+    let mut completed = None;
     let slice_ticks = timer::tsc_frequency_hz().unwrap_or(0) / 1_000;
     loop {
         let pending_devices = pci::take_pending_device_interrupts();
@@ -1110,7 +1163,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
                 runnable[target] = true;
             }
         }
-        let Some(index) = scheduler.next_in_slice(&runnable, timer::now(), slice_ticks) else {
+        let queued = completed.take();
+        let Some(index) = queued.as_ref().map(|(index, _)| *index)
+            .or_else(|| scheduler.next_in_slice(&runnable, timer::now(), slice_ticks)) else {
             if pci_assignments.has_active() {
                 // SAFETY: The mBoot IDT owns every enabled device vector. STI is
                 // immediately followed by HLT, and the handler returns with IF clear.
@@ -1119,86 +1174,39 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             }
             break;
         };
-        let runtime = &mut runtime_domains[index];
-        if runtime.interrupts.update_timer(timer::now()).is_err() {
-            halt_with_error("Virtual APIC timer", mboot::Error::InvalidState)
-        }
-        if !matches!(runtime.resume_kind, ResumeKind::GeneralProtection) {
-            if let Some(vector) = runtime.interrupts.next_pending() {
-                let can_inject = match unsafe { runtime.virtualization.can_inject_interrupt() } {
-                    Ok(can_inject) => can_inject,
-                    Err(error) => halt_with_error("Event IRQ readiness", error),
-                };
-                if can_inject {
-                    if let Err(error) =
-                        unsafe { runtime.virtualization.set_interrupt_window(false) }
-                    {
-                        halt_with_error("Interrupt window disable", error)
-                    }
-                    if let Err(error) = unsafe { runtime.virtualization.inject_interrupt(vector) } {
-                        halt_with_error("Event IRQ injection", error)
-                    }
-                    if runtime.interrupts.accept(vector).is_err() {
-                        halt_with_error("Virtual APIC accept", mboot::Error::InvalidState)
-                    }
-                } else if let Err(error) =
-                    unsafe { runtime.virtualization.set_interrupt_window(true) }
-                {
-                    halt_with_error("Interrupt window enable", error)
-                }
-            }
-        }
-        // SAFETY: The selected vCPU is stopped and owns all guest and control state.
-        let vm_exit = if runtime.started {
-            match runtime.resume_kind {
-                ResumeKind::Hypercall => {
-                    // SAFETY: This vCPU stopped at a Hypercall and remains selected.
-                    unsafe { runtime.virtualization.resume(runtime.pending_result) }
-                }
-                ResumeKind::WithoutAdvance => {
-                    // SAFETY: No guest instruction completed at the previous exit.
-                    unsafe { runtime.virtualization.resume_preempted() }
-                }
-                ResumeKind::Halted => {
-                    // SAFETY: This vCPU stopped on an intercepted HLT.
-                    unsafe { runtime.virtualization.resume_halted() }
-                }
-                ResumeKind::MsrRead(value) => {
-                    // SAFETY: The value completes the preceding intercepted RDMSR.
-                    unsafe { runtime.virtualization.resume_msr_read(value) }
-                }
-                ResumeKind::MsrWrite => {
-                    // SAFETY: The preceding intercepted WRMSR was emulated.
-                    unsafe { runtime.virtualization.resume_msr_write() }
-                }
-                ResumeKind::Cpuid(result) => {
-                    // SAFETY: These values complete the preceding intercepted CPUID.
-                    unsafe { runtime.virtualization.resume_cpuid(result) }
-                }
-                ResumeKind::ControlRegisterWrite { register, value } => unsafe {
-                    runtime
-                        .virtualization
-                        .resume_control_register_write(register, value)
-                },
-                ResumeKind::GeneralProtection => {
-                    // SAFETY: The vCPU is stopped at the rejected instruction.
-                    if let Err(error) =
-                        unsafe { runtime.virtualization.inject_general_protection() }
-                    {
-                        halt_with_error("Domain exception injection", error)
-                    }
-                    // SAFETY: Fault delivery must preserve the faulting guest RIP.
-                    unsafe { runtime.virtualization.resume_preempted() }
-                }
-            }
+        // No management operation runs until both CPUs have returned. Always
+        // consume the second exit before selecting another pair, even if the
+        // first exit changes a peer's runnable state.
+        let vm_exit = if let Some((_, exit)) = queued {
+            exit
         } else {
-            runtime.started = true;
-            if runtime.domain.role() == DomainRole::Hardware {
-                let _ = display::console_page(b"MBOOT STARTING MDRIVER LINUX");
+            let entry = prepare_entry(&mut runtime_domains[index]);
+            if let Some(peer) = mboot::scheduler::parallel_peer(&runnable, &owners[..runnable.len()], index) {
+                let (runtime, other) = if index < peer {
+                    let (left, right) = runtime_domains.split_at_mut(peer);
+                    (&mut left[index], &mut right[0])
+                } else {
+                    let (left, right) = runtime_domains.split_at_mut(index);
+                    (&mut right[0], &mut left[peer])
+                };
+                let other_entry = prepare_entry(other);
+                // SAFETY: Both vCPUs are stopped and exclusively borrowed. Their
+                // mappings, device assignments and shared tables stay unchanged
+                // until enter_pair has joined both physical CPUs.
+                let (first, second) = match unsafe {
+                    runtime.virtualization.enter_pair(entry, &mut other.virtualization, other_entry)
+                } {
+                    Ok(exits) => exits,
+                    Err(error) => halt_with_error("parallel vCPU dispatch", error),
+                };
+                completed = Some((peer, second));
+                first
+            } else {
+                // SAFETY: The selected vCPU is stopped and owns its guest state.
+                unsafe { runtime_domains[index].virtualization.enter(entry) }
             }
-            // SAFETY: This is the first entry into the stopped, fully prepared vCPU.
-            unsafe { runtime.virtualization.run(runtime.guest) }
         };
+        let runtime = &mut runtime_domains[index];
         let vm_exit = match vm_exit {
             Ok(exit) => exit,
             Err(mboot::Error::UnexpectedVmExit(raw_reason)) => {

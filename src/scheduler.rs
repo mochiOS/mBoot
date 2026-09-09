@@ -6,6 +6,18 @@ pub enum WaitState {
     EventChannel,
 }
 
+/// Select another runnable vCPU on a different physical owner, without changing
+/// the primary scheduler's cursor. A collected peer exit must be handled before
+/// starting another pair.
+pub fn parallel_peer<T: PartialEq>(runnable: &[bool], owners: &[T], index: usize) -> Option<usize> {
+    if runnable.len() != owners.len() || runnable.get(index) != Some(&true) {
+        return None;
+    }
+    (1..runnable.len())
+        .map(|offset| (index + offset) % runnable.len())
+        .find(|&peer| runnable[peer] && owners[peer] != owners[index])
+}
+
 impl WaitState {
     /// Device IRQs remain queued while an EventWait awaits a port result.
     pub fn wake_for_interrupt(&mut self) -> bool {
@@ -66,6 +78,18 @@ impl CooperativeScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_selection_requires_distinct_runnable_owners() {
+        assert_eq!(parallel_peer(&[true, true], &[0, 1], 0), Some(1));
+        assert_eq!(parallel_peer(&[true, true], &[0, 0], 0), None);
+        assert_eq!(parallel_peer(&[true, false], &[0, 1], 0), None);
+        assert_eq!(parallel_peer(&[true, true, true], &[0, 0, 1], 0), Some(2));
+        assert_eq!(parallel_peer(&[true, true, true], &[0, 1, 2], 2), Some(0));
+        assert_eq!(parallel_peer(&[true], &[0], 0), None);
+        assert_eq!(parallel_peer(&[], &[] as &[u32], 0), None);
+        assert_eq!(parallel_peer(&[true], &[] as &[u32], 0), None);
+    }
 
     #[test]
     fn emulation_preserves_but_does_not_extend_slice() {

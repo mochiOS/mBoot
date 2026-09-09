@@ -7,9 +7,22 @@ const KERNEL_DATA_SELECTOR: u16 = 0x10;
 const TSS_SELECTOR: u16 = 0x18;
 const INTERRUPT_GATE: u8 = 0x8e;
 
-static mut GDT: [u64; 5] = [0, 0x00af_9a00_0000_ffff, 0x00af_9200_0000_ffff, 0, 0];
-static mut IDT: [IdtEntry; 256] = [IdtEntry::missing(); 256];
-static mut TSS: [u8; 104] = [0; 104];
+/// Each host CPU owns a permanent instance; LTR marks its GDT's TSS busy.
+pub struct HostTables {
+    gdt: [u64; 5],
+    idt: [IdtEntry; 256],
+    tss: [u8; 104],
+}
+
+impl HostTables {
+    pub const fn new() -> Self {
+        Self {
+            gdt: [0, 0x00af_9a00_0000_ffff, 0x00af_9200_0000_ffff, 0, 0],
+            idt: [IdtEntry::missing(); 256],
+            tss: [0; 104],
+        }
+    }
+}
 
 global_asm!(
     ".global mboot_exception_stub",
@@ -148,10 +161,11 @@ impl IdtEntry {
 ///
 /// # Safety
 /// This must run at CPL0 with interrupts disabled. The caller must not rely on
-/// firmware interrupt handlers after this function returns.
-pub unsafe fn install() {
+/// firmware interrupt handlers after this function returns. Each CPU must use
+/// its own tables; the installed instance must never be moved or reclaimed.
+pub unsafe fn install(tables: &'static mut HostTables) {
     let handler = mboot_exception_stub as *const () as usize as u64;
-    let idt_ptr = addr_of_mut!(IDT).cast::<IdtEntry>();
+    let idt_ptr = addr_of_mut!(tables.idt).cast::<IdtEntry>();
     for index in 0..256 {
         // SAFETY: IDT is exclusively initialized here before it is loaded.
         unsafe { idt_ptr.add(index).write(IdtEntry::interrupt(handler)) };
@@ -171,15 +185,15 @@ pub unsafe fn install() {
         };
     }
 
-    let tss_base = addr_of!(TSS) as u64;
+    let tss_base = addr_of!(tables.tss) as u64;
     let tss_limit = (size_of::<[u8; 104]>() - 1) as u64;
     let tss_low = (tss_limit & 0xffff)
         | ((tss_base & 0x00ff_ffff) << 16)
         | (0x89 << 40)
         | (((tss_limit >> 16) & 0xf) << 48)
         | (((tss_base >> 24) & 0xff) << 56);
-    let gdt_ptr = addr_of_mut!(GDT).cast::<u64>();
-    let tss_ptr = addr_of_mut!(TSS).cast::<u8>();
+    let gdt_ptr = addr_of_mut!(tables.gdt).cast::<u64>();
+    let tss_ptr = addr_of_mut!(tables.tss).cast::<u8>();
     // SAFETY: The GDT and TSS are exclusively initialized before LGDT/LTR.
     unsafe {
         gdt_ptr.add(3).write(tss_low);
@@ -187,16 +201,16 @@ pub unsafe fn install() {
         tss_ptr
             .add(102)
             .cast::<u16>()
-            .write((size_of::<[u8; 104]>()) as u16);
+            .write_unaligned((size_of::<[u8; 104]>()) as u16);
     }
 
     let gdt_pointer = DescriptorTablePointer {
         limit: (size_of::<[u64; 5]>() - 1) as u16,
-        base: addr_of!(GDT) as u64,
+        base: addr_of!(tables.gdt) as u64,
     };
     let idt_pointer = DescriptorTablePointer {
         limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
-        base: addr_of!(IDT) as u64,
+        base: addr_of!(tables.idt) as u64,
     };
 
     // SAFETY: The contract requires CPL0 and disabled interrupts. Both tables
@@ -221,6 +235,49 @@ pub unsafe fn install() {
     }
 }
 
-pub(crate) fn tss_base() -> u64 {
-    addr_of!(TSS) as u64
+/// Reads the TSS selected on this CPU, not another CPU's bootstrap TSS.
+///
+/// # Safety
+/// The current GDT must be mapped and contain a live 64-bit TSS descriptor.
+pub(crate) unsafe fn tss_base() -> Result<u64, crate::Error> {
+    let mut gdt = DescriptorTablePointer { limit: 0, base: 0 };
+    let selector: u16;
+    unsafe {
+        asm!("sgdt [{}]", in(reg) &mut gdt, options(nostack, preserves_flags));
+        asm!("str {0:x}", out(reg) selector, options(nomem, nostack, preserves_flags));
+    }
+    let offset = usize::from(selector & !7);
+    if selector & 4 != 0 || offset == 0 || offset + 15 > usize::from(gdt.limit) {
+        return Err(crate::Error::InvalidState);
+    }
+    let descriptor = (gdt.base as usize + offset) as *const u64;
+    let (low, high) = unsafe {
+        (descriptor.read_unaligned(), descriptor.add(1).read_unaligned())
+    };
+    decode_tss_base(low, high)
+}
+
+fn decode_tss_base(low: u64, high: u64) -> Result<u64, crate::Error> {
+    if (low >> 40) & 0xff != 0x8b || high >> 32 != 0 {
+        return Err(crate::Error::InvalidState);
+    }
+    Ok(((low >> 16) & 0xff_ffff) | ((low >> 32) & 0xff00_0000) | (high << 32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_tss_preserves_all_address_bits() {
+        // Busy, present 64-bit TSS at 0x1234_5678_9abc_def0.
+        assert_eq!(decode_tss_base(0x9a00_8bbc_def0_0067, 0x1234_5678),
+            Ok(0x1234_5678_9abc_def0));
+    }
+
+    #[test]
+    fn rejects_non_tss_and_reserved_high_bits() {
+        assert!(decode_tss_base(0x00af_9a00_0000_ffff, 0).is_err());
+        assert!(decode_tss_base(0x0000_8b00_0000_0067, 1 << 32).is_err());
+    }
 }

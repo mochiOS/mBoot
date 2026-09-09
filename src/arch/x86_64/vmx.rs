@@ -187,6 +187,8 @@ struct VmxRunContext {
     r9: u64,
     r10: u64,
     r11: u64,
+    guest_fx: super::FxState,
+    host_fx: super::FxState,
 }
 
 global_asm!(
@@ -206,6 +208,8 @@ global_asm!(
     "mov rcx, 0x6c16",
     "vmwrite rcx, rax",
     "mov rax, [rsp]",
+    "fxsave64 [rax + {host_fx}]",
+    "fxrstor64 [rax + {guest_fx}]",
     "cmp qword ptr [rax + 80], 0",
     "jne mboot_vmx_resume_guest",
     "mov rbx, [rax + 32]",
@@ -267,6 +271,7 @@ global_asm!(
     "push r10",
     "push r11",
     "mov rcx, [rsp + 120]",
+    "fxsave64 [rcx + {guest_fx}]",
     "mov rax, [rsp + 112]",
     "mov [rcx], rax",
     "mov rax, [rsp + 56]",
@@ -300,6 +305,8 @@ global_asm!(
     "add rsp, 120",
     "xor eax, eax",
     "mboot_vmx_return:",
+    "mov rcx, [rsp]",
+    "fxrstor64 [rcx + {host_fx}]",
     "add rsp, 8",
     "pop r15",
     "pop r14",
@@ -308,6 +315,8 @@ global_asm!(
     "pop rbp",
     "pop rbx",
     "ret",
+    guest_fx = const core::mem::offset_of!(VmxRunContext, guest_fx),
+    host_fx = const core::mem::offset_of!(VmxRunContext, host_fx),
 );
 
 unsafe extern "sysv64" {
@@ -1245,7 +1254,7 @@ unsafe fn initialize_host_state() -> Result<(), Error> {
         vmwrite(HOST_CR4, read_cr4())?;
         vmwrite(HOST_FS_BASE, read_msr(IA32_FS_BASE))?;
         vmwrite(HOST_GS_BASE, read_msr(IA32_GS_BASE))?;
-        vmwrite(HOST_TR_BASE, descriptor::tss_base())?;
+        vmwrite(HOST_TR_BASE, descriptor::tss_base()?)?;
         vmwrite(HOST_GDTR_BASE, gdt_base)?;
         vmwrite(HOST_IDTR_BASE, idt_base)?;
         vmwrite(HOST_SYSENTER_CS, read_msr(IA32_SYSENTER_CS) & 0xffff)?;
@@ -1540,7 +1549,9 @@ mod tests {
         assert_eq!(core::mem::offset_of!(VmxRunContext, rcx), 88);
         assert_eq!(core::mem::offset_of!(VmxRunContext, r8), 96);
         assert_eq!(core::mem::offset_of!(VmxRunContext, r11), 120);
-        assert_eq!(core::mem::size_of::<VmxRunContext>(), 128);
+        assert_eq!(core::mem::offset_of!(VmxRunContext, guest_fx), 128);
+        assert_eq!(core::mem::offset_of!(VmxRunContext, host_fx), 640);
+        assert_eq!(core::mem::size_of::<VmxRunContext>(), 1152);
     }
 
     #[test]

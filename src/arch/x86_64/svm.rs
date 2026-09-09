@@ -86,6 +86,8 @@ struct SvmRunContext {
     r9: u64,
     r10: u64,
     r11: u64,
+    guest_fx: super::FxState,
+    host_fx: super::FxState,
 }
 
 global_asm!(
@@ -100,6 +102,10 @@ global_asm!(
     "push rdi",
     "push rsi",
     "push rdx",
+    // Keep interrupts blocked while guest extension state is installed.
+    "clgi",
+    "fxsave64 [rsi + {host_fx}]",
+    "fxrstor64 [rsi + {guest_fx}]",
     // VMRUN does not switch the complete syscall/segment MSR set. Save the
     // host extension state, then load the state belonging to this vCPU.
     "mov rax, rdx",
@@ -145,11 +151,14 @@ global_asm!(
     "vmsave rax",
     "mov rax, [rsp + 112]",
     "vmload rax",
-    // VMEXIT clears GIF. Briefly open it so the pending host interrupt is
-    // dispatched through mBoot's IDT, then close it before handling the exit.
+    // VMEXIT clears GIF. Restore it after host extension state so pending
+    // interrupts run and the host can subsequently wait for another IPI.
+    // Return with IF clear, not GIF clear: host idle paths use STI/HLT.
+    "mov rax, [rsp + 120]",
+    "fxsave64 [rax + {guest_fx}]",
+    "fxrstor64 [rax + {host_fx}]",
     "stgi",
     "nop",
-    "clgi",
     "cli",
     "mov rax, [rsp + 120]",
     "mov rcx, [rsp + 104]",
@@ -189,6 +198,8 @@ global_asm!(
     "pop rbp",
     "pop rbx",
     "ret",
+    guest_fx = const core::mem::offset_of!(SvmRunContext, guest_fx),
+    host_fx = const core::mem::offset_of!(SvmRunContext, host_fx),
 );
 
 unsafe extern "sysv64" {
@@ -790,7 +801,9 @@ mod tests {
         assert_eq!(core::mem::offset_of!(SvmRunContext, rcx), 80);
         assert_eq!(core::mem::offset_of!(SvmRunContext, r8), 88);
         assert_eq!(core::mem::offset_of!(SvmRunContext, r11), 112);
-        assert_eq!(core::mem::size_of::<SvmRunContext>(), 120);
+        assert_eq!(core::mem::offset_of!(SvmRunContext, guest_fx), 128);
+        assert_eq!(core::mem::offset_of!(SvmRunContext, host_fx), 640);
+        assert_eq!(core::mem::size_of::<SvmRunContext>(), 1152);
     }
 
     #[test]
