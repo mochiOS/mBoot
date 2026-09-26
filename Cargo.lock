@@ -92,6 +92,7 @@ dependencies = [
 [[package]]
 name = "mnu-abi"
 version = "0.1.0"
+source = "git+https://github.com/mochiOS/mnu#d31d5b422fb53ccf7f39259a25eeaff8dea57ef3"
 
 [[package]]
 name = "proc-macro2"
