@@ -1,13 +1,19 @@
 use core::ptr::write_volatile;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use bootui::{Color, Image, PixelFormat as BootPixelFormat, Point, Rect, SpinnerStyle, Surface};
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
 use uefi::table::boot::BootServices;
+
+include!(concat!(env!("OUT_DIR"), "/boot_logo.rs"));
 
 static ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static WIDTH: AtomicUsize = AtomicUsize::new(0);
 static HEIGHT: AtomicUsize = AtomicUsize::new(0);
 static STRIDE: AtomicUsize = AtomicUsize::new(0);
 static ORDER: AtomicU8 = AtomicU8::new(0);
+static DISPLAY_MODE: AtomicU8 = AtomicU8::new(0);
+static LOADING_PHASE: AtomicU8 = AtomicU8::new(0);
+static RENDERING: AtomicBool = AtomicBool::new(false);
 
 #[path = "console_font.rs"]
 mod console_font;
@@ -65,11 +71,131 @@ pub fn initialize(boot_services: &BootServices) -> bool {
 /// Ends mBoot framebuffer output before the firmware display controller is
 /// transferred to mDriver. Serial logging remains available after handoff.
 pub fn handoff() {
+    DISPLAY_MODE.store(0, Ordering::Release);
     ADDRESS.store(0, Ordering::Release);
     WIDTH.store(0, Ordering::Relaxed);
     HEIGHT.store(0, Ordering::Relaxed);
     STRIDE.store(0, Ordering::Relaxed);
     ORDER.store(0, Ordering::Relaxed);
+}
+
+/// Replaces firmware text output with the mochiOS boot scene.
+pub fn show_loading() {
+    if !with_surface(|surface| {
+        surface.clear(Color::BLACK);
+        let Ok(logo) = Image::new(
+            BOOT_LOGO_RGBA,
+            BOOT_LOGO_WIDTH,
+            BOOT_LOGO_HEIGHT,
+            BOOT_LOGO_WIDTH as usize * 4,
+        ) else {
+            return;
+        };
+        let longest = (surface.width() / 3)
+            .min(surface.height() / 3)
+            .min(BOOT_LOGO_WIDTH.max(BOOT_LOGO_HEIGHT));
+        if longest == 0 {
+            return;
+        }
+        let logo_width = u64::from(BOOT_LOGO_WIDTH) * u64::from(longest)
+            / u64::from(BOOT_LOGO_WIDTH.max(BOOT_LOGO_HEIGHT));
+        let logo_height = u64::from(BOOT_LOGO_HEIGHT) * u64::from(longest)
+            / u64::from(BOOT_LOGO_WIDTH.max(BOOT_LOGO_HEIGHT));
+        let logo_width = u32::try_from(logo_width).unwrap_or(longest).max(1);
+        let logo_height = u32::try_from(logo_height).unwrap_or(longest).max(1);
+        let center_x = i64::from(surface.width()) / 2;
+        let center_y = i64::from(surface.height()) * 38 / 100;
+        let logo_x = center_x - i64::from(logo_width) / 2;
+        let logo_y = center_y - i64::from(logo_height) / 2;
+        surface.draw_image_scaled(
+            logo,
+            Rect::new(
+                saturating_i64_to_i32(logo_x),
+                saturating_i64_to_i32(logo_y),
+                logo_width,
+                logo_height,
+            ),
+        );
+        draw_spinner(surface, 0);
+    }) {
+        return;
+    }
+    LOADING_PHASE.store(0, Ordering::Relaxed);
+    DISPLAY_MODE.store(1, Ordering::Release);
+}
+
+/// Advances the spinner without clearing or redrawing the logo.
+pub fn loading_tick() {
+    if DISPLAY_MODE.load(Ordering::Acquire) != 1 {
+        return;
+    }
+    let phase = LOADING_PHASE.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let _ = with_surface(|surface| {
+        let center = spinner_center(surface);
+        surface.fill_rect(Rect::new(center.x - 20, center.y - 20, 40, 40), Color::BLACK);
+        draw_spinner(surface, phase);
+    });
+}
+
+fn draw_spinner(surface: &mut Surface<'_>, phase: u8) {
+    surface.draw_spinner(
+        spinner_center(surface),
+        phase,
+        SpinnerStyle::new(10, 2, Color::rgba(244, 246, 250, 230)),
+    );
+}
+
+fn spinner_center(surface: &Surface<'_>) -> Point {
+    Point::new(
+        u32_to_i32(surface.width() / 2),
+        u32_to_i32(surface.height() * 3 / 5),
+    )
+}
+
+fn with_surface(draw: impl FnOnce(&mut Surface<'_>)) -> bool {
+    if RENDERING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    let rendered = (|| {
+        let info = framebuffer_info()?;
+        let length = usize::try_from(info.size).ok()?;
+        let format = match info.format {
+            1 => BootPixelFormat::Rgb,
+            2 => BootPixelFormat::Bgr,
+            _ => return None,
+        };
+        // SAFETY: GOP provided this complete framebuffer range, `initialize`
+        // validated its extent, and `RENDERING` serializes mutable access.
+        let pixels = unsafe { core::slice::from_raw_parts_mut(info.address as *mut u8, length) };
+        let mut surface = Surface::new(
+            pixels,
+            info.width,
+            info.height,
+            info.stride,
+            format,
+        )
+        .ok()?;
+        draw(&mut surface);
+        Some(())
+    })()
+    .is_some();
+    RENDERING.store(false, Ordering::Release);
+    rendered
+}
+
+fn u32_to_i32(value: u32) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+fn saturating_i64_to_i32(value: i64) -> i32 {
+    i32::try_from(value).unwrap_or(if value.is_negative() {
+        i32::MIN
+    } else {
+        i32::MAX
+    })
 }
 
 pub fn framebuffer_info() -> Option<FramebufferInfo> {
@@ -373,6 +499,7 @@ fn draw_hex(value: u64, y: usize) {
 }
 
 fn show(background: u32, title: &[u8], status: &[u8]) {
+    DISPLAY_MODE.store(2, Ordering::Release);
     if ADDRESS.load(Ordering::Acquire) == 0 {
         return;
     }

@@ -83,11 +83,12 @@ const MAX_NETWORK_BUNDLE_SIZE: usize = 256 * 1024 * 1024;
 include!(concat!(env!("OUT_DIR"), "/launch_manifest_digest.rs"));
 
 macro_rules! log {
-    ($($arg:tt)*) => {
+    ($($arg:tt)*) => {{
+        crate::display::loading_tick();
         if cfg!(debug_assertions) {
             crate::serial::print(format_args!("[mBoot] {}\n", format_args!($($arg)*)))
         }
-    };
+    }};
 }
 
 #[derive(Clone, Copy)]
@@ -296,8 +297,10 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         return error.status();
     }
     let has_display = display::initialize(system_table.boot_services());
+    if has_display {
+        display::show_loading();
+    }
     log!("boot display available={}", has_display);
-    let _ = system_table.stdout().output_string(uefi::cstr16!("Checking platform...\r\n"));
 
     let rsdp_address = system_table
         .config_table()
@@ -372,7 +375,6 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         log!("IOMMU description unavailable; device assignment remains disabled");
     }
 
-    let _ = system_table.stdout().output_string(uefi::cstr16!("Loading manifest and domains...\r\n"));
     let boot_services = system_table.boot_services();
     let Some(boot_entropy) = collect_boot_entropy(boot_services) else {
         log!("no secure boot entropy source is available");
@@ -632,7 +634,6 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         Err(status) => return status,
     };
     let host_tables = alloc::boxed::Box::leak(alloc::boxed::Box::new(descriptor::HostTables::new()));
-    let _ = system_table.stdout().output_string(uefi::cstr16!("Domains verified. Exiting boot services...\r\n"));
     // SAFETY: All required firmware allocations are complete and no boot service
     // is used after this call.
     let (_runtime, firmware_map) =
