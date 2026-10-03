@@ -14,11 +14,15 @@ static ORDER: AtomicU8 = AtomicU8::new(0);
 static DISPLAY_MODE: AtomicU8 = AtomicU8::new(0);
 static LOADING_PHASE: AtomicU8 = AtomicU8::new(0);
 static RENDERING: AtomicBool = AtomicBool::new(false);
+static TEXT_COLOR: AtomicUsize = AtomicUsize::new(0x00F4_F6FA);
 
 #[path = "console_font.rs"]
 mod console_font;
 
-pub fn text_console_begin() { fill(0); }
+pub fn text_console_begin() {
+    TEXT_COLOR.store(0x00F4_F6FA, Ordering::Relaxed);
+    fill(0);
+}
 
 pub fn text_console_cell(column: usize, row: usize, byte: u8) {
     let scale = if WIDTH.load(Ordering::Relaxed) >= 1568 && HEIGHT.load(Ordering::Relaxed) >= 800 { 2 } else { 1 };
@@ -503,7 +507,46 @@ fn show(background: u32, title: &[u8], status: &[u8]) {
     if ADDRESS.load(Ordering::Acquire) == 0 {
         return;
     }
-    fill(background);
+    let card_drawn = with_surface(|surface| {
+        surface.clear(Color::BLACK);
+        let card_width = surface.width().saturating_sub(32).min(640);
+        let card_height = surface.height().saturating_sub(32).min(280);
+        let card_x = (surface.width().saturating_sub(card_width)) / 2;
+        let card_y = (surface.height().saturating_sub(card_height)) / 2;
+        surface.fill_rounded_rect(
+            Rect::new(
+                u32_to_i32(card_x),
+                u32_to_i32(card_y),
+                card_width,
+                card_height,
+            ),
+            18,
+            Color::rgb(246, 247, 249),
+        );
+
+        let icon_center = Point::new(
+            u32_to_i32(card_x.saturating_add(48)),
+            u32_to_i32(card_y.saturating_add(48)),
+        );
+        let icon = Color::rgb(
+            u8::try_from((background >> 16) & 0xff).unwrap_or(228),
+            u8::try_from((background >> 8) & 0xff).unwrap_or(59),
+            u8::try_from(background & 0xff).unwrap_or(50),
+        );
+        surface.fill_circle(icon_center, 19, icon);
+        surface.fill_rounded_rect(
+            Rect::new(icon_center.x - 2, icon_center.y - 11, 4, 15),
+            2,
+            Color::WHITE,
+        );
+        surface.fill_circle(Point::new(icon_center.x, icon_center.y + 10), 2, Color::WHITE);
+    });
+    if card_drawn {
+        TEXT_COLOR.store(0x0020_2124, Ordering::Relaxed);
+    } else {
+        TEXT_COLOR.store(0x00F4_F6FA, Ordering::Relaxed);
+        fill(background);
+    }
     draw_centered(title, line_y(0));
     draw_centered(status, line_y(1));
 }
@@ -532,6 +575,7 @@ fn draw_centered(text: &[u8], y: usize) {
 }
 
 fn draw_text(text: &[u8], mut x: usize, y: usize, scale: usize) {
+    let color = TEXT_COLOR.load(Ordering::Relaxed) as u32;
     for &character in text {
         let glyph = glyph(character);
         for (row, bits) in glyph.iter().copied().enumerate() {
@@ -544,7 +588,7 @@ fn draw_text(text: &[u8], mut x: usize, y: usize, scale: usize) {
                     y + row * scale,
                     scale,
                     scale,
-                    0x00F4_F6FA,
+                    color,
                 );
             }
         }
