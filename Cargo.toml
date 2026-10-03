@@ -21,11 +21,13 @@ uefi-app = ["dep:uefi"]
 uefi-net = ["uefi-app"]
 
 [dependencies]
+bootui = { path = "../libraries/bootui" }
 mnu-abi = { git = "https://github.com/mochiOS/mnu" }
 sha2 = { version = "0.10", default-features = false }
 uefi = { version = "0.30", default-features = false, features = ["alloc", "global_allocator"], optional = true }
 
 [build-dependencies]
+png = "0.17.16"
 sha2 = "0.10"
 
 [lints.rust]

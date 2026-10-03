@@ -12,9 +12,14 @@ MOCHIOS_ROOTFS ?=
 
 CARGO ?= $(shell command -v cargo 2>/dev/null)
 RUSTC ?= $(shell command -v rustc 2>/dev/null)
+BOOTUI_DIR ?= $(abspath $(CURDIR)/../libraries/bootui)
+MBOOT_UI_LOGO ?= $(abspath $(CURDIR)/../resources/system/icons/mochimochi-kun.png)
 MNU_ABI_PATCH = $(if $(wildcard $(MNU_DIR)/crates/abi/Cargo.toml),--config 'patch."https://github.com/mochiOS/mnu".mnu-abi.path="$(MNU_DIR)/crates/abi"')
+BOOTUI_INPUTS := $(shell find $(BOOTUI_DIR)/src -type f -print 2>/dev/null) \
+	$(wildcard $(BOOTUI_DIR)/Cargo.toml)
 MBOOT_INPUTS := $(shell find $(CURDIR)/src $(CURDIR)/scripts -type f -print 2>/dev/null) \
-	$(CURDIR)/Cargo.toml $(CURDIR)/Cargo.lock
+	$(CURDIR)/Cargo.toml $(CURDIR)/Cargo.lock $(CURDIR)/build.rs \
+	$(BOOTUI_INPUTS) $(MBOOT_UI_LOGO)
 MNU_INPUTS := $(shell find $(MNU_DIR)/src $(MNU_DIR)/crates/abi/src \
 	-type f -print 2>/dev/null) \
 	$(wildcard $(MNU_DIR)/Cargo.toml $(MNU_DIR)/crates/abi/Cargo.toml)
