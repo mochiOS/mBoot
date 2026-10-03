@@ -300,6 +300,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     if has_display {
         display::show_loading();
     }
+    let loading_animation = has_display
+        .then(|| display::start_loading_animation(system_table.boot_services()))
+        .flatten();
     log!("boot display available={}", has_display);
 
     let rsdp_address = system_table
@@ -634,6 +637,9 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
         Err(status) => return status,
     };
     let host_tables = alloc::boxed::Box::leak(alloc::boxed::Box::new(descriptor::HostTables::new()));
+    if let Some(event) = loading_animation {
+        display::stop_loading_animation(boot_services, event);
+    }
     // SAFETY: All required firmware allocations are complete and no boot service
     // is used after this call.
     let (_runtime, firmware_map) =

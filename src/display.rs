@@ -1,8 +1,11 @@
-use core::ptr::write_volatile;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use bootui::{Color, Image, PixelFormat as BootPixelFormat, Point, Rect, SpinnerStyle, Surface};
+use core::ffi::c_void;
+use core::ptr::write_volatile;
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
-use uefi::table::boot::BootServices;
+use uefi::table::boot::{BootServices, EventType, TimerTrigger, Tpl};
+use uefi::Event;
 
 include!(concat!(env!("OUT_DIR"), "/boot_logo.rs"));
 
@@ -139,6 +142,39 @@ pub fn loading_tick() {
         surface.fill_rect(Rect::new(center.x - 20, center.y - 20, 40, 40), Color::BLACK);
         draw_spinner(surface, phase);
     });
+}
+
+/// Starts a firmware timer that advances the loading animation every 80ms.
+pub fn start_loading_animation(boot_services: &BootServices) -> Option<Event> {
+    unsafe extern "efiapi" fn tick(_event: Event, _context: Option<NonNull<c_void>>) {
+        loading_tick();
+    }
+
+    // SAFETY: the callback touches only atomics and the firmware framebuffer.
+    // The returned event is stopped before ExitBootServices.
+    let event = unsafe {
+        boot_services.create_event(
+            EventType::TIMER | EventType::NOTIFY_SIGNAL,
+            Tpl::CALLBACK,
+            Some(tick),
+            None,
+        )
+    }
+    .ok()?;
+    if boot_services
+        .set_timer(&event, TimerTrigger::Periodic(800_000))
+        .is_err()
+    {
+        let _ = boot_services.close_event(event);
+        return None;
+    }
+    Some(event)
+}
+
+/// Stops the firmware-backed animation before boot services disappear.
+pub fn stop_loading_animation(boot_services: &BootServices, event: Event) {
+    let _ = boot_services.set_timer(&event, TimerTrigger::Cancel);
+    let _ = boot_services.close_event(event);
 }
 
 fn draw_spinner(surface: &mut Surface<'_>, phase: u8) {
