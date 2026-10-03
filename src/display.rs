@@ -144,8 +144,37 @@ pub fn loading_tick() {
     });
 }
 
+/// Owns the firmware event used to animate the loading scene.
+pub struct LoadingAnimation<'boot> {
+    boot_services: &'boot BootServices,
+    event: Option<Event>,
+}
+
+impl LoadingAnimation<'_> {
+    /// Stops the callback before boot services disappear.
+    pub fn stop(mut self) {
+        self.close();
+    }
+
+    fn close(&mut self) {
+        let Some(event) = self.event.take() else {
+            return;
+        };
+        let _ = self
+            .boot_services
+            .set_timer(&event, TimerTrigger::Cancel);
+        let _ = self.boot_services.close_event(event);
+    }
+}
+
+impl Drop for LoadingAnimation<'_> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Starts a firmware timer that advances the loading animation every 80ms.
-pub fn start_loading_animation(boot_services: &BootServices) -> Option<Event> {
+pub fn start_loading_animation(boot_services: &BootServices) -> Option<LoadingAnimation<'_>> {
     unsafe extern "efiapi" fn tick(_event: Event, _context: Option<NonNull<c_void>>) {
         loading_tick();
     }
@@ -168,13 +197,10 @@ pub fn start_loading_animation(boot_services: &BootServices) -> Option<Event> {
         let _ = boot_services.close_event(event);
         return None;
     }
-    Some(event)
-}
-
-/// Stops the firmware-backed animation before boot services disappear.
-pub fn stop_loading_animation(boot_services: &BootServices, event: Event) {
-    let _ = boot_services.set_timer(&event, TimerTrigger::Cancel);
-    let _ = boot_services.close_event(event);
+    Some(LoadingAnimation {
+        boot_services,
+        event: Some(event),
+    })
 }
 
 fn draw_spinner(surface: &mut Surface<'_>, phase: u8) {
