@@ -1,0 +1,299 @@
+From: mochiOS <dev@mochios.local>
+Subject: [PATCH] x86/mboot: pin bounded storage regions with exclusive lifetime
+
+--- a/arch/x86/kernel/cpu/mboot.c
++++ b/arch/x86/kernel/cpu/mboot.c
+@@ -124,7 +124,12 @@
+ #define MBOOT_CONTROL_STATUS_INTERNAL_ERROR 7
+ #define MBOOT_CONTROL_STATUS_IO_ERROR 8
+ #define MBOOT_CONTROL_STATUS_OUT_OF_RANGE 9
+-#define MBOOT_CONTROL_CAPABILITIES GENMASK_ULL(7, 0)
++#define MBOOT_CONTROL_OPEN_REGION 27
++#define MBOOT_CONTROL_REGION_READ 28
++#define MBOOT_CONTROL_REGION_WRITE 29
++#define MBOOT_CONTROL_REGION_FLUSH 30
++#define MBOOT_CONTROL_CLOSE_REGION 31
++#define MBOOT_CONTROL_CAPABILITIES GENMASK_ULL(8, 0)
+ #define MBOOT_STORAGE_QUERY_DISK 0
+ #define MBOOT_STORAGE_QUERY_PARTITION_GUIDS 1
+ #define MBOOT_STORAGE_QUERY_PARTITION_RANGE 2
+@@ -2441,7 +2446,12 @@
+ 	return *sector_count ? 0 : -EINVAL;
+ }
+ 
+-static struct file *mboot_block_open(const struct mboot_pci_device_info *info)
++static bool mboot_scope_conflicts(struct file *file);
++static bool mboot_scope_active(void);
++static void mboot_scope_close(void);
++
++static struct file *mboot_block_lookup(const struct mboot_pci_device_info *info,
++                                      u64 *selected_first, u64 *selected_count)
+ {
+ 	struct class_dev_iter iterator;
+ 	struct pci_dev *pdev;
+@@ -2474,7 +2484,8 @@
+ 					     NULL, NULL);
+ 		if (IS_ERR(file))
+ 			continue;
+-		if (mboot_block_apply_policy(file, info, &first_sector,
++		if (mboot_scope_conflicts(file) ||
++            mboot_block_apply_policy(file, info, &first_sector,
+ 					     &sector_count)) {
+ 			fput(file);
+ 			continue;
+@@ -2486,12 +2497,17 @@
+ 			break;
+ 		}
+ 		selected = file;
+-		mboot_block_first_sector = first_sector;
+-		mboot_block_sector_count = sector_count;
++		*selected_first = first_sector;
++		*selected_count = sector_count;
+ 	}
+ 	class_dev_iter_exit(&iterator);
+ 	pci_dev_put(pdev);
+ 	return selected ?: ERR_PTR(-ENODEV);
++}
++
++static struct file *mboot_block_open(const struct mboot_pci_device_info *info)
++{
++    return mboot_block_lookup(info, &mboot_block_first_sector, &mboot_block_sector_count);
+ }
+ 
+ static void mboot_block_close(void)
+@@ -2755,6 +2771,12 @@
+ 	if (total_lbas < 6)
+ 		return -EINVAL;
+ 	result = mboot_gpt_validate_pmbr(file, total_lbas, logical_block_size);
++    if (result && query == MBOOT_STORAGE_QUERY_DISK) {
++        values[0] = values[1] = 0;
++        values[2] = bdev_nr_sectors(bdev);
++        values[3] = logical_block_size;
++        return 0;
++    }
+ 	if (result)
+ 		return result;
+ 	result = mboot_gpt_read_copy(file, 1, total_lbas - 1, total_lbas,
+@@ -3110,9 +3132,10 @@
+ 	const struct mboot_pci_frontend *device;
+ 	struct file *file;
+ 	int result;
++    u64 first, count;
+ 
+ 	if (!request->device_id || request->device_id > mboot_pci_device_count ||
+-	    request->arguments[0] > MBOOT_STORAGE_QUERY_PARTITION_RANGE ||
++	    request->arguments[0] > 3 ||
+ 	    request->arguments[1] > U32_MAX || request->arguments[2] ||
+ 	    request->arguments[3])
+ 		return;
+@@ -3122,20 +3145,20 @@
+ 		response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
+ 		return;
+ 	}
+-	if (mboot_block_file || mboot_block_ring) {
+-		response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
+-		return;
+-	}
+-	file = mboot_block_open(&device->info);
++	file = mboot_block_lookup(&device->info, &first, &count);
+ 	if (IS_ERR(file)) {
+ 		response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
+ 		return;
+ 	}
+-	result = mboot_storage_inspect(file, request->arguments[0],
++	if (request->arguments[0] == 3) {
++        response->values[0] = file_bdev(file)->bd_disk->diskseq;
++        response->values[1] = bdev_nr_sectors(file_bdev(file));
++        response->values[2] = bdev_logical_block_size(file_bdev(file));
++        response->values[3] = bdev_read_only(file_bdev(file));
++        result = request->arguments[1] ? -EINVAL : 0;
++    } else result = mboot_storage_inspect(file, request->arguments[0],
+ 				       request->arguments[1], response->values);
+ 	fput(file);
+-	mboot_block_first_sector = 0;
+-	mboot_block_sector_count = 0;
+ 	if (!result)
+ 		response->status = MBOOT_CONTROL_STATUS_OK;
+ 	else if (result == -ENOENT)
+@@ -3361,7 +3384,7 @@
+ 		response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
+ 		return;
+ 	}
+-	if (mboot_block_file || mboot_block_ring) {
++	if (mboot_block_file || mboot_block_ring || mboot_scope_active()) {
+ 		response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
+ 		return;
+ 	}
+@@ -3426,6 +3449,7 @@
+ }
+ 
+ #include "mboot_input.h"
++#include "mboot_scoped_storage.h"
+ 
+ static void mboot_control_handle(const struct mboot_control_request *request,
+ 				 struct mboot_control_response *response)
+@@ -3466,6 +3490,13 @@
+ 		return;
+ 	}
+ 	switch (request->operation) {
++    case MBOOT_CONTROL_OPEN_REGION:
++    case MBOOT_CONTROL_REGION_READ:
++    case MBOOT_CONTROL_REGION_WRITE:
++    case MBOOT_CONTROL_REGION_FLUSH:
++    case MBOOT_CONTROL_CLOSE_REGION:
++        mboot_scope_control(request, response);
++        return;
+ 	case MBOOT_CONTROL_READ_POINTER:
+ 		mboot_control_read_pointer(request, response);
+ 		return;
+@@ -4020,6 +4051,7 @@
+ 		cond_resched();
+ 	}
+ 	mboot_block_queue_close();
++	mboot_scope_close();
+ 	mboot_block_close();
+ 	mboot_display_close();
+ 	pr_err("mDriver: device control worker stopped\n");
+--- /dev/null
++++ b/arch/x86/kernel/cpu/mboot_scoped_storage.h
+@@ -0,0 +1,140 @@
++static bool mboot_scope_active(void);
++/* Serialized by the single control worker. No process can name a Linux path. */
++static struct {
++    struct file *file;
++    void *buffer;
++    unsigned long grant;
++    u64 first, count, sequence;
++    u32 device, token, next_token;
++} mboot_scope;
++
++static bool mboot_scope_active(void) { return mboot_scope.file != NULL; }
++
++static bool mboot_scope_conflicts(struct file *file)
++{
++    return mboot_scope.file && file_bdev(file)->bd_disk ==
++           file_bdev(mboot_scope.file)->bd_disk;
++}
++
++static void mboot_scope_close(void)
++{
++    if (mboot_scope.buffer) memunmap(mboot_scope.buffer);
++    if (mboot_scope.grant)
++        mboot_hypercall(MBOOT_HYPERCALL_GRANT_UNMAP, mboot_scope.grant, 0, 0);
++    if (mboot_scope.file) fput(mboot_scope.file);
++    mboot_scope.buffer = NULL;
++    mboot_scope.grant = 0;
++    mboot_scope.file = NULL;
++    mboot_scope.token = 0;
++}
++
++static int mboot_scope_open(const struct mboot_control_request *request,
++                           u64 values[4])
++{
++    const struct mboot_pci_device_info *info;
++    struct file *selected, *exclusive;
++    struct block_device *bdev;
++    u64 first, count, end, address;
++    unsigned long grant = request->arguments[3];
++    int result = -EINVAL;
++
++    if (mboot_scope.file || !request->device_id ||
++        request->device_id > mboot_pci_device_count || !grant ||
++        !request->arguments[0] || !request->arguments[2] ||
++        mboot_scope.next_token == 0x7fffffff)
++        return -EINVAL;
++    info = &mboot_pci_devices[request->device_id - 1].info;
++    if (mboot_control_device_kind(info) != MBOOT_DEVICE_KIND_BLOCK ||
++        info->flags & (MBOOT_PCI_FLAG_READ_ONLY | MBOOT_PCI_FLAG_PARTITIONED))
++        return -EROFS;
++    selected = mboot_block_lookup(info, &first, &count);
++    if (IS_ERR(selected)) return PTR_ERR(selected);
++    bdev = file_bdev(selected);
++    if (first || bdev->bd_disk->diskseq != request->arguments[0] ||
++        (mboot_block_file && bdev->bd_disk == file_bdev(mboot_block_file)->bd_disk) ||
++        check_add_overflow(request->arguments[1], request->arguments[2], &end) ||
++        end > bdev_nr_sectors(bdev) || bdev_logical_block_size(bdev) != 512) {
++        result = -ESTALE;
++        goto out;
++    }
++    exclusive = bdev_file_open_by_dev(bdev->bd_dev,
++        BLK_OPEN_READ | BLK_OPEN_WRITE | BLK_OPEN_EXCL, &mboot_scope, NULL);
++    if (IS_ERR(exclusive)) { result = PTR_ERR(exclusive); goto out; }
++    if (file_bdev(exclusive) != bdev || !disk_live(bdev->bd_disk) ||
++        bdev_read_only(bdev) || bdev->bd_disk->diskseq != request->arguments[0]) {
++        fput(exclusive); result = -ESTALE; goto out;
++    }
++    address = mboot_grant_window_start + MBOOT_INSTALL_METADATA_PAGE * PAGE_SIZE;
++    if (mboot_hypercall(MBOOT_HYPERCALL_GRANT_MAP, grant, address, 0)) {
++        fput(exclusive); result = -EIO; goto out;
++    }
++    mboot_scope.grant = grant;
++    mboot_scope.buffer = memremap(address, PAGE_SIZE, MEMREMAP_WB);
++    mboot_scope.file = exclusive;
++    if (!mboot_scope.buffer) { mboot_scope_close(); result = -ENOMEM; goto out; }
++    mboot_scope.first = request->arguments[1];
++    mboot_scope.count = request->arguments[2];
++    mboot_scope.sequence = request->arguments[0];
++    mboot_scope.device = request->device_id;
++    mboot_scope.token = ++mboot_scope.next_token;
++    values[0] = mboot_scope.token;
++    values[1] = mboot_scope.count;
++    values[2] = 512;
++    values[3] = mboot_scope.sequence;
++    result = 0;
++out:
++    fput(selected);
++    return result;
++}
++
++static void mboot_scope_control(const struct mboot_control_request *request,
++                               struct mboot_control_response *response)
++{
++    struct block_device *bdev;
++    u64 lba, end, offset, length = request->arguments[2];
++    loff_t position;
++    ssize_t done;
++    int result = -EINVAL;
++
++    if (request->operation == MBOOT_CONTROL_OPEN_REGION) {
++        result = mboot_scope_open(request, response->values);
++        goto out;
++    }
++    if (!mboot_scope.file || request->device_id != mboot_scope.device ||
++        request->arguments[0] != mboot_scope.token || request->arguments[3])
++        goto out;
++    if (request->operation == MBOOT_CONTROL_CLOSE_REGION) {
++        if (request->arguments[1] || length) goto out;
++        /* Never treat a close as a successful flush. */
++        mboot_scope_close(); result = 0; goto out;
++    }
++    bdev = file_bdev(mboot_scope.file);
++    if (!disk_live(bdev->bd_disk) || bdev->bd_disk->diskseq != mboot_scope.sequence) {
++        result = -ENODEV; goto out;
++    }
++    if (request->operation == MBOOT_CONTROL_REGION_FLUSH) {
++        if (request->arguments[1] || length) goto out;
++        result = vfs_fsync(mboot_scope.file, 0);
++        if (!result) result = blkdev_issue_flush(bdev);
++        goto out;
++    }
++    if (!length || length > PAGE_SIZE || length % 512 ||
++        check_add_overflow(request->arguments[1], length / 512, &end) ||
++        end > mboot_scope.count ||
++        check_add_overflow(mboot_scope.first, request->arguments[1], &lba) ||
++        check_mul_overflow(lba, 512ULL, &offset) || offset > LLONG_MAX - length) {
++        result = -ERANGE; goto out;
++    }
++    position = offset;
++    if (request->operation == MBOOT_CONTROL_REGION_READ)
++        done = kernel_read(mboot_scope.file, mboot_scope.buffer, length, &position);
++    else
++        done = kernel_write(mboot_scope.file, mboot_scope.buffer, length, &position);
++    result = done == (ssize_t)length ? 0 : done < 0 ? done : -EIO;
++    if (!result) response->values[0] = length;
++out:
++    response->status = !result ? MBOOT_CONTROL_STATUS_OK :
++        result == -ERANGE ? MBOOT_CONTROL_STATUS_OUT_OF_RANGE :
++        result == -EINVAL || result == -ESTALE ? MBOOT_CONTROL_STATUS_INVALID_REQUEST :
++        MBOOT_CONTROL_STATUS_IO_ERROR;
++}
