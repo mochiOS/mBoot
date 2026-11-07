@@ -32,13 +32,12 @@ pub struct BootLog {
     failure_shown: bool,
     console_started: bool,
     console_finished: bool,
-    rendered: [u8; COLUMNS * LINES],
 }
 
 impl BootLog {
     pub const fn new() -> Self {
         Self { bytes: [0; (COLUMNS + 1) * LINES], len: 0, column: 0, lines: 1, failure_shown: false,
-            console_started: false, console_finished: false, rendered: [b' '; COLUMNS * LINES] }
+            console_started: false, console_finished: false }
     }
 
     fn newline(&mut self) {
@@ -78,22 +77,10 @@ impl BootLog {
     pub fn finish_console(&mut self) { self.console_finished = true; }
     pub fn console_finished(&self) -> bool { self.console_finished }
 
-    pub fn render_console(&mut self, begin: impl FnOnce(), mut cell: impl FnMut(usize, usize, u8)) {
-        if self.console_finished { return; }
-        if !self.console_started {
-            begin();
+    pub fn begin_console(&mut self) {
+        if !self.console_finished {
             self.console_started = true;
         }
-        let mut next = [b' '; COLUMNS * LINES];
-        let (mut row, mut col) = (0, 0);
-        for &byte in self.text() {
-            if byte == b'\n' { row += 1; col = 0; }
-            else if row < LINES && col < COLUMNS { next[row * COLUMNS + col] = byte; col += 1; }
-        }
-        for (i, &byte) in next.iter().enumerate() {
-            if self.rendered[i] != byte { cell(i % COLUMNS, i / COLUMNS, byte); }
-        }
-        self.rendered = next;
     }
 
     pub fn failure_shown(&self) -> bool { self.failure_shown }
@@ -147,29 +134,13 @@ mod tests {
     }
 
     #[test]
-    fn console_updates_only_changed_cells_and_preserves_case() {
-        let mut log = BootLog::new();
-        log.append(b"Linux\n");
-        let mut cells = [(0, 0, 0); 5];
-        let mut count = 0;
-        log.render_console(|| {}, |x, y, ch| { cells[count] = (x, y, ch); count += 1; });
-        assert_eq!(count, 5);
-        assert_eq!(cells[1], (1, 0, b'i'));
-        log.render_console(|| panic!("must not clear again"), |_, _, _| panic!("unchanged"));
-        log.append(b"ok");
-        count = 0;
-        log.render_console(|| panic!("must not clear again"), |x, y, ch| { cells[count] = (x, y, ch); count += 1; });
-        assert_eq!(count, 2);
-        assert_eq!(&cells[..count], &[(0, 1, b'o'), (1, 1, b'k')]);
-    }
-
-    #[test]
-    fn console_never_writes_after_linux_handoff() {
+    fn finished_console_stream_cannot_restart() {
         let mut log = BootLog::new();
         log.append(b"boot\n");
         log.finish_console();
-        log.render_console(|| panic!("handoff"), |_, _, _| panic!("handoff"));
+        log.begin_console();
         assert!(log.console_finished());
+        assert!(!log.console_started());
     }
 
     #[test]

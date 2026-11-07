@@ -19,25 +19,6 @@ static LOADING_PHASE: AtomicU8 = AtomicU8::new(0);
 static RENDERING: AtomicBool = AtomicBool::new(false);
 static TEXT_COLOR: AtomicUsize = AtomicUsize::new(0x00F4_F6FA);
 
-#[path = "console_font.rs"]
-mod console_font;
-
-pub fn text_console_begin() {
-    TEXT_COLOR.store(0x00F4_F6FA, Ordering::Relaxed);
-    fill(0);
-}
-
-pub fn text_console_cell(column: usize, row: usize, byte: u8) {
-    let scale = if WIDTH.load(Ordering::Relaxed) >= 1568 && HEIGHT.load(Ordering::Relaxed) >= 800 { 2 } else { 1 };
-    let glyph = console_font::GLYPHS[(byte.clamp(b' ', b'~') - b' ') as usize];
-    for (y, bits) in glyph.iter().enumerate() {
-        for x in 0..8 {
-            let color = if bits & (0x80 >> x) != 0 { 0x00cc_cccc } else { 0 };
-            rectangle(8 + (column * 8 + x) * scale, 8 + (row * 16 + y) * scale, scale, scale, color);
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FramebufferInfo {
     pub address: u64,
@@ -484,19 +465,6 @@ pub fn storage_candidates(
         write_hex_u8(&mut text[8..10], subclass);
         draw_centered(&text, line_y(2));
     }
-}
-
-pub fn console_page(message: &[u8]) -> bool {
-    if ADDRESS.load(Ordering::Acquire) == 0 || message.is_empty() || message.len() > 4096 {
-        return false;
-    }
-    // Boot services have ended: use the same fixed-size text style as printk,
-    // not the old centered, green diagnostic page.
-    let mut log = mboot::boot_log::BootLog::new();
-    log.append(message);
-    log.render_console(text_console_begin, text_console_cell);
-    core::sync::atomic::fence(Ordering::SeqCst);
-    true
 }
 
 fn draw_pci_identity((requester, vendor, device): (u16, u16, u16), y: usize) {

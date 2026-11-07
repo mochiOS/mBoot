@@ -59,7 +59,7 @@ initramfs = "mdriver"
 initramfs_path = '\EFI\MBOOT\MDRIVER.CPIO'
 # Release boot: no console output; no diagnostic probe stops.
 # No DHCP or log receiver ACK is required.
-command_line = "loglevel=0 console=ttyS0 rdinit=/init pci=off acpi=off maxcpus=0 ip=off mboot.text_console=1"
+command_line = "loglevel=0 console=ttyS0 rdinit=/init pci=off acpi=off maxcpus=0 ip=off"
 autostart = true
 required = true
 restart = "never"

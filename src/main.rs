@@ -195,7 +195,7 @@ fn prepare_entry(runtime: &mut RuntimeDomain) -> smp::Entry {
     } else {
         runtime.started = true;
         if runtime.domain.role() == DomainRole::Hardware {
-            let _ = display::console_page(b"MBOOT STARTING MDRIVER LINUX");
+            serial::print(format_args!("[mBoot] starting mDriver Linux\n"));
         }
         Some(runtime.guest)
     };
@@ -288,8 +288,6 @@ impl BootMemoryMap {
 
 #[entry]
 unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
-    // Leave evidence of EFI entry even when the machine has no working UART.
-    let _ = system_table.stdout().output_string(uefi::cstr16!("\r\nMBOOT EFI ENTERED\r\n"));
     serial::init();
     log!("starting independent hypervisor");
     if let Err(error) = uefi::helpers::init(&mut system_table) {
@@ -663,7 +661,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     }
     // SAFETY: Firmware I/O has ended, interrupts are disabled, and mBoot is the
     // sole PCI configuration-space owner from this point onward.
-    let _ = display::console_page(b"MBOOT BOOT SERVICES EXITED\nPCI ISOLATION");
+    serial::print(format_args!("[mBoot] boot services exited; PCI isolation\n"));
     let quarantine = unsafe { pci::quarantine_segment_zero() };
     log!(
         "PCI DMA quarantine: {} function(s), {} bus master(s) disabled, {} still active",
@@ -2616,10 +2614,9 @@ fn handle_console_write(
             crate::serial::print(format_args!("[Domain {}] {}", domain_id.get(),
                 core::str::from_utf8(text).unwrap_or("[non-UTF8 log]\n")));
             if !boot_log.console_finished() {
+                boot_log.begin_console();
                 boot_log.append(text);
                 if !streamed && !text.ends_with(b"\n") { boot_log.append(b"\n"); }
-                boot_log.render_console(crate::display::text_console_begin, crate::display::text_console_cell);
-                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             }
             return HYPERCALL_SUCCESS;
         }
@@ -2629,7 +2626,7 @@ fn handle_console_write(
     {
         boot_log.append(report);
         if boot_log.take_failure() {
-            let _ = crate::display::console_page(boot_log.text());
+            crate::display::failure(99);
         }
         crate::serial::print(format_args!("[Domain {}] {}", domain_id.get(),
             core::str::from_utf8(report).unwrap_or("[non-UTF8 log chunk]\n")));
@@ -2640,23 +2637,12 @@ fn handle_console_write(
     };
     crate::serial::print(format_args!("[Domain {}] {}", domain_id.get(), message));
     if allow_display {
-        if let Some(report) = bytes.strip_prefix(b"BOOT STATUS\n")
-            .filter(|_| allow_device_status && detail == 0)
-        {
-            if !boot_log.failure_shown() {
-                let _ = crate::display::console_page(report);
-            }
-        } else if let Some(report) = bytes
-            .strip_prefix(b"DISPLAY\n")
-            .filter(|_| !allow_device_status)
-        {
-            let _ = crate::display::console_page(report);
-        } else if allow_device_status && detail & (1_u64 << 63) != 0 {
+        if allow_device_status && detail & (1_u64 << 63) != 0 {
             let error = detail & !(1_u64 << 63);
             if (1..=u64::from(u16::MAX) + 1).contains(&error) {
                 if bytes.starts_with(b"PCI PROBE REPORT\n") {
                     boot_log.mark_failure_shown();
-                    let _ = crate::display::console_page(bytes);
+                    crate::display::mdriver_claim_failure((error - 1) as u16, b"PCI probe failed");
                 } else if bytes.starts_with(b"GPU PROBE REPORT ") || bytes.starts_with(b"GPU MMIO CHECK\n") {
                     boot_log.mark_failure_shown();
                     use core::fmt::Write;
@@ -2732,7 +2718,7 @@ fn handle_console_write(
                         let _ = report.write_str(opregion_report.text());
                     }
                     crate::serial::print(format_args!("{}", &report.text()[message.len()..]));
-                    let _ = crate::display::console_page(report.text().as_bytes());
+                    crate::display::mdriver_claim_failure((error - 1) as u16, b"GPU probe failed");
                 } else if !boot_log.failure_shown() {
                     crate::display::mdriver_claim_failure((error - 1) as u16, bytes);
                 }
