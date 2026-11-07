@@ -1154,6 +1154,7 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
     let mut completed = None;
     let slice_ticks = timer::tsc_frequency_hz().unwrap_or(0) / 1_000;
     loop {
+        display::loading_tick();
         let pending_devices = pci::take_pending_device_interrupts();
         for (domain_id, vector) in pci_assignments.route_pending(pending_devices) {
             let Some(target) = runtime_domains

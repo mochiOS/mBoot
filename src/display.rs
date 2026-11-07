@@ -1,8 +1,8 @@
-use bootui::{Color, Image, PixelFormat as BootPixelFormat, Point, Rect, SpinnerStyle, Surface};
+use bootui::{Color, Image, LoadingScreen, PixelFormat as BootPixelFormat, Point, Rect, Surface};
 use core::ffi::c_void;
 use core::ptr::write_volatile;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
 use uefi::table::boot::{BootServices, EventType, TimerTrigger, Tpl};
 use uefi::Event;
@@ -16,6 +16,8 @@ static STRIDE: AtomicUsize = AtomicUsize::new(0);
 static ORDER: AtomicU8 = AtomicU8::new(0);
 static DISPLAY_MODE: AtomicU8 = AtomicU8::new(0);
 static LOADING_PHASE: AtomicU8 = AtomicU8::new(0);
+static START_TICKS: AtomicU64 = AtomicU64::new(0);
+static TICKS_PER_MILLISECOND: AtomicU64 = AtomicU64::new(0);
 static RENDERING: AtomicBool = AtomicBool::new(false);
 static TEXT_COLOR: AtomicUsize = AtomicUsize::new(0x00F4_F6FA);
 
@@ -70,41 +72,14 @@ pub fn handoff() {
 /// Replaces firmware text output with the mochiOS boot scene.
 pub fn show_loading() {
     if !with_surface(|surface| {
-        surface.clear(Color::BLACK);
-        let Ok(logo) = Image::new(
+        if let Ok(logo) = Image::new(
             BOOT_LOGO_RGBA,
             BOOT_LOGO_WIDTH,
             BOOT_LOGO_HEIGHT,
             BOOT_LOGO_WIDTH as usize * 4,
-        ) else {
-            return;
-        };
-        let longest = (surface.width() / 3)
-            .min(surface.height() / 3)
-            .min(BOOT_LOGO_WIDTH.max(BOOT_LOGO_HEIGHT));
-        if longest == 0 {
-            return;
+        ) {
+            LoadingScreen::new(logo).paint(surface, 0);
         }
-        let logo_width = u64::from(BOOT_LOGO_WIDTH) * u64::from(longest)
-            / u64::from(BOOT_LOGO_WIDTH.max(BOOT_LOGO_HEIGHT));
-        let logo_height = u64::from(BOOT_LOGO_HEIGHT) * u64::from(longest)
-            / u64::from(BOOT_LOGO_WIDTH.max(BOOT_LOGO_HEIGHT));
-        let logo_width = u32::try_from(logo_width).unwrap_or(longest).max(1);
-        let logo_height = u32::try_from(logo_height).unwrap_or(longest).max(1);
-        let center_x = i64::from(surface.width()) / 2;
-        let center_y = i64::from(surface.height()) * 38 / 100;
-        let logo_x = center_x - i64::from(logo_width) / 2;
-        let logo_y = center_y - i64::from(logo_height) / 2;
-        surface.draw_image_scaled(
-            logo,
-            Rect::new(
-                saturating_i64_to_i32(logo_x),
-                saturating_i64_to_i32(logo_y),
-                logo_width,
-                logo_height,
-            ),
-        );
-        draw_spinner(surface, 0);
     }) {
         return;
     }
@@ -112,17 +87,31 @@ pub fn show_loading() {
     DISPLAY_MODE.store(1, Ordering::Release);
 }
 
-/// Advances the spinner without clearing or redrawing the logo.
+/// Refreshes at a fixed rate both before and after ExitBootServices.
 pub fn loading_tick() {
     if DISPLAY_MODE.load(Ordering::Acquire) != 1 {
         return;
     }
-    let phase = LOADING_PHASE.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     let _ = with_surface(|surface| {
-        let center = spinner_center(surface);
-        surface.fill_rect(Rect::new(center.x - 20, center.y - 20, 40, 40), Color::BLACK);
-        draw_spinner(surface, phase);
+        let frequency = TICKS_PER_MILLISECOND.load(Ordering::Acquire);
+        if frequency == 0 {
+            return;
+        }
+        let elapsed = read_ticks().saturating_sub(START_TICKS.load(Ordering::Relaxed)) / frequency;
+        let phase = LoadingScreen::phase_at(elapsed);
+        if phase != LOADING_PHASE.load(Ordering::Relaxed) {
+            LoadingScreen::paint_spinner(surface, elapsed);
+            LOADING_PHASE.store(phase, Ordering::Relaxed);
+        }
     });
+}
+
+fn read_ticks() -> u64 {
+    // SAFETY: firmware loading and the host event loop run on the BSP.
+    unsafe {
+        core::arch::x86_64::_mm_lfence();
+        core::arch::x86_64::_rdtsc()
+    }
 }
 
 /// Owns the firmware event used to animate the loading scene.
@@ -154,8 +143,16 @@ impl Drop for LoadingAnimation<'_> {
     }
 }
 
-/// Starts a firmware timer that advances the loading animation every 80ms.
+/// Starts a firmware timer that refreshes the loading animation at 30 Hz.
 pub fn start_loading_animation(boot_services: &BootServices) -> Option<LoadingAnimation<'_>> {
+    let start = read_ticks();
+    boot_services.stall(10_000);
+    let end = read_ticks();
+    START_TICKS.store(end, Ordering::Relaxed);
+    TICKS_PER_MILLISECOND.store(
+        end.saturating_sub(start).max(10) / 10,
+        Ordering::Release,
+    );
     unsafe extern "efiapi" fn tick(_event: Event, _context: Option<NonNull<c_void>>) {
         loading_tick();
     }
@@ -165,14 +162,14 @@ pub fn start_loading_animation(boot_services: &BootServices) -> Option<LoadingAn
     let event = unsafe {
         boot_services.create_event(
             EventType::TIMER | EventType::NOTIFY_SIGNAL,
-            Tpl::CALLBACK,
+            Tpl::NOTIFY,
             Some(tick),
             None,
         )
     }
     .ok()?;
     if boot_services
-        .set_timer(&event, TimerTrigger::Periodic(800_000))
+        .set_timer(&event, TimerTrigger::Periodic(333_333))
         .is_err()
     {
         let _ = boot_services.close_event(event);
@@ -182,21 +179,6 @@ pub fn start_loading_animation(boot_services: &BootServices) -> Option<LoadingAn
         boot_services,
         event: Some(event),
     })
-}
-
-fn draw_spinner(surface: &mut Surface<'_>, phase: u8) {
-    surface.draw_spinner(
-        spinner_center(surface),
-        phase,
-        SpinnerStyle::new(10, 2, Color::rgba(244, 246, 250, 230)),
-    );
-}
-
-fn spinner_center(surface: &Surface<'_>) -> Point {
-    Point::new(
-        u32_to_i32(surface.width() / 2),
-        u32_to_i32(surface.height() * 3 / 5),
-    )
 }
 
 fn with_surface(draw: impl FnOnce(&mut Surface<'_>)) -> bool {
@@ -235,14 +217,6 @@ fn with_surface(draw: impl FnOnce(&mut Surface<'_>)) -> bool {
 
 fn u32_to_i32(value: u32) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
-}
-
-fn saturating_i64_to_i32(value: i64) -> i32 {
-    i32::try_from(value).unwrap_or(if value.is_negative() {
-        i32::MIN
-    } else {
-        i32::MAX
-    })
 }
 
 pub fn framebuffer_info() -> Option<FramebufferInfo> {
@@ -297,6 +271,7 @@ pub fn present_firmware_frame(
     {
         return false;
     }
+    DISPLAY_MODE.store(0, Ordering::Release);
     let framebuffer = info.address as *mut u8;
     let destination_row = info.stride as usize * 4;
     for row in 0..height as usize {
