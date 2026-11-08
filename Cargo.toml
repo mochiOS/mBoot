@@ -21,7 +21,7 @@ uefi-app = ["dep:uefi"]
 uefi-net = ["uefi-app"]
 
 [dependencies]
-bootui = { path = "../libraries/bootui" }
+bootui = { git = "https://github.com/mochiOS/BootUI", rev = "4b0fca76023d9484d33a179946dc0fc5b770dd29" }
 mnu-abi = { git = "https://github.com/mochiOS/mnu" }
 sha2 = { version = "0.10", default-features = false }
 uefi = { version = "0.30", default-features = false, features = ["alloc", "global_allocator"], optional = true }
