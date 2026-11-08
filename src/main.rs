@@ -1390,6 +1390,14 @@ unsafe fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Sta
             continue;
         }
         runtime.resume_kind = ResumeKind::Hypercall;
+        // Hypercalls carry Domain authority and are reserved for its kernel.
+        // Reject user instructions without stopping the Domain or dispatching
+        // any operation. Resume advances only the rejected instruction.
+        // SAFETY: The vCPU just exited and remains stopped on this CPU.
+        if unsafe { runtime.virtualization.guest_privilege_level() } != Ok(0) {
+            runtime.pending_result = HYPERCALL_UNSUPPORTED;
+            continue;
+        }
         if vm_exit.hypercall_number == HypercallNumber::DeviceQuery as u64 {
             let domain_id = runtime_domains[index].domain.id().get();
             let authorized = runtime_domains[index].domain.role() == DomainRole::Hardware

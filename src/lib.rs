@@ -347,6 +347,19 @@ impl Virtualization {
         }
     }
 
+    /// Reads the actual guest privilege level from hardware-saved state.
+    ///
+    /// # Safety
+    /// The vCPU must have entered and be stopped on its owning CPU.
+    pub unsafe fn guest_privilege_level(&self) -> Result<u8, Error> {
+        match self {
+            // SAFETY: Forward the stopped-vCPU contract unchanged.
+            Virtualization::Intel(vmx) => unsafe { vmx.guest_privilege_level() },
+            // SAFETY: Forward the stopped-vCPU contract unchanged.
+            Virtualization::Amd(svm) => unsafe { svm.guest_privilege_level() },
+        }
+    }
+
     /// Reads the instruction pointer from a stopped vCPU for crash reporting.
     ///
     /// # Safety

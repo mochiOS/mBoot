@@ -37,6 +37,7 @@ const VMCB_GDTR: usize = 0x460;
 const VMCB_LDTR: usize = 0x470;
 const VMCB_IDTR: usize = 0x480;
 const VMCB_TR: usize = 0x490;
+const VMCB_CPL: usize = 0x4cb;
 const VMCB_EFER: usize = 0x4d0;
 const VMCB_CR4: usize = 0x548;
 const VMCB_CR3: usize = 0x550;
@@ -449,6 +450,18 @@ impl Svm {
         }
         unsafe { write_u8(self.vmcb_phys, VMCB_TLB_CONTROL, TLB_CONTROL_FLUSH_ALL) };
         Ok(())
+    }
+
+    /// Reads the hardware-saved privilege level, not a guest claim.
+    ///
+    /// # Safety
+    /// The vCPU must have entered and be stopped on its owning CPU.
+    pub unsafe fn guest_privilege_level(&self) -> Result<u8, Error> {
+        if !self.active || !self.started {
+            return Err(Error::InvalidState);
+        }
+        // SAFETY: CPL is a byte in the exclusively owned, stopped VMCB state area.
+        Ok(unsafe { core::ptr::read_volatile((self.vmcb_phys + VMCB_CPL as u64) as *const u8) })
     }
 
     /// Reads the instruction pointer from a stopped guest.

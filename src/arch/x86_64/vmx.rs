@@ -701,6 +701,33 @@ impl Vmx {
         }
     }
 
+    /// Reads the hardware-saved privilege level, including virtual-8086 mode.
+    ///
+    /// # Safety
+    /// The vCPU must have entered and be stopped on its owning CPU.
+    pub unsafe fn guest_privilege_level(&self) -> Result<u8, Error> {
+        if !self.active {
+            return Err(Error::InvalidState);
+        }
+        // SAFETY: The caller owns this stopped VMCS on the current CPU.
+        unsafe { vmptrld(self.vmcs_phys).map_err(|()| Error::VmcsLoadFailed)? };
+        // SAFETY: These are hardware-saved guest state fields of the loaded VMCS.
+        let (flags, cr0, cs) = unsafe {
+            (
+                vmread(GUEST_RFLAGS),
+                vmread(GUEST_CR0),
+                vmread(GUEST_CS_SELECTOR),
+            )
+        };
+        Ok(if flags & (1 << 17) != 0 {
+            3
+        } else if cr0 & 1 == 0 {
+            0
+        } else {
+            (cs & 3) as u8
+        })
+    }
+
     /// Reads the instruction pointer from a stopped guest.
     ///
     /// # Safety

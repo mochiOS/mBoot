@@ -349,6 +349,10 @@ impl PinnedVirtualization {
         write_guest_msr(msr: u32, value: u64) -> ();
     }
 
+    pub unsafe fn guest_privilege_level(&self) -> Result<u8, mboot::Error> {
+        // SAFETY: Dispatch the stopped-vCPU read to its owning CPU.
+        unsafe { self.with_ref(|backend| backend.guest_privilege_level()) }
+    }
     pub unsafe fn guest_instruction_pointer(&self) -> Result<u64, mboot::Error> {
         // SAFETY: Caller supplies a stopped vCPU.
         unsafe { self.with_ref(|backend| backend.guest_instruction_pointer()) }
