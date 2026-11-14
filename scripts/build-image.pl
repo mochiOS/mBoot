@@ -123,6 +123,10 @@ my %initramfs_images = (
     'mdriver' => $ENV{MBOOT_MDRIVER_INITRAMFS},
     'mochios' => $ENV{MBOOT_MOCHIOS_INITFS},
 );
+my $prebuilt_system = $ENV{MBOOT_MOCHIOS_SYSTEM_ELF};
+if (defined $prebuilt_system && length $prebuilt_system) {
+    $domain_images{'mochios-system'}->{path} = absolute_existing($prebuilt_system);
+}
 my $mochios_rootfs = $ENV{MBOOT_MOCHIOS_ROOTFS};
 if (exists $config->{payload_guid}) {
     defined $mochios_rootfs && length $mochios_rootfs
@@ -171,7 +175,7 @@ if (@native_images) {
         '--config', qq{patch."https://github.com/mochiOS/mnu".mnu-abi.path="$mnu_abi"},
     );
 }
-if ($required_images{'mochios-system'}) {
+if ($required_images{'mochios-system'} && !(defined $prebuilt_system && length $prebuilt_system)) {
     run_env(
         { RUSTFLAGS => '-C relocation-model=static -C link-arg=-no-pie --cfg curve25519_dalek_backend="serial"' },
         $cargo, $toolchain, 'build', '-Z', 'build-std=core,alloc', '--release',

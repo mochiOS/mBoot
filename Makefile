@@ -9,6 +9,7 @@ MDRIVER_KERNEL ?=
 MDRIVER_INITRAMFS ?=
 MOCHIOS_INITFS ?=
 MOCHIOS_ROOTFS ?=
+MOCHIOS_SYSTEM_ELF ?=
 
 CARGO ?= $(shell command -v cargo 2>/dev/null)
 RUSTC ?= $(shell command -v rustc 2>/dev/null)
@@ -27,7 +28,7 @@ MOCHIOS_SYSTEM_INPUTS := $(shell find $(MOCHIOS_SYSTEM_DIR)/src $(MOCHIOS_SYSTEM
 	-type f -print 2>/dev/null) \
 	$(wildcard $(MOCHIOS_SYSTEM_DIR)/Cargo.toml $(MOCHIOS_SYSTEM_DIR)/Cargo.lock)
 IMAGE_INPUTS := $(MBOOT_INPUTS) $(MNU_INPUTS) $(MOCHIOS_SYSTEM_INPUTS) $(CONFIG) \
-	$(wildcard $(MDRIVER_KERNEL) $(MDRIVER_INITRAMFS) $(MOCHIOS_INITFS) $(MOCHIOS_ROOTFS))
+	$(wildcard $(MDRIVER_KERNEL) $(MDRIVER_INITRAMFS) $(MOCHIOS_INITFS) $(MOCHIOS_ROOTFS) $(MOCHIOS_SYSTEM_ELF))
 
 .PHONY: all build clean device-io-test mdriver-test help image image-test qemu-test setup test
 .PHONY: hv-build hv-device-io-test hv-mdriver-test hv-image hv-image-test hv-qemu-test hv-test
@@ -64,6 +65,7 @@ $(IMAGE): $(SETUP_STAMP) $(IMAGE_INPUTS)
 	MBOOT_MDRIVER_INITRAMFS="$(MDRIVER_INITRAMFS)" \
 	MBOOT_MOCHIOS_INITFS="$(MOCHIOS_INITFS)" \
 	MBOOT_MOCHIOS_ROOTFS="$(MOCHIOS_ROOTFS)" \
+	MBOOT_MOCHIOS_SYSTEM_ELF="$(MOCHIOS_SYSTEM_ELF)" \
 		scripts/build-image.pl \
 		--config "$(CONFIG)" \
 		--mnu-dir "$(MNU_DIR)" \
