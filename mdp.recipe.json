@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "steps": [
+    "make -C $(PROJECT)/mdriver build",
+    "make -C $(PROJECT) image CONFIG=$(PROJECT)/config/intel-hardware.toml MNU_DIR=$(ROOT)/core MOCHIOS_SYSTEM_DIR=$(ROOT)/boot IMAGE=$(PROJECT)/out/mdp/hardware/mochiOS.img PXE_DIR=$(PROJECT)/out/mdp/pxe UEFI_NET_DIR=$(PROJECT)/out/mdp/uefi-net MDRIVER_KERNEL=$(PROJECT)/mdriver/output/artifacts/vmlinux MDRIVER_INITRAMFS=$(PROJECT)/mdriver/output/artifacts/initramfs.cpio MOCHIOS_INITFS=$(OUT)/artifacts/initfs.img MOCHIOS_ROOTFS=$(OUT)/mmake/image/rootfs.img"
+  ],
+  "package": {
+    "name": "mboot",
+    "version": "0.1.0",
+    "target": "x86_64-mochios",
+    "abi": "mochios-1"
+  },
+  "artifact": "out/mdp/mboot.tar.mdp",
+  "exports": [
+    {
+      "source": "$(PROJECT)/out/mdp/hardware/mochiOS.img",
+      "area": "hardware-media",
+      "destination": "mochiOS.img"
+    }
+  ]
+}

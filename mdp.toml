@@ -1,0 +1,8 @@
+format = 1
+
+[build]
+inputs = ["out/artifacts/initfs.img", "out/mmake/image/rootfs.img"]
+command = ["mdp", "pipeline", "--recipe", "mdp.recipe.json"]
+requires = ["boot", "kernel"]
+sources = ["kernel"]
+artifact = "out/mdp/mboot.tar.mdp"
