@@ -47,8 +47,8 @@ def main():
         f'UEFI_NET_DIR={project}/out/mdp/uefi-net',
         f'MDRIVER_KERNEL={project}/mdriver/output/artifacts/vmlinux',
         f'MDRIVER_INITRAMFS={project}/mdriver/output/artifacts/initramfs.cpio',
-        f'MOCHIOS_INITFS={root}/out/artifacts/initfs.img',
-        f'MOCHIOS_ROOTFS={root}/out/mmake/image/rootfs.img'],check=True)
+        f'MOCHIOS_INITFS={root}/out/images/system/initfs.img',
+        f'MOCHIOS_ROOTFS={root}/out/build/os/image/rootfs.img'],check=True)
 
 
 if __name__=='__main__':main()

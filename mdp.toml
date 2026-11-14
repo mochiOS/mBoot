@@ -1,7 +1,7 @@
 format = 1
 
 [build]
-inputs = ["out/artifacts/initfs.img", "out/mmake/image/rootfs.img", "resources/system/icons/mochimochi-kun.png"]
+inputs = ["out/images/system/initfs.img", "out/build/os/image/rootfs.img", "resources/system/icons/mochimochi-kun.png"]
 command = ["mdp", "pipeline", "--recipe", "mdp.recipe.json"]
 requires = ["boot-hardware"]
 sources = ["kernel", "bootui-source"]
