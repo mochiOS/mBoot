@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod cpu;
 pub mod descriptor;
 mod instructions;
