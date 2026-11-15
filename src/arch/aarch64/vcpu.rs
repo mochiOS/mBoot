@@ -31,8 +31,11 @@ const GUEST_HCR: u64 = (1 << 35)
     | (1 << 3)
     | (1 << 2)
     | 1;
-// Non-VHE RES1, trap SVE/trace/AMU; TSM=0 traps SME. Base FP is switched eagerly.
-const GUEST_CPTR: u64 = (1 << 30) | (1 << 20) | (1 << 13) | (1 << 9) | (1 << 8) | 0xff;
+// Non-VHE RES1, trap SVE/trace/AMU. This admitted baseline has no SME, so
+// bit 12 is RES1 (it becomes TSM=0 when SME state is supported in future).
+// Base FP is switched eagerly.
+const GUEST_CPTR: u64 =
+    (1 << 30) | (1 << 20) | (1 << 13) | (1 << 12) | (1 << 9) | (1 << 8) | 0xff;
 // All debug, OS debug and PMU register accesses trap. No debug/PMU ABI yet.
 const GUEST_MDCR: u64 =
     (1 << 12) | (1 << 11) | (1 << 10) | (1 << 9) | (1 << 8) | (1 << 6) | (1 << 5);

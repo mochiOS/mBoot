@@ -75,7 +75,14 @@ _start:
     msr vbar_el2, x0
     mov x0, #(1 << 31)
     msr hcr_el2, x0
-    msr cptr_el2, xzr
+    // Baseline RES1, SVE trapped, FP available. SME changes bit 12 from
+    // RES1 to TSM: clear it only when the actual CPU implements SME.
+    mov x0, #0x33ff
+    mrs x1, S3_0_C0_C4_1
+    ubfx x1, x1, #24, #4
+    cbz x1, 3f
+    bic x0, x0, #0x1000
+3:  msr cptr_el2, x0
     isb
     bl probe_main
     b .
