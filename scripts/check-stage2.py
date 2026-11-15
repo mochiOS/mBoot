@@ -31,6 +31,10 @@ def main():
     parser.add_argument("--qemu", default="qemu-system-aarch64")
     parser.add_argument("--cpu", choices=["cortex-a57", "max"], default="cortex-a57")
     parser.add_argument("--out", type=Path, default=MBOOT / "out/mdp/stage2")
+    parser.add_argument("--system-elf", type=Path,
+                        help="also enter a real native System Domain ELF through its Ready HVC")
+    parser.add_argument("--abi-rlib", type=Path,
+                        help="matching AArch64 mnu-abi rlib, required with --system-elf")
     args = parser.parse_args()
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -39,10 +43,18 @@ def main():
         if not qemu:
             raise RuntimeError(f"required executable not found: {args.qemu}")
         binary = out / "stage2.elf"
-        run(["rustc", f"+{args.toolchain}", "--edition", "2021", "--crate-type", "bin",
+        build = ["rustc", f"+{args.toolchain}", "--edition", "2021", "--crate-type", "bin",
              "--target", "aarch64-unknown-none", "-C", "panic=abort", "-C", "opt-level=2",
              "-C", f"link-arg=-T{MBOOT / 'scripts/stage2-probe.ld'}",
-             str(MBOOT / "scripts/stage2-probe.rs"), "-o", str(binary)], out / "build.log", 60)
+             str(MBOOT / "scripts/stage2-probe.rs"), "-o", str(binary)]
+        environment = dict(os.environ)
+        if args.system_elf:
+            if not args.abi_rlib:
+                raise RuntimeError("--system-elf requires --abi-rlib from the same toolchain")
+            build += ["--cfg", "system_domain_probe", "--extern",
+                      f"mnu_abi={args.abi_rlib.resolve()}"]
+            environment["MBOOT_SYSTEM_ELF"] = str(args.system_elf.resolve())
+        run(build, out / "build.log", 60, env=environment)
         run([str(Path(qemu).resolve()), "-machine", "virt-8.2,virtualization=on,gic-version=2",
              "-cpu", args.cpu, "-accel", "tcg", "-m", "128M", "-smp", "1",
              "-display", "none", "-monitor", "none", "-nic", "none", "-serial", "stdio",

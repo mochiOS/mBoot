@@ -6,9 +6,21 @@
 #[path = "../src/arch/aarch64/stage2.rs"]
 mod stage2;
 
+#[cfg(system_domain_probe)]
+#[path = "../src/error.rs"]
+mod native_error;
+#[cfg(system_domain_probe)]
+pub use native_error::Error;
+#[cfg(system_domain_probe)]
+#[path = "../src/image.rs"]
+mod image;
+#[cfg(system_domain_probe)]
+#[path = "system-domain-probe.rs"]
+mod system_domain_probe;
+
 use core::arch::{asm, global_asm};
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-use stage2::{Access, Config, Error, Mapper, MemoryType, PageTable, TableMemory, PAGE_SIZE};
+use stage2::{Access, Config, Error as Stage2Error, Mapper, MemoryType, PageTable, TableMemory, PAGE_SIZE};
 
 const CODE: u64 = 0x10000;
 const STACK: u64 = 0x20000;
@@ -84,24 +96,100 @@ guest_exit:
     ldp x25, x26, [sp, #48]
     ldp x27, x28, [sp, #64]
     ldp x29, x30, [sp, #80]
-    add sp, sp, #96
+    ldr x9, [sp, #608]
+    msr fpcr, x9
+    ldr x9, [sp, #616]
+    msr fpsr, x9
+    ldp q0, q1, [sp, #96]
+    ldp q2, q3, [sp, #128]
+    ldp q4, q5, [sp, #160]
+    ldp q6, q7, [sp, #192]
+    ldp q8, q9, [sp, #224]
+    ldp q10, q11, [sp, #256]
+    ldp q12, q13, [sp, #288]
+    ldp q14, q15, [sp, #320]
+    ldp q16, q17, [sp, #352]
+    ldp q18, q19, [sp, #384]
+    ldp q20, q21, [sp, #416]
+    ldp q22, q23, [sp, #448]
+    ldp q24, q25, [sp, #480]
+    ldp q26, q27, [sp, #512]
+    ldp q28, q29, [sp, #544]
+    ldp q30, q31, [sp, #576]
+    add sp, sp, #624
     ret
 
     .global enter_guest
 enter_guest:
-    stp x19, x20, [sp, #-96]!
+    sub sp, sp, #624
+    stp x19, x20, [sp]
     stp x21, x22, [sp, #16]
     stp x23, x24, [sp, #32]
     stp x25, x26, [sp, #48]
     stp x27, x28, [sp, #64]
     stp x29, x30, [sp, #80]
+    stp q0, q1, [sp, #96]
+    stp q2, q3, [sp, #128]
+    stp q4, q5, [sp, #160]
+    stp q6, q7, [sp, #192]
+    stp q8, q9, [sp, #224]
+    stp q10, q11, [sp, #256]
+    stp q12, q13, [sp, #288]
+    stp q14, q15, [sp, #320]
+    stp q16, q17, [sp, #352]
+    stp q18, q19, [sp, #384]
+    stp q20, q21, [sp, #416]
+    stp q22, q23, [sp, #448]
+    stp q24, q25, [sp, #480]
+    stp q26, q27, [sp, #512]
+    stp q28, q29, [sp, #544]
+    stp q30, q31, [sp, #576]
+    mrs x9, fpcr
+    str x9, [sp, #608]
+    mrs x9, fpsr
+    str x9, [sp, #616]
+    movi v0.16b, #0
+    movi v1.16b, #0
+    movi v2.16b, #0
+    movi v3.16b, #0
+    movi v4.16b, #0
+    movi v5.16b, #0
+    movi v6.16b, #0
+    movi v7.16b, #0
+    movi v8.16b, #0
+    movi v9.16b, #0
+    movi v10.16b, #0
+    movi v11.16b, #0
+    movi v12.16b, #0
+    movi v13.16b, #0
+    movi v14.16b, #0
+    movi v15.16b, #0
+    movi v16.16b, #0
+    movi v17.16b, #0
+    movi v18.16b, #0
+    movi v19.16b, #0
+    movi v20.16b, #0
+    movi v21.16b, #0
+    movi v22.16b, #0
+    movi v23.16b, #0
+    movi v24.16b, #0
+    movi v25.16b, #0
+    movi v26.16b, #0
+    movi v27.16b, #0
+    movi v28.16b, #0
+    movi v29.16b, #0
+    movi v30.16b, #0
+    movi v31.16b, #0
+    msr fpcr, xzr
+    msr fpsr, xzr
     msr elr_el2, x0
     msr sp_el1, x1
     mov x0, #0x3c5
     msr spsr_el2, x0
     ldr x0, =0x30d00800
     msr sctlr_el1, x0
-    // Guest is integer-only; no FP/SIMD, SVE or SME state can leak.
+    // Start with FP disabled and zeroed. A native bootstrap can enable
+    // its own base FP/SIMD without reading or corrupting EL2 host FP state.
     msr cpacr_el1, xzr
     msr ttbr0_el1, xzr
     msr ttbr1_el1, xzr
@@ -189,6 +277,8 @@ static mut LAST_EXIT: Exit = Exit {
 };
 
 struct Pool {
+    base: u64,
+    roots: [u64; 2],
     used: [bool; 32],
     budget: usize,
 }
@@ -200,18 +290,18 @@ impl Pool {
 // SAFETY: Private statically pinned page-aligned storage; live bits exclusively
 // track unique allocations. Roots and pool are disjoint and never guest-mapped.
 unsafe impl TableMemory for Pool {
-    fn allocate_table(&mut self) -> Result<u64, Error> {
+    fn allocate_table(&mut self) -> Result<u64, Stage2Error> {
         if self.budget == 0 {
-            return Err(Error::OutOfMemory);
+            return Err(Stage2Error::OutOfMemory);
         }
         let index = self
             .used
             .iter()
             .position(|&v| !v)
-            .ok_or(Error::OutOfMemory)?;
+            .ok_or(Stage2Error::OutOfMemory)?;
         self.budget -= 1;
         self.used[index] = true;
-        let ptr = addr_of_mut!(TABLES).cast::<PageTable>().wrapping_add(index);
+        let ptr = (self.base as *mut PageTable).wrapping_add(index);
         // SAFETY: This slot is exclusively owned and has no published parent.
         unsafe {
             ptr.write(PageTable::zeroed());
@@ -219,15 +309,14 @@ unsafe impl TableMemory for Pool {
         Ok(ptr as u64)
     }
     unsafe fn free_table(&mut self, frame: u64) {
-        let index = ((frame - addr_of!(TABLES) as u64) / PAGE_SIZE) as usize;
+        let index = ((frame - self.base) / PAGE_SIZE) as usize;
         check(index < 32 && self.used[index], "invalid table free");
         self.used[index] = false;
     }
     unsafe fn table_ptr(&self, frame: u64) -> *mut PageTable {
-        let in_root = [addr_of!(ROOT_A) as u64, addr_of!(ROOT_B) as u64]
-            .iter()
+        let in_root = self.roots.iter()
             .any(|&base| (base..base + 65536).contains(&frame));
-        let base = addr_of!(TABLES) as u64;
+        let base = self.base;
         let in_pool = (base..base + 32 * PAGE_SIZE).contains(&frame)
             && self.used[((frame - base) / PAGE_SIZE) as usize];
         check(
@@ -377,6 +466,8 @@ extern "C" fn probe_main() -> ! {
         asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack));
     }
     let mut pool = Pool {
+        base: addr_of!(TABLES) as u64,
+        roots: [addr_of!(ROOT_A) as u64, addr_of!(ROOT_B) as u64],
         used: [false; 32],
         budget: usize::MAX,
     };
@@ -387,7 +478,7 @@ extern "C" fn probe_main() -> ! {
     // SAFETY: Failed edits must leave inactive roots unchanged.
     check(
         unsafe { a.map_page(DATA, addr_of!(PAGE_A) as u64, READ_WRITE) }
-            == Err(Error::InactiveAddressSpace),
+            == Err(Stage2Error::InactiveAddressSpace),
         "inactive edit accepted",
     );
     select(&a);
@@ -461,7 +552,7 @@ extern "C" fn probe_main() -> ! {
     let mut a = unsafe { Mapper::new(&mut pool, root_a, config, 1).unwrap() };
     check(
         unsafe { a.map_page(1 << 30, addr_of!(PAGE_A) as u64, READ_ONLY) }
-            == Err(Error::OutOfMemory),
+            == Err(Stage2Error::OutOfMemory),
         "partial allocation accepted",
     );
     read(DATA, 0x1234);
@@ -476,12 +567,12 @@ extern "C" fn probe_main() -> ! {
     read(1 << 30, 0x1234);
     check(
         unsafe { a.map_page(1 << 40, addr_of!(PAGE_A) as u64, READ_ONLY) }
-            == Err(Error::InvalidAddress),
+            == Err(Stage2Error::InvalidAddress),
         "IPA overflow",
     );
     check(
         unsafe { a.map_page(DATA + PAGE_SIZE, 1 << config.physical_bits(), READ_ONLY) }
-            == Err(Error::InvalidAddress),
+            == Err(Stage2Error::InvalidAddress),
         "PA overflow",
     );
     let device_execute = Access {
@@ -490,7 +581,7 @@ extern "C" fn probe_main() -> ! {
     };
     check(
         unsafe { a.map_page(DATA + PAGE_SIZE, addr_of!(PAGE_A) as u64, device_execute) }
-            == Err(Error::InvalidPermissions),
+            == Err(Stage2Error::InvalidPermissions),
         "executable device",
     );
     drop(a);
@@ -532,6 +623,8 @@ extern "C" fn probe_main() -> ! {
         read(high, 0xb22);
     }
     emit("Stage-2 L0/L1/L2 starting levels PASS\n");
+    #[cfg(system_domain_probe)]
+    system_domain_probe::run(config);
     emit("STAGE2 PASS aarch64\n");
     finish(0)
 }
