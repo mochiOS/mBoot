@@ -7,6 +7,7 @@ use core::arch::{asm, global_asm};
 use core::marker::PhantomData;
 
 use super::stage2::{self, Mapper, TableMemory};
+use super::vgic;
 
 const WALK_DISABLED: u64 = (1 << 7) | (1 << 23);
 const RESET_SCTLR: u64 = 0x30d0_0800;
@@ -43,6 +44,7 @@ pub enum Error {
     WrongCpu,
     WrongAddressSpace,
     Stage2(stage2::Error),
+    Interrupts(vgic::Error),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +172,7 @@ pub struct Vcpu {
     mpidr: u64,
     timer_compare: u64,
     timer_control: u64,
+    interrupts: vgic::State,
     valid: bool,
     _local: PhantomData<*mut ()>,
 }
@@ -216,6 +219,7 @@ impl Vcpu {
             mpidr,
             timer_compare: u64::MAX,
             timer_control: 0,
+            interrupts: vgic::State::new(),
             valid: true,
             _local: PhantomData,
         })
@@ -231,6 +235,25 @@ impl Vcpu {
 
     pub fn pstate(&self) -> u64 {
         self.registers.pstate
+    }
+
+    pub fn configure_interrupts(&mut self, controller: &vgic::Controller) -> Result<(), Error> {
+        controller
+            .configure(&mut self.interrupts)
+            .map_err(Error::Interrupts)
+    }
+
+    /// Queue a software-originated, coalesced edge in the assigned virtual
+    /// controller. The caller must retain authoritative event payloads and
+    /// retry QueueFull; no event data is stored in this hardware queue.
+    pub fn inject_edge(&mut self, id: u16, priority: u8, source: Option<u8>) -> Result<(), Error> {
+        self.interrupts
+            .inject_edge(id, priority, source)
+            .map_err(Error::Interrupts)
+    }
+
+    pub fn interrupt_status(&self, id: u16) -> Option<vgic::InterruptStatus> {
+        self.interrupts.status(id)
     }
 
     /// Complete an architectural HVC #0 without changing unrelated registers.
@@ -301,6 +324,31 @@ impl Vcpu {
     /// On return, EL1 translation walks and its virtual timer are stopped,
     /// while the selected Stage-2 context remains unchanged.
     pub unsafe fn run<M: TableMemory>(&mut self, mapper: &Mapper<'_, M>) -> Result<Exit, Error> {
+        // SAFETY: Inherits this public method's exclusive execution contract.
+        unsafe { self.run_inner(mapper, None) }
+    }
+
+    /// Enter with the vCPU's own GICv2 state, saving active/pending priorities
+    /// before returning to the caller. A configured vCPU requires this path.
+    ///
+    /// # Safety
+    /// The same execution, ownership, speculation and DMA requirements as
+    /// run(), with this exclusively owned controller replacing its disabled
+    /// virtual-GIC requirement. Its GICV mapping belongs to this Domain only.
+    pub unsafe fn run_with_gic<M: TableMemory>(
+        &mut self,
+        mapper: &Mapper<'_, M>,
+        controller: &mut vgic::Controller,
+    ) -> Result<Exit, Error> {
+        // SAFETY: Public caller supplies the exclusive execution resources.
+        unsafe { self.run_inner(mapper, Some(controller)) }
+    }
+
+    unsafe fn run_inner<M: TableMemory>(
+        &mut self,
+        mapper: &Mapper<'_, M>,
+        mut controller: Option<&mut vgic::Controller>,
+    ) -> Result<Exit, Error> {
         require_host()?;
         if !self.valid {
             return Err(Error::InvalidState);
@@ -312,12 +360,20 @@ impl Vcpu {
             return Err(Error::WrongAddressSpace);
         }
         mapper.require_active().map_err(Error::Stage2)?;
+        if controller.is_none() && self.interrupts.configured() {
+            return Err(Error::InvalidState);
+        }
         let pstate = self.registers.pstate;
         if !matches!(pstate & 0x1f, 0 | 5) || self.registers.pc & 3 != 0 {
             self.valid = false;
             return Err(Error::InvalidState);
         }
         let host = HostRegisters::save();
+        if let Some(controller) = controller.as_deref_mut() {
+            controller
+                .load(&self.interrupts)
+                .map_err(Error::Interrupts)?;
+        }
         // SAFETY: Preconditions above plus the exclusive execution contract.
         unsafe {
             quiesce();
@@ -340,7 +396,12 @@ impl Vcpu {
                 out(reg) self.timer_compare, out(reg) self.timer_control,
                 options(nomem, nostack, preserves_flags));
             quiesce();
+            let saved_interrupts = match controller {
+                Some(controller) => controller.save(&mut self.interrupts),
+                None => Ok(()),
+            };
             host.restore();
+            saved_interrupts.map_err(Error::Interrupts)?;
         }
         if !matches!(self.registers.pstate & 0x1f, 0 | 5) {
             self.valid = false;
