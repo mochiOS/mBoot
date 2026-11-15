@@ -34,7 +34,11 @@ def main():
     parser.add_argument("--system-elf", type=Path,
                         help="also enter a real native System Domain ELF through its Ready HVC")
     parser.add_argument("--abi-rlib", type=Path,
-                        help="matching AArch64 mnu-abi rlib, required with --system-elf")
+                        help="matching AArch64 mnu-abi rlib for --system-elf without --production-library")
+    parser.add_argument("--production-library", action="store_true",
+                        help="link the complete native mBoot crate using Cargo (cached dependencies required)")
+    parser.add_argument("--target-dir", type=Path,
+                        help="reuse a Cargo target directory with --production-library")
     args = parser.parse_args()
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -49,12 +53,30 @@ def main():
              str(MBOOT / "scripts/stage2-probe.rs"), "-o", str(binary)]
         environment = dict(os.environ)
         if args.system_elf:
-            if not args.abi_rlib:
+            if not args.abi_rlib and not args.production_library:
                 raise RuntimeError("--system-elf requires --abi-rlib from the same toolchain")
-            build += ["--cfg", "system_domain_probe", "--extern",
-                      f"mnu_abi={args.abi_rlib.resolve()}"]
+            if not args.production_library:
+                build += ["--cfg", "system_domain_probe", "--extern",
+                          f"mnu_abi={args.abi_rlib.resolve()}"]
             environment["MBOOT_SYSTEM_ELF"] = str(args.system_elf.resolve())
-        run(build, out / "build.log", 60, env=environment)
+        if args.production_library:
+            target_dir = (args.target_dir or out / "cargo").resolve()
+            build = ["cargo", f"+{args.toolchain}", "rustc", "--offline",
+                     "-Z", "build-std=core,alloc,compiler_builtins", "--manifest-path",
+                     str(MBOOT / "Cargo.toml"), "--features", "arm-diagnostics",
+                     "--bin", "mboot-stage2-probe", "--target", "aarch64-unknown-none",
+                     "--target-dir", str(target_dir), "--",
+                     "-C", f"link-arg=-T{MBOOT / 'scripts/stage2-probe.ld'}"]
+            if args.system_elf:
+                build += ["--cfg", "system_domain_probe"]
+            environment.update(CARGO_INCREMENTAL="0", CARGO_PROFILE_DEV_DEBUG="0",
+                               CARGO_PROFILE_DEV_OPT_LEVEL="2")
+            environment.setdefault("CARGO_BUILD_JOBS", "2")
+            environment.setdefault("TMPDIR", str(out))
+            run(build, out / "build.log", 300, env=environment)
+            shutil.copy2(target_dir / "aarch64-unknown-none/debug/mboot-stage2-probe", binary)
+        else:
+            run(build, out / "build.log", 60, env=environment)
         run([str(Path(qemu).resolve()), "-machine", "virt-8.2,virtualization=on,gic-version=2",
              "-cpu", args.cpu, "-accel", "tcg", "-m", "128M", "-smp", "1",
              "-display", "none", "-monitor", "none", "-nic", "none", "-serial", "stdio",

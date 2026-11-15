@@ -15,10 +15,18 @@ test = false
 bench = false
 required-features = ["uefi-app"]
 
+[[bin]]
+name = "mboot-stage2-probe"
+path = "scripts/stage2-probe.rs"
+test = false
+bench = false
+required-features = ["arm-diagnostics"]
+
 [features]
 default = []
 uefi-app = ["dep:uefi"]
 uefi-net = ["uefi-app"]
+arm-diagnostics = []
 
 [dependencies]
 bootui = { git = "https://github.com/mochiOS/BootUI", rev = "4b0fca76023d9484d33a179946dc0fc5b770dd29" }
@@ -32,6 +40,7 @@ sha2 = "0.10"
 
 [lints.rust]
 unused = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_domain_probe)"] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

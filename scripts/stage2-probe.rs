@@ -1,27 +1,34 @@
-//! One-shot EL1 accesses through the production EL2 Stage-2 mapper.
+//! EL1 accesses and retained vCPU/IRQ state through production EL2 mechanisms.
 //! Fixed QEMU board setup is a fixture, not a replacement VMM or OS boot.
 #![no_std]
 #![no_main]
 
+#[cfg(not(feature = "arm-diagnostics"))]
 #[path = "../src/arch/aarch64/stage2.rs"]
 mod stage2;
+#[cfg(not(feature = "arm-diagnostics"))]
 #[path = "../src/arch/aarch64/vcpu.rs"]
 mod vcpu;
+#[cfg(not(feature = "arm-diagnostics"))]
 #[path = "../src/arch/aarch64/vgic.rs"]
 mod vgic;
+#[cfg(feature = "arm-diagnostics")]
+use mboot::arch::aarch64::{stage2, vcpu, vgic};
 #[path = "vcpu-probe.rs"]
 mod vcpu_probe;
 #[path = "vgic-probe.rs"]
 mod vgic_probe;
 
-#[cfg(system_domain_probe)]
+#[cfg(all(system_domain_probe, not(feature = "arm-diagnostics")))]
 #[path = "../src/error.rs"]
 mod native_error;
-#[cfg(system_domain_probe)]
+#[cfg(all(system_domain_probe, not(feature = "arm-diagnostics")))]
 pub use native_error::Error;
-#[cfg(system_domain_probe)]
+#[cfg(all(system_domain_probe, not(feature = "arm-diagnostics")))]
 #[path = "../src/image.rs"]
 mod image;
+#[cfg(all(system_domain_probe, feature = "arm-diagnostics"))]
+use mboot::image;
 #[cfg(system_domain_probe)]
 #[path = "system-domain-probe.rs"]
 mod system_domain_probe;
@@ -458,6 +465,8 @@ fn map_fixture_code(mapper: &mut Mapper<'_, Pool>) {
 #[unsafe(no_mangle)]
 extern "C" fn probe_main() -> ! {
     emit("STAGE2 EL2 started\n");
+    #[cfg(feature = "arm-diagnostics")]
+    emit("Linked production mBoot library\n");
     let native = Config::detect().expect("CPU features");
     // Exercise concatenation even when this CPU exposes a wider PA range.
     let features: u64;
