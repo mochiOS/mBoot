@@ -7,8 +7,12 @@
 mod stage2;
 #[path = "../src/arch/aarch64/vcpu.rs"]
 mod vcpu;
+#[path = "../src/arch/aarch64/vgic.rs"]
+mod vgic;
 #[path = "vcpu-probe.rs"]
 mod vcpu_probe;
+#[path = "vgic-probe.rs"]
+mod vgic_probe;
 
 #[cfg(system_domain_probe)]
 #[path = "../src/error.rs"]
@@ -434,13 +438,20 @@ fn abort(exit: Exit, ipa: u64, execute: bool, write: bool, permission: bool) {
 fn map_basics(mapper: &mut Mapper<'_, Pool>, data: u64) {
     // SAFETY: Only dedicated guest pages; hypervisor pages remain unmapped.
     unsafe {
-        mapper
-            .map_page(CODE, addr_of!(__guest_start) as u64, READ_EXECUTE)
-            .expect("code map");
+        map_fixture_code(mapper);
         mapper
             .map_page(STACK, addr_of!(GUEST_STACK) as u64, READ_WRITE)
             .expect("stack map");
         mapper.map_page(DATA, data, READ_WRITE).expect("data map");
+    }
+}
+
+fn map_fixture_code(mapper: &mut Mapper<'_, Pool>) {
+    let start = addr_of!(__guest_start) as u64;
+    for offset in (0..addr_of!(__guest_end) as u64 - start).step_by(4096) {
+        // SAFETY: Explicitly shared, immutable code-only fixture pages. The
+        // linker separates this region from all EL2 text, rodata and state.
+        unsafe { mapper.map_page(CODE + offset, start + offset, READ_EXECUTE).expect("fixture code"); }
     }
 }
 
@@ -459,8 +470,8 @@ extern "C" fn probe_main() -> ! {
         "Cortex-A57 concatenated root geometry",
     );
     check(
-        addr_of!(__guest_end) as u64 - addr_of!(__guest_start) as u64 == PAGE_SIZE,
-        "guest page",
+        (addr_of!(__guest_end) as u64 - addr_of!(__guest_start) as u64) < STACK - CODE,
+        "guest code overlaps stack",
     );
     // SAFETY: Fixture-private storage; executable data is initialized before
     // any guest entry and instruction-cache coherence is completed explicitly.
@@ -628,6 +639,7 @@ extern "C" fn probe_main() -> ! {
     }
     emit("Stage-2 L0/L1/L2 starting levels PASS\n");
     vcpu_probe::run(config);
+    vgic_probe::run(config);
     #[cfg(system_domain_probe)]
     system_domain_probe::run(config);
     emit("STAGE2 PASS aarch64\n");

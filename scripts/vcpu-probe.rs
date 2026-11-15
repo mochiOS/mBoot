@@ -140,9 +140,7 @@ pub fn run(config: Config) {
         // SAFETY: Read-only executable fixture code is explicitly shared;
         // stacks are private and no EL2 table/code/data beyond that page maps.
         unsafe {
-            mapper
-                .map_page(CODE, addr_of!(__guest_start) as u64, READ_EXECUTE)
-                .unwrap();
+            map_fixture_code(&mut mapper);
             mapper.map_page(STACK, stacks[i], READ_WRITE).unwrap();
         }
         guests[i] = Some(candidate.expect("baseline CPU admission"));
