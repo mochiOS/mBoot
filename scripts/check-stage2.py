@@ -29,7 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--toolchain", default="nightly-2026-05-14")
     parser.add_argument("--qemu", default="qemu-system-aarch64")
-    parser.add_argument("--cpu", choices=["cortex-a57", "max"], default="cortex-a57")
+    parser.add_argument("--cpu", choices=["cortex-a53", "cortex-a57", "max"], default="cortex-a57")
     parser.add_argument("--out", type=Path, default=MBOOT / "out/mdp/stage2")
     parser.add_argument("--system-elf", type=Path,
                         help="also enter a real native System Domain ELF through its Ready HVC")

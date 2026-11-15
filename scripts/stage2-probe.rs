@@ -649,6 +649,14 @@ extern "C" fn probe_main() -> ! {
     emit("Stage-2 VMID switching and reuse PASS\n");
     drop(b);
     for (bits, pages) in [(32, 4), (44, 1)] {
+        if bits > config.physical_bits() {
+            check(
+                Config::from_features(features, Some(bits)) == Err(Stage2Error::InvalidAddress),
+                "unsupported IPA geometry admitted",
+            );
+            emit("Stage-2 geometry beyond actual PA width rejected\n");
+            continue;
+        }
         let geometry = Config::from_features(features, Some(bits)).expect("root geometry");
         check(geometry.root_pages() == pages, "wrong root size");
         // SAFETY: All old guests are stopped. Retain all old child frames;
@@ -667,7 +675,7 @@ extern "C" fn probe_main() -> ! {
         }
         read(high, 0xb22);
     }
-    emit("Stage-2 L0/L1/L2 starting levels PASS\n");
+    emit("Stage-2 supported starting levels PASS\n");
     vcpu_probe::run(config);
     vgic_probe::run(config);
     #[cfg(system_domain_probe)]
