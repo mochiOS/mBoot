@@ -2,6 +2,9 @@
 //! Parsing grants no ownership of RAM, devices, interrupt IDs or firmware
 //! calls. Platform admission must interpret bindings and reserve resources.
 
+#[path = "fdt/arm64.rs"]
+pub mod arm64;
+
 const HEADER_SIZE: usize = 40;
 const MAX_DEPTH: usize = 64;
 
@@ -309,13 +312,13 @@ mod tests {
     fn put_word(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
     }
-    fn words(values: &[u32]) -> Vec<u8> {
+    pub(super) fn words(values: &[u32]) -> Vec<u8> {
         values
             .iter()
             .flat_map(|value| value.to_be_bytes())
             .collect()
     }
-    fn blob(structure: &[u8], strings: &[u8]) -> Vec<u8> {
+    pub(super) fn blob(structure: &[u8], strings: &[u8]) -> Vec<u8> {
         let mut bytes = std::vec![0u8; 72];
         bytes[40..48].copy_from_slice(&0x4400_0000u64.to_be_bytes());
         bytes[48..56].copy_from_slice(&4096u64.to_be_bytes());
