@@ -9,6 +9,7 @@ pub mod cpuid;
 pub mod device;
 pub mod domain;
 pub mod event;
+pub mod fdt;
 pub mod grant;
 pub mod image;
 #[cfg(target_arch = "x86_64")]
