@@ -3,3 +3,4 @@
 pub mod stage2;
 pub mod vcpu;
 pub mod vgic;
+pub mod firmware;

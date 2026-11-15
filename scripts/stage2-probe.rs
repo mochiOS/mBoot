@@ -13,7 +13,10 @@ mod vcpu;
 #[path = "../src/arch/aarch64/vgic.rs"]
 mod vgic;
 #[cfg(feature = "arm-diagnostics")]
-use mboot::arch::aarch64::{stage2, vcpu, vgic};
+use mboot::arch::aarch64::{firmware, stage2, vcpu, vgic};
+#[cfg(not(feature = "arm-diagnostics"))]
+#[path = "../src/arch/aarch64/firmware.rs"]
+mod firmware;
 #[path = "vcpu-probe.rs"]
 mod vcpu_probe;
 #[path = "vgic-probe.rs"]
@@ -474,6 +477,17 @@ extern "C" fn probe_main() -> ! {
     emit("STAGE2 EL2 started\n");
     #[cfg(feature = "arm-diagnostics")]
     emit("Linked production mBoot library\n");
+    // SAFETY: This fixed virt-8.2 virtualization fixture provides the standard
+    // SMC PSCI conduit. This is not product platform/FDT admission code.
+    let firmware = unsafe { firmware::Firmware::from_smc_conduit().expect("SMC PSCI conduit") };
+    check(firmware.psci_version() == 0x0001_0001, "real PSCI version");
+    for workaround in [firmware::Workaround::BranchPredictor, firmware::Workaround::BranchHistory] {
+        check(firmware.architectural_features(workaround) == Ok(-1),
+            "unsupported firmware workaround was fabricated");
+        check(firmware.apply(workaround) == Err(firmware::Error::UnsupportedWorkaround),
+            "unavailable firmware workaround accepted");
+    }
+    emit("Real PSCI / unavailable SMCCC workaround propagation PASS\n");
     let native = Config::detect().expect("CPU features");
     // Exercise concatenation even when this CPU exposes a wider PA range.
     let features: u64;
