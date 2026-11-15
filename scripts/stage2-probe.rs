@@ -5,6 +5,10 @@
 
 #[path = "../src/arch/aarch64/stage2.rs"]
 mod stage2;
+#[path = "../src/arch/aarch64/vcpu.rs"]
+mod vcpu;
+#[path = "vcpu-probe.rs"]
+mod vcpu_probe;
 
 #[cfg(system_domain_probe)]
 #[path = "../src/error.rs"]
@@ -623,6 +627,7 @@ extern "C" fn probe_main() -> ! {
         read(high, 0xb22);
     }
     emit("Stage-2 L0/L1/L2 starting levels PASS\n");
+    vcpu_probe::run(config);
     #[cfg(system_domain_probe)]
     system_domain_probe::run(config);
     emit("STAGE2 PASS aarch64\n");
