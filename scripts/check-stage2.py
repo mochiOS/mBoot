@@ -77,10 +77,21 @@ def main():
             shutil.copy2(target_dir / "aarch64-unknown-none/debug/mboot-stage2-probe", binary)
         else:
             run(build, out / "build.log", 60, env=environment)
+        # ELF direct boot leaves x0 unspecified. Use the standard AArch64
+        # Image protocol to exercise the real firmware DTB handoff instead.
+        libdir = subprocess.check_output(
+            ["rustc", f"+{args.toolchain}", "--print", "target-libdir"], text=True,
+        ).strip()
+        objcopy = Path(libdir).parent / "bin/llvm-objcopy"
+        if not objcopy.is_file():
+            raise RuntimeError(f"llvm-tools component required for {args.toolchain}")
+        image = out / "stage2.Image"
+        run([str(objcopy), "-O", "binary", str(binary), str(image)],
+            out / "image.log", 30, env=environment)
         run([str(Path(qemu).resolve()), "-machine", "virt-8.2,virtualization=on,gic-version=2",
              "-cpu", args.cpu, "-accel", "tcg", "-m", "128M", "-smp", "1",
              "-display", "none", "-monitor", "none", "-nic", "none", "-serial", "stdio",
-             "-no-reboot", "-kernel", str(binary), "-semihosting-config", "enable=on,target=native"],
+             "-no-reboot", "-kernel", str(image), "-semihosting-config", "enable=on,target=native"],
             out / "run.log", 15, env=dict(os.environ, TMPDIR=str(out)), marker="STAGE2 PASS aarch64")
     except (OSError, RuntimeError) as error:
         parser.exit(1, f"Stage-2 check failed: {error}\n")

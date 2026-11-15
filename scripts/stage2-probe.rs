@@ -14,6 +14,11 @@ mod vcpu;
 mod vgic;
 #[cfg(feature = "arm-diagnostics")]
 use mboot::arch::aarch64::{firmware, stage2, vcpu, vgic};
+#[cfg(feature = "arm-diagnostics")]
+use mboot::fdt;
+#[cfg(not(feature = "arm-diagnostics"))]
+#[path = "../src/fdt.rs"]
+mod fdt;
 #[cfg(not(feature = "arm-diagnostics"))]
 #[path = "../src/arch/aarch64/firmware.rs"]
 mod firmware;
@@ -62,7 +67,21 @@ global_asm!(
     .section .text.entry, "ax"
     .global _start
 _start:
+    // Standard AArch64 Image boot header, so the firmware loader supplies
+    // x0=DTB rather than the unspecified registers of a direct ELF entry.
+    b __probe_start
+    nop
+    .quad 0x80000
+    .quad __image_size
+    .quad 2
+    .quad 0
+    .quad 0
+    .quad 0
+    .long 0x644d5241
+    .long 0
+__probe_start:
     msr daifset, #15
+    mov x19, x0
     ldr x0, =__stack_top
     mov sp, x0
     ldr x1, =__bss_start
@@ -87,6 +106,7 @@ _start:
     bic x0, x0, #0x1000
 3:  msr cptr_el2, x0
     isb
+    mov x0, x19
     bl probe_main
     b .
 
@@ -473,12 +493,33 @@ fn map_fixture_code(mapper: &mut Mapper<'_, Pool>) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn probe_main() -> ! {
+extern "C" fn probe_main(dtb: u64) -> ! {
     emit("STAGE2 EL2 started\n");
     #[cfg(feature = "arm-diagnostics")]
     emit("Linked production mBoot library\n");
-    // SAFETY: This fixed virt-8.2 virtualization fixture provides the standard
-    // SMC PSCI conduit. This is not product platform/FDT admission code.
+    // QEMU's direct boot contract supplies the DTB in x0. Bound both reads in
+    // this fixed machine's RAM before constructing the immutable borrowed view.
+    check(dtb & 7 == 0 && (0x4000_0000..=0x4800_0000 - 40).contains(&dtb),
+        "firmware DTB header outside fixture RAM");
+    // SAFETY: This header lies in pinned firmware RAM and no guest maps it.
+    let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 40) };
+    let size = u32::from_be_bytes(header[4..8].try_into().unwrap()) as u64;
+    check(size >= 40 && size <= 0x4800_0000 - dtb, "firmware DTB outside fixture RAM");
+    // SAFETY: The complete DTB range is bounded above, unchanged by the fixture
+    // and disjoint from every guest's private RAM and table storage.
+    let blob = unsafe { core::slice::from_raw_parts(dtb as *const u8, size as usize) };
+    let tree = fdt::Fdt::new(blob).expect("actual boot DTB");
+    let mpidr: u64;
+    unsafe { asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)); }
+    let topology = fdt::arm64::Topology::from_fdt(&tree, mpidr).expect("native CPU topology");
+    check(topology.boot_cpu().enabled
+        && topology.cpus().len() == 1
+        && topology.psci_conduit() == Some(fdt::arm64::Conduit::Smc),
+        "actual firmware CPU / conduit does not match reference machine");
+    emit("Real boot DTB / physical CPU affinity / SMC binding PASS\n");
+    // SAFETY: This trusted virt-8.2 reference boot supplies both the standard
+    // firmware contract and the actual SMC binding verified above. A guest DTB
+    // or topology description alone would not grant this firmware authority.
     let firmware = unsafe { firmware::Firmware::from_smc_conduit().expect("SMC PSCI conduit") };
     check(firmware.psci_version() == 0x0001_0001, "real PSCI version");
     for workaround in [firmware::Workaround::BranchPredictor, firmware::Workaround::BranchHistory] {

@@ -18,5 +18,6 @@ SECTIONS {
         . += 65536;
         __stack_top = .;
     }
+    __image_size = __stack_top - 0x40080000;
     /DISCARD/ : { *(.eh_frame*) *(.note*) }
 }
