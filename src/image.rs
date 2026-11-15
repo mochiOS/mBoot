@@ -1,6 +1,7 @@
 use core::mem::size_of;
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
+#[cfg(target_arch = "x86_64")]
 use crate::memory::NestedPageTable;
 use crate::Error;
 
@@ -37,6 +38,7 @@ pub unsafe trait ImageMemory {
 
 // SAFETY: NestedPageTable exposes bounds-checked host ranges in its own retained
 // Domain RAM. The unsafe loader caller excludes VCPU/DMA/source-image aliases.
+#[cfg(target_arch = "x86_64")]
 unsafe impl ImageMemory for NestedPageTable {
     fn guest_memory_size(&self) -> u64 {
         NestedPageTable::guest_memory_size(self)
@@ -294,7 +296,7 @@ pub unsafe fn load_linux_pvh(
     command_line: &str,
     rsdp: u64,
     usable_memory_size: u64,
-    memory: &NestedPageTable,
+    memory: &impl ImageMemory,
 ) -> Result<GuestImage, Error> {
     if command_line.len() + 1 > PVH_COMMAND_LINE_LIMIT || !command_line.is_ascii() {
         return Err(Error::InvalidImage);
@@ -521,7 +523,7 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 }
 
 fn write_guest_struct<T: Copy>(
-    memory: &NestedPageTable,
+    memory: &impl ImageMemory,
     guest_address: u64,
     value: &T,
 ) -> Result<(), Error> {

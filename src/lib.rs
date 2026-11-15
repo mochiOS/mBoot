@@ -17,33 +17,8 @@ pub mod pci;
 pub mod scheduler;
 
 use arch::x86_64::{cpu, svm, vmx};
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error {
-    UnsupportedCpu,
-    VirtualizationDisabled,
-    NestedPagingUnavailable,
-    InvalidPage,
-    InvalidState,
-    ControlInstructionFailed,
-    VmcsLoadFailed,
-    VmcsWriteFailed(u64),
-    ControlRegionTooLarge,
-    GuestEntryFailed(u64),
-    UnexpectedVmExit(u64),
-    InvalidImage,
-    ImageTooLarge,
-    InvalidManifest,
-    InvalidBundle,
-    ManifestDigestMismatch,
-    ImageDigestMismatch,
-    UnsupportedDomainConfig,
-    AddressSpaceIdUnavailable,
-    InterruptVirtualizationUnavailable,
-    DeviceQuarantineFailed,
-    UnsupportedIommu,
-    IommuInitializationFailed,
-    IommuCommandTimeout,
-}
+mod error;
+pub use error::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendKind {
