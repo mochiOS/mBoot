@@ -1,4 +1,3 @@
-use crate::memory::NestedPageTable;
 use crate::{BackendKind, Error};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,22 +30,22 @@ pub enum DomainRole {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Domain {
+pub struct Domain<Memory> {
     id: DomainId,
     role: DomainRole,
     capabilities: u64,
     backend: BackendKind,
     state: DomainState,
-    nested_pages: NestedPageTable,
+    nested_pages: Memory,
 }
 
-impl Domain {
+impl<Memory> Domain<Memory> {
     pub const fn new(
         id: DomainId,
         role: DomainRole,
         capabilities: u64,
         backend: BackendKind,
-        nested_pages: NestedPageTable,
+        nested_pages: Memory,
     ) -> Self {
         Self {
             id,
@@ -78,7 +77,7 @@ impl Domain {
         self.state
     }
 
-    pub const fn nested_pages(&self) -> &NestedPageTable {
+    pub const fn nested_pages(&self) -> &Memory {
         &self.nested_pages
     }
 
@@ -122,6 +121,7 @@ impl Domain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::NestedPageTable;
 
     #[test]
     fn domain_state_machine_rejects_skipped_states() {

@@ -135,7 +135,7 @@ struct PreparedDomain {
 
 struct RuntimeDomain {
     opregion_storage: Vec<u8>,
-    domain: Domain,
+    domain: Domain<NestedPageTable>,
     virtualization: Virtualization,
     guest: GuestConfig,
     started: bool,
