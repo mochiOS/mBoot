@@ -307,6 +307,16 @@ impl<'a, M: TableMemory> Mapper<'a, M> {
         self.root | (u64::from(self.vmid) << 48)
     }
 
+    /// Identity retained by a vCPU; changing the selected VMID/root cannot
+    /// silently move a continuation into another Domain's address space.
+    pub(super) fn identity(&self) -> (u64, u64) {
+        (self.vttbr(), self.config.vtcr())
+    }
+
+    pub(super) fn require_active(&self) -> Result<(), Error> {
+        self.editing_context()
+    }
+
     fn context(&self) -> Result<(u64, u64, u64), Error> {
         let level: u64;
         let daif: u64;
