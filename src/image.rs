@@ -9,6 +9,42 @@ const ELF_CLASS_64: u8 = 2;
 const ELF_DATA_LITTLE_ENDIAN: u8 = 1;
 const ELF_TYPE_EXECUTABLE: u16 = 2;
 const ELF_MACHINE_X86_64: u16 = 0x3e;
+const PF_EXECUTE: u32 = 1;
+
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElfArchitecture {
+    X86_64 = ELF_MACHINE_X86_64,
+    Aarch64 = 183,
+}
+
+#[cfg(target_arch = "x86_64")]
+const NATIVE_ELF: ElfArchitecture = ElfArchitecture::X86_64;
+#[cfg(target_arch = "aarch64")]
+const NATIVE_ELF: ElfArchitecture = ElfArchitecture::Aarch64;
+
+/// Stable, exclusively retained guest RAM, independent of EPT/NPT/Stage-2.
+///
+/// # Safety
+/// Every returned host range must remain backed by the same writable RAM for
+/// the complete load operation. It must not alias hypervisor-private memory,
+/// MMIO, another Domain, or the immutable source image. VCPUs/DMA cannot mutate
+/// this RAM while a loader holds the caller's exclusive stopped-Domain access.
+pub unsafe trait ImageMemory {
+    fn guest_memory_size(&self) -> u64;
+    fn guest_host_address(&self, address: u64, length: u64) -> Option<u64>;
+}
+
+// SAFETY: NestedPageTable exposes bounds-checked host ranges in its own retained
+// Domain RAM. The unsafe loader caller excludes VCPU/DMA/source-image aliases.
+unsafe impl ImageMemory for NestedPageTable {
+    fn guest_memory_size(&self) -> u64 {
+        NestedPageTable::guest_memory_size(self)
+    }
+    fn guest_host_address(&self, address: u64, length: u64) -> Option<u64> {
+        NestedPageTable::guest_host_address(self, address, length)
+    }
+}
 const PT_LOAD: u32 = 1;
 const PT_NOTE: u32 = 4;
 const MINIMUM_LOAD_GPA: u64 = 0x1_0000;
@@ -108,63 +144,77 @@ struct ProgramHeader {
     alignment: u64,
 }
 
-/// Copies the loadable parts of a fixed-address x86_64 ELF into guest RAM.
+/// Copies a native ELF into stopped guest RAM. Foreign CPUs are rejected.
 ///
 /// # Safety
 /// `memory` must retain exclusive writable ownership of its guest RAM while the
 /// image is copied. No vCPU may be executing from it yet.
-pub unsafe fn load_elf(image: &[u8], memory: &NestedPageTable) -> Result<GuestImage, Error> {
-    let header: ElfHeader = read_struct(image, 0)?;
-    if header.ident[..4] != ELF_MAGIC
-        || header.ident[4] != ELF_CLASS_64
-        || header.ident[5] != ELF_DATA_LITTLE_ENDIAN
-        || header.file_type != ELF_TYPE_EXECUTABLE
-        || header.machine != ELF_MACHINE_X86_64
-        || header.program_header_size as usize != size_of::<ProgramHeader>()
-    {
-        return Err(Error::InvalidImage);
-    }
+pub unsafe fn load_elf(image: &[u8], memory: &impl ImageMemory) -> Result<GuestImage, Error> {
+    // SAFETY: Forward the caller's stopped, exclusively retained RAM contract.
+    unsafe { load_elf_for(NATIVE_ELF, image, memory) }
+}
+
+/// Load an explicitly selected CPU image. ARM may use a low identity-mapped
+/// bootstrap and upper-half VMAs whose bytes are stored at separate GPAs. The
+/// signed bootstrap establishes Stage-1 before entering its upper-half code;
+/// this byte loader never substitutes a virtual address for a physical range.
+///
+/// # Safety
+/// As for `load_elf`: retain stopped, exclusive RAM and a disjoint immutable
+/// source image. The eventual VCPU backend must match `architecture`.
+pub unsafe fn load_elf_for(
+    architecture: ElfArchitecture,
+    image: &[u8],
+    memory: &impl ImageMemory,
+) -> Result<GuestImage, Error> {
+    let header = elf_header_for(image, architecture)?;
     if header.entry < MINIMUM_LOAD_GPA || header.entry >= memory.guest_memory_size() {
         return Err(Error::ImageTooLarge);
+    }
+    if architecture == ElfArchitecture::Aarch64 && header.entry & 3 != 0 {
+        return Err(Error::InvalidImage);
     }
 
     let mut loaded = false;
     let mut loaded_end = 0;
+    let mut bootstrap_entry = false;
+    // Validate the entire image before modifying any byte of guest RAM.
     for index in 0..usize::from(header.program_header_count) {
-        let offset = (header.program_header_offset as usize)
-            .checked_add(
-                index
-                    .checked_mul(size_of::<ProgramHeader>())
-                    .ok_or(Error::InvalidImage)?,
-            )
-            .ok_or(Error::InvalidImage)?;
-        let segment: ProgramHeader = read_struct(image, offset)?;
+        let segment = program_header(image, header, index)?;
         if segment.segment_type != PT_LOAD {
             continue;
         }
-        if segment.physical_address != segment.virtual_address
-            || segment.virtual_address < MINIMUM_LOAD_GPA
+        let identity = segment.physical_address == segment.virtual_address;
+        if (!identity
+            && (architecture != ElfArchitecture::Aarch64
+                || segment.virtual_address < 0xffff_0000_0000_0000))
+            || segment.physical_address < MINIMUM_LOAD_GPA
             || segment.file_size > segment.memory_size
         {
             return Err(Error::InvalidImage);
         }
-        let source_start = segment.offset as usize;
+        let source_start = usize::try_from(segment.offset).map_err(|_| Error::InvalidImage)?;
         let source_end = source_start
-            .checked_add(segment.file_size as usize)
+            .checked_add(usize::try_from(segment.file_size).map_err(|_| Error::InvalidImage)?)
             .ok_or(Error::InvalidImage)?;
-        let source = image
+        image
             .get(source_start..source_end)
             .ok_or(Error::InvalidImage)?;
-        let destination = memory
+        memory
             .guest_host_address(segment.physical_address, segment.memory_size)
             .ok_or(Error::ImageTooLarge)?;
-
-        // SAFETY: The source range was checked and the destination belongs to
-        // unused guest RAM for the complete segment size.
-        unsafe {
-            write_bytes(destination as *mut u8, 0, segment.memory_size as usize);
-            copy_nonoverlapping(source.as_ptr(), destination as *mut u8, source.len());
-        }
+        segment
+            .virtual_address
+            .checked_add(segment.memory_size)
+            .ok_or(Error::InvalidImage)?;
+        bootstrap_entry |= identity
+            && segment.flags & PF_EXECUTE != 0
+            && header.entry >= segment.virtual_address
+            && header.entry
+                < segment
+                    .virtual_address
+                    .checked_add(segment.file_size)
+                    .ok_or(Error::InvalidImage)?;
         loaded_end = loaded_end.max(
             segment
                 .physical_address
@@ -173,8 +223,25 @@ pub unsafe fn load_elf(image: &[u8], memory: &NestedPageTable) -> Result<GuestIm
         );
         loaded = true;
     }
-    if !loaded {
+    if !loaded || !bootstrap_entry {
         return Err(Error::InvalidImage);
+    }
+    for index in 0..usize::from(header.program_header_count) {
+        let segment = program_header(image, header, index)?;
+        if segment.segment_type != PT_LOAD {
+            continue;
+        }
+        let source_start = segment.offset as usize;
+        let source = &image[source_start..source_start + segment.file_size as usize];
+        let destination = memory
+            .guest_host_address(segment.physical_address, segment.memory_size)
+            .ok_or(Error::ImageTooLarge)?;
+        // SAFETY: Preflight checked the complete source/destination ranges.
+        // The caller and ImageMemory retain disjoint, stable, stopped RAM.
+        unsafe {
+            write_bytes(destination as *mut u8, 0, segment.memory_size as usize);
+            copy_nonoverlapping(source.as_ptr(), destination as *mut u8, source.len());
+        }
     }
     Ok(GuestImage {
         entry: header.entry,
@@ -195,7 +262,7 @@ pub unsafe fn load_boot_module(
     module: &[u8],
     image_end: u64,
     limit: u64,
-    memory: &NestedPageTable,
+    memory: &impl ImageMemory,
 ) -> Result<(u64, u64), Error> {
     if module.is_empty() || limit > memory.guest_memory_size() {
         return Err(Error::InvalidImage);
@@ -353,12 +420,16 @@ pub unsafe fn load_linux_pvh(
 }
 
 fn elf_header(image: &[u8]) -> Result<ElfHeader, Error> {
+    elf_header_for(image, ElfArchitecture::X86_64)
+}
+
+fn elf_header_for(image: &[u8], architecture: ElfArchitecture) -> Result<ElfHeader, Error> {
     let header: ElfHeader = read_struct(image, 0)?;
     if header.ident[..4] != ELF_MAGIC
         || header.ident[4] != ELF_CLASS_64
         || header.ident[5] != ELF_DATA_LITTLE_ENDIAN
         || header.file_type != ELF_TYPE_EXECUTABLE
-        || header.machine != ELF_MACHINE_X86_64
+        || header.machine != architecture as u16
         || header.program_header_size as usize != size_of::<ProgramHeader>()
     {
         return Err(Error::InvalidImage);
@@ -480,6 +551,145 @@ mod tests {
 
     #[repr(align(4096))]
     struct GuestMemory([u8; 128 * 1024]);
+
+    struct ImageRam(core::cell::UnsafeCell<[u8; 128 * 1024]>);
+
+    // SAFETY: Test-owned RAM is interior-mutable, stable and disjoint from the
+    // input image. Each test loads it synchronously with no VCPU or DMA actor.
+    unsafe impl ImageMemory for ImageRam {
+        fn guest_memory_size(&self) -> u64 {
+            128 * 1024
+        }
+        fn guest_host_address(&self, address: u64, length: u64) -> Option<u64> {
+            (address.checked_add(length)? <= self.guest_memory_size())
+                .then(|| self.0.get() as u64 + address)
+        }
+    }
+
+    fn split_native_elf(architecture: ElfArchitecture) -> std::vec::Vec<u8> {
+        let mut image = vec![0; 0x300];
+        let mut header = ElfHeader {
+            ident: [0; 16],
+            file_type: ELF_TYPE_EXECUTABLE,
+            machine: architecture as u16,
+            version: 1,
+            entry: 0x10000,
+            program_header_offset: size_of::<ElfHeader>() as u64,
+            section_header_offset: 0,
+            flags: 0,
+            header_size: size_of::<ElfHeader>() as u16,
+            program_header_size: size_of::<ProgramHeader>() as u16,
+            program_header_count: 2,
+            section_header_size: 0,
+            section_header_count: 0,
+            section_name_index: 0,
+        };
+        header.ident[..4].copy_from_slice(&ELF_MAGIC);
+        header.ident[4] = ELF_CLASS_64;
+        header.ident[5] = ELF_DATA_LITTLE_ENDIAN;
+        write_test_struct(&mut image, 0, &header);
+        for index in 0..2 {
+            let physical = 0x10000 + index as u64 * 4096;
+            let virtual_address = if architecture == ElfArchitecture::Aarch64 && index == 1 {
+                0xffff_8000_0000_0000
+            } else {
+                physical
+            };
+            write_test_struct(
+                &mut image,
+                size_of::<ElfHeader>() + index * size_of::<ProgramHeader>(),
+                &ProgramHeader {
+                    segment_type: PT_LOAD,
+                    flags: 5,
+                    offset: 0x200 + index as u64 * 16,
+                    virtual_address,
+                    physical_address: physical,
+                    file_size: 4,
+                    memory_size: 8,
+                    alignment: 1,
+                },
+            );
+        }
+        image[0x200..0x204].copy_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
+        image[0x210..0x214].copy_from_slice(&[0xc0, 0x03, 0x5f, 0xd6]);
+        image
+    }
+
+    #[test]
+    fn native_elf_loads_physical_bytes_without_confusing_upper_virtual_addresses() {
+        for architecture in [ElfArchitecture::X86_64, ElfArchitecture::Aarch64] {
+            let image = split_native_elf(architecture);
+            let memory = ImageRam(core::cell::UnsafeCell::new([0xaa; 128 * 1024]));
+            // SAFETY: This test exclusively retains the stopped RAM and input.
+            let loaded = unsafe { load_elf_for(architecture, &image, &memory) }.unwrap();
+            assert_eq!(loaded.entry(), 0x10000);
+            assert_eq!(loaded.loaded_end(), 0x11008);
+            let bytes = unsafe { &*memory.0.get() };
+            assert_eq!(&bytes[0x10000..0x10004], &image[0x200..0x204]);
+            assert_eq!(&bytes[0x11000..0x11004], &image[0x210..0x214]);
+            assert_eq!(&bytes[0x10004..0x10008], &[0; 4]);
+            assert_eq!(&bytes[0x11004..0x11008], &[0; 4]);
+            assert_eq!(bytes[0x10008], 0xaa);
+            assert_eq!(bytes[0x11008], 0xaa);
+        }
+        if let Some(path) = std::env::var_os("MBOOT_ARM_BOOT_ELF") {
+            // Optional integration with a real compiler/LLD image: its low
+            // bootstrap, high text, initialized data and BSS have separate LMAs.
+            let image = std::fs::read(path).unwrap();
+            let memory = ImageRam(core::cell::UnsafeCell::new([0xaa; 128 * 1024]));
+            let loaded =
+                unsafe { load_elf_for(ElfArchitecture::Aarch64, &image, &memory) }.unwrap();
+            assert_eq!(loaded.entry(), 0x10000);
+            assert_eq!(loaded.loaded_end(), 0x12018);
+            let bytes = unsafe { &*memory.0.get() };
+            assert_eq!(&bytes[0x10000..0x10004], &[0x1f, 0x20, 0x03, 0xd5]);
+            assert_eq!(&bytes[0x11000..0x11004], &[0xc0, 0x03, 0x5f, 0xd6]);
+            assert_eq!(
+                &bytes[0x12000..0x12008],
+                &0x1122334455667788u64.to_le_bytes()
+            );
+            assert_eq!(&bytes[0x12008..0x12018], &[0; 16]);
+            std::println!("Real Clang/LLD ARM bootstrap and upper-half load layout PASS");
+        }
+    }
+
+    #[test]
+    fn native_elf_rejects_foreign_or_invalid_layout_before_writing_ram() {
+        let valid = split_native_elf(ElfArchitecture::Aarch64);
+        for mode in 0..8 {
+            let mut image = valid.clone();
+            let mut header: ElfHeader = read_struct(&image, 0).unwrap();
+            let mut segment = program_header(&image, header, 1).unwrap();
+            let mut architecture = ElfArchitecture::Aarch64;
+            let mut expected = Error::InvalidImage;
+            match mode {
+                0 => architecture = ElfArchitecture::X86_64,
+                1 => segment.virtual_address = 0x0001_0000_0000_0000,
+                2 => segment.physical_address = 0x8000,
+                3 => {
+                    segment.physical_address = 0x1fffc;
+                    expected = Error::ImageTooLarge;
+                }
+                4 => header.entry += 1,
+                5 => header.entry = 0x12000,
+                6 => segment.virtual_address = u64::MAX - 3,
+                _ => segment.file_size = 9,
+            }
+            write_test_struct(&mut image, 0, &header);
+            write_test_struct(
+                &mut image,
+                size_of::<ElfHeader>() + size_of::<ProgramHeader>(),
+                &segment,
+            );
+            let memory = ImageRam(core::cell::UnsafeCell::new([0xaa; 128 * 1024]));
+            // SAFETY: Rejection must occur before writing this test-owned RAM.
+            assert_eq!(
+                unsafe { load_elf_for(architecture, &image, &memory) },
+                Err(expected)
+            );
+            assert!(unsafe { &*memory.0.get() }.iter().all(|byte| *byte == 0xaa));
+        }
+    }
 
     #[test]
     fn truncated_elf_is_rejected() {
