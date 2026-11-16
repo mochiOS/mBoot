@@ -81,6 +81,58 @@ impl GuestImage {
     }
 }
 
+/// Load a modern little-endian, 4 KiB AArch64 Linux Image at an explicitly
+/// admitted 2 MiB base. This is the raw Image entry protocol, not EFI or PVH.
+/// The caller supplies a separately validated guest DTB in x0 when entering.
+///
+/// # Safety
+/// As for `load_elf`: the entire destination is retained, stopped and exclusive,
+/// and the immutable source is disjoint. `base` describes guest RAM, not a host
+/// pointer. The caller must reserve the resulting range against other payloads.
+pub unsafe fn load_arm64_linux(
+    image: &[u8],
+    base: u64,
+    memory: &impl ImageMemory,
+) -> Result<GuestImage, Error> {
+    let header = image.get(..64).ok_or(Error::InvalidImage)?;
+    let field = |offset| u64::from_le_bytes(header[offset..offset + 8].try_into().unwrap());
+    let offset = field(8);
+    let size = field(16);
+    let flags = field(24);
+    // Unknown legacy sizes, big-endian kernels and other granules need their
+    // own admitted profile. Never guess a load extent or execute compressed data.
+    if header[56..60] != *b"ARM\x64"
+        || size < image.len() as u64
+        || flags & !8 != 2
+        || field(32) != 0
+        || field(40) != 0
+        || field(48) != 0
+        || base & (0x20_0000 - 1) != 0
+        || offset & 3 != 0
+    {
+        return Err(Error::InvalidImage);
+    }
+    let start = base.checked_add(offset).ok_or(Error::ImageTooLarge)?;
+    let end = start.checked_add(size).ok_or(Error::ImageTooLarge)?;
+    if start < MINIMUM_LOAD_GPA || end > memory.guest_memory_size() {
+        return Err(Error::ImageTooLarge);
+    }
+    let destination = memory
+        .guest_host_address(start, size)
+        .ok_or(Error::ImageTooLarge)?;
+    let size = usize::try_from(size).map_err(|_| Error::ImageTooLarge)?;
+    // SAFETY: Complete validation precedes writes into the caller-owned range.
+    unsafe {
+        write_bytes(destination as *mut u8, 0, size);
+        copy_nonoverlapping(image.as_ptr(), destination as *mut u8, image.len());
+    }
+    Ok(GuestImage {
+        entry: start,
+        boot_info: 0,
+        loaded_end: end,
+    })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct HvmStartInfo {
@@ -555,6 +607,41 @@ mod tests {
     struct GuestMemory([u8; 128 * 1024]);
 
     struct ImageRam(core::cell::UnsafeCell<[u8; 128 * 1024]>);
+
+    #[test]
+    fn arm_linux_image_checks_header_and_extent_before_writing() {
+        let mut image = [0u8; 128];
+        image[8..16].copy_from_slice(&0x10000u64.to_le_bytes());
+        image[16..24].copy_from_slice(&4096u64.to_le_bytes());
+        image[24..32].copy_from_slice(&2u64.to_le_bytes());
+        image[56..60].copy_from_slice(b"ARM\x64");
+        for (field, value) in [
+            (8, u64::MAX),
+            (16, 0),
+            (16, 0x20000),
+            (24, 3),
+            (24, 4),
+            (24, 18),
+            (32, 1),
+        ] {
+            let mut invalid = image;
+            invalid[field..field + 8].copy_from_slice(&value.to_le_bytes());
+            let memory = ImageRam(core::cell::UnsafeCell::new([0xaa; 128 * 1024]));
+            // SAFETY: Private synchronous test RAM; failed admission must not
+            // modify even one byte of it.
+            assert!(unsafe { load_arm64_linux(&invalid, 0, &memory) }.is_err());
+            assert!(unsafe { &*memory.0.get() }.iter().all(|b| *b == 0xaa));
+        }
+        let memory = ImageRam(core::cell::UnsafeCell::new([0xaa; 128 * 1024]));
+        let loaded = unsafe { load_arm64_linux(&image, 0, &memory) }.unwrap();
+        assert_eq!(loaded.entry(), 0x10000);
+        assert_eq!(loaded.loaded_end(), 0x11000);
+        let bytes = unsafe { &*memory.0.get() };
+        assert_eq!(&bytes[0x10000..0x10080], &image);
+        assert!(bytes[0x10080..0x11000].iter().all(|b| *b == 0));
+        assert_eq!(bytes[0xffff], 0xaa);
+        assert_eq!(bytes[0x11000], 0xaa);
+    }
 
     // SAFETY: Test-owned RAM is interior-mutable, stable and disjoint from the
     // input image. Each test loads it synchronously with no VCPU or DMA actor.
