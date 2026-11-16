@@ -295,5 +295,32 @@ pub unsafe fn run(config: Config, binding: fdt::gic::GicV2) {
         full.interrupt_status(64 + count).is_none(),
         "failed injection mutated the queue",
     );
+    let mut level = vcpu::Vcpu::new(&mapper, guest_address(guest_irq_entry), 0, 0).unwrap();
+    level.configure_interrupts(&controller).unwrap();
+    level.set_interrupt_level(80, 0x40, true).unwrap();
+    level.set_interrupt_level(80, 0x40, false).unwrap();
+    check(
+        level.interrupt_status(80).is_none(),
+        "deasserted pending level retained",
+    );
+    level.set_interrupt_level(80, 0x40, true).unwrap();
+    // SAFETY: Same stopped reference guest and exclusively retained banks.
+    unsafe { level.run_with_gic(&mapper, &mut controller).unwrap() };
+    check(level.register(0) == Some(80), "level IRQ not delivered");
+    level.set_interrupt_level(80, 0x40, true).unwrap();
+    active(&level, 80); // Active assertion must not create a duplicate pending IRQ.
+    check(
+        level.inject_edge(80, 0x40, None)
+            == Err(vcpu::Error::Interrupts(vgic::Error::ConflictingSource)),
+        "level source accepted as edge",
+    );
+    level.set_interrupt_level(80, 0x40, false).unwrap();
+    level.complete_hypercall(0).unwrap();
+    unsafe { level.run_with_gic(&mapper, &mut controller).unwrap() };
+    check(
+        level.register(0) == Some(0xeeee) && level.interrupt_status(80).is_none(),
+        "cleared level repeated after EOI",
+    );
+    emit("Native virtual GIC level assertion / deassertion / EOI PASS\n");
     emit("Native virtual GIC active/pending/priority/SGI isolation and EOI PASS\n");
 }
