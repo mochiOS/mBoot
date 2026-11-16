@@ -8,6 +8,8 @@ pub mod arm64;
 pub mod gic;
 #[path = "fdt/memory.rs"]
 pub mod memory;
+#[path = "fdt/timer.rs"]
+pub mod timer;
 
 const HEADER_SIZE: usize = 40;
 const MAX_DEPTH: usize = 64;
@@ -23,6 +25,7 @@ pub enum Error {
     InvalidTree,
     InvalidString,
     TooDeep,
+    InvalidSeed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +142,42 @@ impl<'a> Fdt<'a> {
     /// to this 32-bit field.
     pub fn boot_cpu_id(&self) -> u32 {
         self.boot_cpu
+    }
+
+    /// Decode `/chosen/rng-seed` without logging it. Only a trusted, fresh
+    /// firmware handoff may supply entropy authority; a guest-provided DTB
+    /// or replayed fixture is not an entropy source. No clock/address fallback.
+    pub fn rng_seed(&self) -> Result<Option<[u8; 32]>, Error> {
+        let mut chosen = false;
+        let mut seen = false;
+        let mut seed = None;
+        for token in self.tokens() {
+            match token? {
+                Token::BeginNode { depth: 1, name } => {
+                    chosen = name == "chosen";
+                    if chosen && core::mem::replace(&mut seen, true) {
+                        return Err(Error::InvalidTree);
+                    }
+                }
+                Token::Property {
+                    depth: 1,
+                    name: "rng-seed",
+                    value,
+                } if chosen => {
+                    if seed.is_some() || !(32..=256).contains(&value.len()) {
+                        return Err(Error::InvalidSeed);
+                    }
+                    let bytes: [u8; 32] = value[..32].try_into().unwrap();
+                    if bytes == [0; 32] {
+                        return Err(Error::InvalidSeed);
+                    }
+                    seed = Some(bytes);
+                }
+                Token::EndNode { depth: 1 } => chosen = false,
+                _ => {}
+            }
+        }
+        Ok(seed)
     }
 
     pub fn reservations(&self) -> impl Iterator<Item = Reservation> + '_ {
@@ -392,6 +431,47 @@ mod tests {
         structure.extend_from_slice(b"cpu@0\0\0\0");
         structure.extend_from_slice(&words(&[3, 4, 11, 0, 2, 2, 9]));
         blob(&structure, b"compatible\0reg\0")
+    }
+
+    #[test]
+    fn firmware_seed_is_bounded_unique_and_never_fabricated() {
+        for value in [&[7; 32][..], &[9; 64][..]] {
+            let mut tree = Tree::new();
+            tree.begin("");
+            tree.begin("chosen");
+            tree.property("rng-seed", value);
+            tree.end();
+            tree.end();
+            let bytes = tree.finish();
+            assert_eq!(
+                Fdt::new(&bytes).unwrap().rng_seed().unwrap(),
+                Some(value[..32].try_into().unwrap())
+            );
+        }
+        for value in [&[0; 32][..], &[1; 31][..], &[1; 257][..]] {
+            let mut tree = Tree::new();
+            tree.begin("");
+            tree.begin("chosen");
+            tree.property("rng-seed", value);
+            tree.end();
+            tree.end();
+            assert_eq!(
+                Fdt::new(&tree.finish()).unwrap().rng_seed(),
+                Err(Error::InvalidSeed)
+            );
+        }
+        let mut tree = Tree::new();
+        tree.begin("");
+        tree.begin("chosen");
+        tree.property("rng-seed", &[1; 32]);
+        tree.property("rng-seed", &[2; 32]);
+        tree.end();
+        tree.end();
+        assert_eq!(
+            Fdt::new(&tree.finish()).unwrap().rng_seed(),
+            Err(Error::InvalidSeed)
+        );
+        assert_eq!(Fdt::new(&sample()).unwrap().rng_seed(), Ok(None));
     }
 
     #[test]

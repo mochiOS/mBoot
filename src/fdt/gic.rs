@@ -168,7 +168,7 @@ impl GicV2 {
     }
 }
 
-fn maintenance(bytes: &[u8]) -> Result<MaintenanceInterrupt, Error> {
+pub(super) fn maintenance(bytes: &[u8]) -> Result<MaintenanceInterrupt, Error> {
     if bytes.len() != 12 || cell(&bytes[..4])? != 1 {
         return Err(Error::InvalidProperty);
     }
