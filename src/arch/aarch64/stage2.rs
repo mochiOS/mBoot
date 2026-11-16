@@ -402,6 +402,41 @@ impl<'a, M: TableMemory> Mapper<'a, M> {
         Ok(())
     }
 
+    /// Stop using this address space on the editing CPU and flush its VMID.
+    /// The selected root is cleared; other address spaces are never stopped
+    /// implicitly. This consumes the editor, not the owner's table pages.
+    ///
+    /// # Safety
+    /// As for activate, all sharing vCPUs must be stopped, EL1 speculative walks
+    /// suppressed, and IRQ/FIQ masked at non-reentrant EL2. Before reclaiming
+    /// tables, their owner must also detach every other CPU/walker and prevent
+    /// all future entries using the old continuation/VMID.
+    pub unsafe fn deactivate(self) -> Result<(), Error> {
+        self.editing_context()?;
+        let (hcr, _, _) = self.context()?;
+        let sctlr: u64;
+        let tcr: u64;
+        // SAFETY: Validated privileged, quiescent non-VHE context.
+        unsafe {
+            asm!("mrs {}, sctlr_el1", "mrs {}, tcr_el1", out(reg) sctlr, out(reg) tcr,
+                options(nomem, nostack, preserves_flags));
+        }
+        const EPD: u64 = (1 << 7) | (1 << 23);
+        if sctlr & 1 == 0 || tcr & EPD != EPD {
+            return Err(Error::UnsupportedHostMode);
+        }
+        // SAFETY: This exact VMID/root is selected; all old walks are stopped.
+        // Complete invalidation before severing the hardware's root reference.
+        unsafe {
+            // Complete outstanding speculative reads as well as PTE writes.
+            asm!("dsb ish", options(nostack, preserves_flags));
+            self.invalidate();
+            asm!("msr hcr_el2, {off}", "isb", "msr vttbr_el2, xzr", "isb",
+                off = in(reg) hcr & !HCR_VM, options(nostack, preserves_flags));
+        }
+        Ok(())
+    }
+
     /// Map a Domain-owned page. Allocation failure publishes no partial chain.
     ///
     /// # Safety
