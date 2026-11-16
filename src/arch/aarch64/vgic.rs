@@ -43,6 +43,7 @@ pub(super) struct State {
     vmcr: u32,
     apr: u32,
     list: [u32; 64],
+    level_sources: [u64; 16],
 }
 
 impl State {
@@ -53,6 +54,7 @@ impl State {
             vmcr: 0,
             apr: 0,
             list: [0; 64],
+            level_sources: [0; 16],
         }
     }
 
@@ -77,6 +79,9 @@ impl State {
         {
             return Err(Error::InvalidInterrupt);
         }
+        if self.level_sources[id as usize / 64] & (1 << (id % 64)) != 0 {
+            return Err(Error::ConflictingSource);
+        }
         let source = u32::from(source.unwrap_or(0)) << 10;
         let count = (vtr & 63) as usize + 1;
         if let Some(lr) = self.list[..count]
@@ -96,6 +101,40 @@ impl State {
             .find(|lr| **lr & STATE == 0)
             .ok_or(Error::QueueFull)?;
         *slot = PENDING | (u32::from(priority >> 3) << 23) | source | u32::from(id);
+        Ok(())
+    }
+
+    /// Sample an owned software level source. Unlike an edge, an asserted
+    /// active level does not latch another pending IRQ: its handler may clear
+    /// the source before EOI. The owner resamples it on the next EL2 exit.
+    pub(super) fn set_level(&mut self, id: u16, priority: u8, asserted: bool) -> Result<(), Error> {
+        let (_, _, vtr) = self.binding.ok_or(Error::Unconfigured)?;
+        if !(16..1020).contains(&id) || priority & 7 != 0 {
+            return Err(Error::InvalidInterrupt);
+        }
+        let count = (vtr & 63) as usize + 1;
+        let index = id as usize / 64;
+        let bit = 1 << (id % 64);
+        let existing = self.list[..count]
+            .iter_mut()
+            .find(|lr| **lr & STATE != 0 && **lr & ID == u32::from(id));
+        if let Some(lr) = existing {
+            if self.level_sources[index] & bit == 0 {
+                return Err(Error::ConflictingSource);
+            }
+            if !asserted {
+                *lr &= !PENDING;
+            }
+            return Ok(());
+        }
+        if asserted {
+            let slot = self.list[..count]
+                .iter_mut()
+                .find(|lr| **lr & STATE == 0)
+                .ok_or(Error::QueueFull)?;
+            *slot = PENDING | (u32::from(priority >> 3) << 23) | u32::from(id);
+        }
+        self.level_sources[index] |= bit;
         Ok(())
     }
 
@@ -241,7 +280,7 @@ impl Controller {
     }
 }
 
-fn context() -> Result<u64, Error> {
+pub(super) fn context() -> Result<u64, Error> {
     let level: u64;
     let daif: u64;
     // SAFETY: Read-only context registers, prior to accessing an EL2-only bank.

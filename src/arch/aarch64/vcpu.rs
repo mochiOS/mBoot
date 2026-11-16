@@ -34,8 +34,7 @@ const GUEST_HCR: u64 = (1 << 35)
 // Non-VHE RES1, trap SVE/trace/AMU. This admitted baseline has no SME, so
 // bit 12 is RES1 (it becomes TSM=0 when SME state is supported in future).
 // Base FP is switched eagerly.
-const GUEST_CPTR: u64 =
-    (1 << 30) | (1 << 20) | (1 << 13) | (1 << 12) | (1 << 9) | (1 << 8) | 0xff;
+const GUEST_CPTR: u64 = (1 << 30) | (1 << 20) | (1 << 13) | (1 << 12) | (1 << 9) | (1 << 8) | 0xff;
 // All debug, OS debug and PMU register accesses trap. No debug/PMU ABI yet.
 const GUEST_MDCR: u64 =
     (1 << 12) | (1 << 11) | (1 << 10) | (1 << 9) | (1 << 8) | (1 << 6) | (1 << 5);
@@ -257,6 +256,57 @@ impl Vcpu {
 
     pub fn interrupt_status(&self, id: u16) -> Option<vgic::InterruptStatus> {
         self.interrupts.status(id)
+    }
+
+    /// Update an assigned software level source. Hardware deactivation rights
+    /// are never encoded here; assignment policy remains with the EL2 owner.
+    pub fn set_interrupt_level(
+        &mut self,
+        id: u16,
+        priority: u8,
+        asserted: bool,
+    ) -> Result<(), Error> {
+        self.interrupts
+            .set_level(id, priority, asserted)
+            .map_err(Error::Interrupts)
+    }
+
+    /// Sample this vCPU's owned CNTV level into its assigned virtual PPI.
+    /// EL2's physical timer drives exits independently of guest cooperation;
+    /// the physical CNTV PPI stays disabled, so it cannot cause an IRQ storm.
+    pub fn synchronize_virtual_timer(&mut self, interrupt: u16) -> Result<(), Error> {
+        require_host()?;
+        if hardware_id() != self.owner {
+            return Err(Error::WrongCpu);
+        }
+        if !(16..32).contains(&interrupt) {
+            return Err(Error::InvalidState);
+        }
+        let expired = self.timer_control & 3 == 1
+            && super::irq::now().wrapping_sub(self.timer_compare) <= i64::MAX as u64;
+        self.interrupts
+            .set_level(interrupt, 0x40, expired)
+            .map_err(Error::Interrupts)
+    }
+
+    /// Complete an intercepted AArch64 WFI/WFE after its owner selected when
+    /// the vCPU is runnable again. Unknown ISS/reserved bits are not skipped.
+    pub fn complete_wait(&mut self) -> Result<(), Error> {
+        if !self.valid
+            || self.registers.kind != ExitKind::Synchronous as u64
+            || self.registers.esr >> 26 != 1
+            || self.registers.esr & (1 << 25) == 0
+            || !matches!(self.registers.esr & 0x1ff_fffe, 0 | 0x1e0_0000)
+        {
+            return Err(Error::InvalidState);
+        }
+        self.registers.pc = self
+            .registers
+            .pc
+            .checked_add(4)
+            .ok_or(Error::InvalidState)?;
+        self.registers.esr = 0;
+        Ok(())
     }
 
     /// Complete an architectural HVC #0 without changing unrelated registers.
