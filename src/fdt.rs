@@ -4,6 +4,8 @@
 
 #[path = "fdt/arm64.rs"]
 pub mod arm64;
+#[path = "fdt/gic.rs"]
+pub mod gic;
 #[path = "fdt/memory.rs"]
 pub mod memory;
 
