@@ -19,6 +19,7 @@ pub mod iommu;
 pub mod manifest;
 #[cfg(target_arch = "x86_64")]
 pub mod memory;
+pub mod pages;
 #[cfg(target_arch = "x86_64")]
 pub mod pci;
 pub mod scheduler;
