@@ -2,7 +2,6 @@
 //! No success response is supplied, no boot module is consumed and no services
 //! are started. This verifies bootstrap translation, not a completed OS boot.
 use super::*;
-use core::cell::UnsafeCell;
 use image::ImageMemory;
 use mnu_abi::hypervisor::{self, DomainBootInfo, HypercallNumber};
 
@@ -10,26 +9,6 @@ const RAM_BYTES: usize = 16 * 1024 * 1024;
 const BOOT_INFO: u64 = 0x3000;
 const UPPER: u64 = 0xffff_8000_0000_0000;
 static ELF: &[u8] = include_bytes!(env!("MBOOT_SYSTEM_ELF"));
-
-#[repr(C, align(4096))]
-struct Ram(UnsafeCell<[u8; RAM_BYTES]>);
-// SAFETY: One fixture CPU owns this stopped guest's stable RAM. EL1 execution
-// is synchronous, and no Rust reference to its contents survives guest entry.
-unsafe impl Sync for Ram {}
-static RAM: Ram = Ram(UnsafeCell::new([0; RAM_BYTES]));
-static mut ROOT: Root = Root([const { PageTable::zeroed() }; 16]);
-static mut TABLES: [PageTable; 32] = [const { PageTable::zeroed() }; 32];
-
-// SAFETY: The bounded UnsafeCell storage is private and disjoint from the
-// immutable ELF, EL2 code, Stage-2 tables and every earlier fixture guest.
-unsafe impl ImageMemory for Ram {
-    fn guest_memory_size(&self) -> u64 {
-        RAM_BYTES as u64
-    }
-    fn guest_host_address(&self, address: u64, length: u64) -> Option<u64> {
-        (address.checked_add(length)? <= RAM_BYTES as u64).then(|| self.0.get() as u64 + address)
-    }
-}
 
 fn u64_at(bytes: &[u8], index: usize) -> u64 {
     u64::from_le_bytes(bytes[index..index + 8].try_into().expect("ELF u64"))
@@ -41,10 +20,14 @@ fn u16_at(bytes: &[u8], index: usize) -> usize {
     u16::from_le_bytes(bytes[index..index + 2].try_into().expect("ELF u16")) as usize
 }
 
-pub(super) fn run(config: Config) {
+pub(super) fn run(config: Config, pool: &pages::PagePool) {
     emit("System Domain real ELF bootstrap entered\n");
+    let ram = pool
+        .allocate(RAM_BYTES as u64 / PAGE_SIZE, PAGE_SIZE)
+        .expect("System RAM");
+    let mut tables = native_memory::Tables::<32>::new(pool, config).expect("System tables");
     // SAFETY: Only this stopped guest's private RAM is writable by the loader.
-    let loaded = unsafe { image::load_elf(ELF, &RAM) }.expect("native System ELF");
+    let loaded = unsafe { image::load_elf(ELF, &ram) }.expect("native System ELF");
     check(
         loaded.entry() == 0x10000 && loaded.loaded_end() < RAM_BYTES as u64 - 0x41000,
         "System image layout does not fit fixture RAM",
@@ -69,23 +52,17 @@ pub(super) fn run(config: Config) {
     // The declared module range is intentionally not a runnable boot module;
     // this probe stops at Ready, before mnu can try to consume module bytes.
     unsafe {
-        (RAM.guest_host_address(BOOT_INFO, core::mem::size_of::<DomainBootInfo>() as u64)
+        (ram.guest_host_address(BOOT_INFO, core::mem::size_of::<DomainBootInfo>() as u64)
             .expect("boot metadata RAM") as *mut DomainBootInfo)
             .write(info);
     }
-    let root = addr_of!(ROOT) as u64;
-    let mut pool = Pool {
-        base: addr_of!(TABLES) as u64,
-        roots: [root, root],
-        used: [false; 32],
-        budget: usize::MAX,
-    };
+    let root = tables.root();
     // SAFETY: Separate root/pool, new VMID, no device assignment or DMA.
-    let mut mapper = unsafe { Mapper::new(&mut pool, root, config, 3).expect("System root") };
+    let mut mapper = unsafe { Mapper::new(&mut tables, root, config, 3).expect("System root") };
     select(&mapper);
     for address in (0..RAM_BYTES as u64).step_by(4096) {
-        let physical = RAM
-            .guest_host_address(address, 4096)
+        let physical = ram
+            .physical_address(address, 4096)
             .expect("System RAM page");
         unsafe {
             mapper

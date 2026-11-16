@@ -13,7 +13,15 @@ mod vcpu;
 #[path = "../src/arch/aarch64/vgic.rs"]
 mod vgic;
 #[cfg(feature = "arm-diagnostics")]
-use mboot::arch::aarch64::{firmware, stage2, vcpu, vgic};
+use mboot::arch::aarch64::{firmware, memory as native_memory, stage2, vcpu, vgic};
+#[cfg(not(feature = "arm-diagnostics"))]
+#[path = "../src/arch/aarch64/memory.rs"]
+mod native_memory;
+#[cfg(feature = "arm-diagnostics")]
+use mboot::pages;
+#[cfg(not(feature = "arm-diagnostics"))]
+#[path = "../src/pages.rs"]
+mod pages;
 #[cfg(feature = "arm-diagnostics")]
 use mboot::fdt;
 #[cfg(not(feature = "arm-diagnostics"))]
@@ -27,16 +35,19 @@ mod vcpu_probe;
 #[path = "vgic-probe.rs"]
 mod vgic_probe;
 
-#[cfg(all(system_domain_probe, not(feature = "arm-diagnostics")))]
+#[cfg(not(feature = "arm-diagnostics"))]
 #[path = "../src/error.rs"]
 mod native_error;
-#[cfg(all(system_domain_probe, not(feature = "arm-diagnostics")))]
+#[cfg(not(feature = "arm-diagnostics"))]
 pub use native_error::Error;
-#[cfg(all(system_domain_probe, not(feature = "arm-diagnostics")))]
+#[cfg(not(feature = "arm-diagnostics"))]
 #[path = "../src/image.rs"]
 mod image;
-#[cfg(all(system_domain_probe, feature = "arm-diagnostics"))]
+#[cfg(feature = "arm-diagnostics")]
 use mboot::image;
+#[cfg(feature = "arm-diagnostics")]
+#[path = "owned-memory-probe.rs"]
+mod owned_memory_probe;
 #[cfg(system_domain_probe)]
 #[path = "system-domain-probe.rs"]
 mod system_domain_probe;
@@ -422,7 +433,7 @@ fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
     unexpected()
 }
 
-fn select(mapper: &Mapper<'_, Pool>) {
+fn select<M: TableMemory>(mapper: &Mapper<'_, M>) {
     // SAFETY: Single CPU, no guest running; stop Stage-1 speculative walks
     // with valid 4K controls before the production VMID switch.
     unsafe {
@@ -485,7 +496,7 @@ fn map_basics(mapper: &mut Mapper<'_, Pool>, data: u64) {
     }
 }
 
-fn map_fixture_code(mapper: &mut Mapper<'_, Pool>) {
+fn map_fixture_code<M: TableMemory>(mapper: &mut Mapper<'_, M>) {
     let start = addr_of!(__guest_start) as u64;
     for offset in (0..addr_of!(__guest_end) as u64 - start).step_by(4096) {
         // SAFETY: Explicitly shared, immutable code-only fixture pages. The
@@ -553,6 +564,12 @@ extern "C" fn probe_main(dtb: u64) -> ! {
     }
     emit("Real PSCI / unavailable SMCCC workaround propagation PASS\n");
     let native = Config::detect().expect("CPU features");
+    // SAFETY: The trusted reference boot describes this exclusive RAM. The
+    // complete EL2 image/stack, firmware reservations and actual DTB were
+    // excluded above. No other allocator, guest or DMA accesses these pages;
+    // this fixture's EL2 uses the real identity CPU mapping with caches off.
+    let owned_pages = unsafe { pages::PagePool::claim(&plan, 1u64 << native.physical_bits(), 0) }
+        .expect("claim admitted boot RAM");
     // Exercise concatenation even when this CPU exposes a wider PA range.
     let features: u64;
     unsafe {
@@ -742,8 +759,10 @@ extern "C" fn probe_main(dtb: u64) -> ! {
     emit("Stage-2 supported starting levels PASS\n");
     vcpu_probe::run(config);
     vgic_probe::run(config);
+    #[cfg(feature = "arm-diagnostics")]
+    owned_memory_probe::run(config, &owned_pages);
     #[cfg(system_domain_probe)]
-    system_domain_probe::run(config);
+    system_domain_probe::run(config, &owned_pages);
     emit("STAGE2 PASS aarch64\n");
     finish(0)
 }
