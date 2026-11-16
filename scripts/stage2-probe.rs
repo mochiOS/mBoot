@@ -564,6 +564,17 @@ extern "C" fn probe_main(dtb: u64) -> ! {
     }
     emit("Real PSCI / unavailable SMCCC workaround propagation PASS\n");
     let native = Config::detect().expect("CPU features");
+    let gic = fdt::gic::GicV2::from_fdt(&tree).expect("primary GICv2 firmware binding");
+    let virtualized = gic.virtualization.expect("declared GICH and GICV banks");
+    for bank in [gic.distributor, gic.cpu, virtualized.control, virtualized.cpu] {
+        check(
+            bank.start() != 0 && bank.start() & (PAGE_SIZE - 1) == 0
+                && bank.size() >= PAGE_SIZE && bank.end() <= 1u64 << native.physical_bits()
+                && memory.ram().iter().all(|ram| bank.end() <= ram.start() || ram.end() <= bank.start()),
+            "GIC bank is unaligned, outside physical space or aliases boot RAM",
+        );
+    }
+    emit("Real boot GICv2 / translated physical bank binding PASS\n");
     // SAFETY: The trusted reference boot describes this exclusive RAM. The
     // complete EL2 image/stack, firmware reservations and actual DTB were
     // excluded above. No other allocator, guest or DMA accesses these pages;
@@ -758,7 +769,9 @@ extern "C" fn probe_main(dtb: u64) -> ! {
     }
     emit("Stage-2 supported starting levels PASS\n");
     vcpu_probe::run(config);
-    vgic_probe::run(config);
+    // SAFETY: The fixed trusted reference boot owns the declared banks; no
+    // devices or other CPUs/DMA use them, and all guests are stopped here.
+    unsafe { vgic_probe::run(config, gic) };
     #[cfg(feature = "arm-diagnostics")]
     owned_memory_probe::run(config, &owned_pages);
     #[cfg(system_domain_probe)]

@@ -1,10 +1,9 @@
 //! Real GICH/GICV execution with active IRQs retained across vCPU switches.
-//! Board discovery is fixed here only. No physical Distributor is guest-mapped.
+//! Bank addresses come from the admitted boot DTB. No physical Distributor
+//! or GICH control bank is guest-mapped.
 use super::*;
 
 const GICV: u64 = 0x40000;
-const GICH_HOST: u64 = 0x0803_0000;
-const GICV_HOST: u64 = 0x0804_0000;
 static mut ROOT_IRQ_A: Root = Root([const { PageTable::zeroed() }; 16]);
 static mut ROOT_IRQ_B: Root = Root([const { PageTable::zeroed() }; 16]);
 static mut IRQ_TABLES: [PageTable; 32] = [const { PageTable::zeroed() }; 32];
@@ -77,7 +76,20 @@ fn active(guest: &vcpu::Vcpu, id: u16) {
     );
 }
 
-pub fn run(config: Config) {
+/// # Safety
+/// This trusted reference boot exclusively owns the described GIC banks on
+/// this CPU. Their actual Device mapping is identity, no other controller or
+/// DMA aliases them, and every guest is stopped. Discovery alone is not proof.
+pub unsafe fn run(config: Config, binding: fdt::gic::GicV2) {
+    let virtualized = binding
+        .virtualization
+        .expect("declared virtualization banks");
+    let gich_host = virtualized.control.start();
+    let gicv_host = virtualized.cpu.start();
+    check(
+        virtualized.control.size() >= PAGE_SIZE && virtualized.cpu.size() >= 2 * PAGE_SIZE,
+        "GIC virtualization banks too short",
+    );
     emit("Native virtual GIC entered\n");
     let roots = [addr_of!(ROOT_IRQ_A) as u64, addr_of!(ROOT_IRQ_B) as u64];
     let stacks = [addr_of!(STACK_IRQ_A) as u64, addr_of!(STACK_IRQ_B) as u64];
@@ -105,7 +117,7 @@ pub fn run(config: Config) {
                 mapper
                     .map_page(
                         GICV + offset,
-                        GICV_HOST + offset,
+                        gicv_host + offset,
                         Access {
                             writable: true,
                             executable: false,
@@ -117,11 +129,13 @@ pub fn run(config: Config) {
         }
         guests[i] = Some(guest);
     }
-    // SAFETY: Fixed fixture owns this CPU's GICH; EL2-only and Device memory.
-    let mut controller = unsafe { vgic::Controller::new(GICH_HOST, 4096).expect("GICH admission") };
+    // SAFETY: Caller admitted exclusive ownership of this CPU's GICH mapping.
+    let mut controller = unsafe {
+        vgic::Controller::new(gich_host, virtualized.control.size()).expect("GICH admission")
+    };
     // BPR/ABPR have architecturally required implementation minima; writing
     // zero does not imply that these two fields read back as zero.
-    let reset_vmcr = unsafe { read_volatile((GICH_HOST + 8) as *const u32) };
+    let reset_vmcr = unsafe { read_volatile((gich_host + 8) as *const u32) };
     for i in 0..2 {
         let guest = guests[i].as_mut().unwrap();
         check(
@@ -194,21 +208,21 @@ pub fn run(config: Config) {
             // physical GICH bank before another Domain is selected.
             unsafe {
                 check(
-                    read_volatile(GICH_HOST as *const u32) == 0,
+                    read_volatile(gich_host as *const u32) == 0,
                     "GICH left enabled",
                 );
                 check(
-                    read_volatile((GICH_HOST + 0xf0) as *const u32) == 0,
+                    read_volatile((gich_host + 0xf0) as *const u32) == 0,
                     "active priority leaked",
                 );
                 check(
-                    read_volatile((GICH_HOST + 8) as *const u32) == reset_vmcr,
+                    read_volatile((gich_host + 8) as *const u32) == reset_vmcr,
                     "VMCR leaked",
                 );
-                let count = (read_volatile((GICH_HOST + 4) as *const u32) & 63) + 1;
+                let count = (read_volatile((gich_host + 4) as *const u32) & 63) + 1;
                 for slot in 0..count {
                     check(
-                        read_volatile((GICH_HOST + 0x100 + u64::from(slot) * 4) as *const u32) == 0,
+                        read_volatile((gich_host + 0x100 + u64::from(slot) * 4) as *const u32) == 0,
                         "virtual list register leaked",
                     );
                 }
@@ -243,7 +257,7 @@ pub fn run(config: Config) {
         "SGI EOI token lost",
     );
     // The guest's map must not expose the physical Distributor or GICH.
-    for private in [0x0800_0000, GICH_HOST] {
+    for private in [binding.distributor.start(), gich_host] {
         let mut denied = vcpu::Vcpu::new(&mapper, guest_address(guest_read), private, 0).unwrap();
         let exit = unsafe { denied.run(&mapper).unwrap() };
         abort(
@@ -261,7 +275,7 @@ pub fn run(config: Config) {
     }
     let mut full = vcpu::Vcpu::new(&mapper, guest_address(guest_irq_entry), 0, 0).unwrap();
     full.configure_interrupts(&controller).unwrap();
-    let count = unsafe { read_volatile((GICH_HOST + 4) as *const u32) & 63 } as u16 + 1;
+    let count = unsafe { read_volatile((gich_host + 4) as *const u32) & 63 } as u16 + 1;
     for id in 64..64 + count {
         full.inject_edge(id, 0x40, None).unwrap();
     }
