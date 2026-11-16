@@ -97,6 +97,13 @@ guest_vcpu_debug:
 guest_vcpu_id:
     mrs x0, id_aa64pfr0_el1
     hvc #0
+    .global guest_vcpu_mmio
+guest_vcpu_mmio:
+    mov x1, #0x40000
+    ldr w0, [x1]
+    str w0, [x1, #4]
+    ldrsb x0, [x1, #8]
+    hvc #0
     .section .text
 "#
 );
@@ -106,6 +113,7 @@ unsafe extern "C" {
     fn guest_vcpu_smc();
     fn guest_vcpu_debug();
     fn guest_vcpu_id();
+    fn guest_vcpu_mmio();
 }
 
 fn guest_address(entry: unsafe extern "C" fn()) -> u64 {
@@ -303,5 +311,35 @@ pub fn run(config: Config) {
             );
         }
     }
+    let mapper = unsafe { Mapper::new(&mut pool, roots[0], config, 4).unwrap() };
+    select(&mapper);
+    let mut mmio = Vcpu::new(&mapper, guest_address(guest_vcpu_mmio), 0, 0).unwrap();
+    for (address, size, write, value) in [
+        (0x40000, 4, false, 0x80000001),
+        (0x40004, 4, true, 0),
+        (0x40008, 1, false, 0x80),
+    ] {
+        // SAFETY: Same private reference code, scalar accesses to an unmapped
+        // test register range. No physical MMIO/device is exposed or accessed.
+        unsafe { mmio.run(&mapper).unwrap() };
+        let access = mmio.mmio_access().expect("scalar device fault decoding");
+        check(
+            access.address == address && access.size == size && access.write == write,
+            "MMIO decoded the wrong address/width/direction",
+        );
+        if write {
+            check(access.value == 0x80000001, "MMIO lost the store source");
+        }
+        mmio.complete_mmio(value).unwrap();
+        check(mmio.complete_mmio(value).is_err(), "MMIO completed twice");
+    }
+    let exit = unsafe { mmio.run(&mapper).unwrap() };
+    check(
+        exit.esr >> 26 == 0x16
+            && mmio.register(0) == Some(0xffff_ffff_ffff_ff80)
+            && mmio.mmio_access().is_none(),
+        "MMIO sign extension or PC continuation",
+    );
+    emit("Native scalar MMIO decoding / completion / sign extension PASS\n");
     emit("Native vCPU GPR/SIMD/TLS/EL1/timer isolation and resume PASS\n");
 }

@@ -77,6 +77,16 @@ pub struct SystemRegister {
     pub op2: u8,
 }
 
+/// Decoded scalar device access, not permission to touch the described IPA.
+/// The resource owner must route it to an assigned emulated register bank.
+#[derive(Clone, Copy, Debug)]
+pub struct MmioAccess {
+    pub address: u64,
+    pub size: u8,
+    pub write: bool,
+    pub value: u64,
+}
+
 #[repr(C, align(16))]
 struct Registers {
     x: [u64; 31],
@@ -275,18 +285,26 @@ impl Vcpu {
     /// EL2's physical timer drives exits independently of guest cooperation;
     /// the physical CNTV PPI stays disabled, so it cannot cause an IRQ storm.
     pub fn synchronize_virtual_timer(&mut self, interrupt: u16) -> Result<(), Error> {
+        if !(16..32).contains(&interrupt) {
+            return Err(Error::InvalidState);
+        }
+        let expired = self.virtual_timer_level()?;
+        self.interrupts
+            .set_level(interrupt, 0x40, expired)
+            .map_err(Error::Interrupts)
+    }
+
+    pub(super) fn virtual_timer_level(&self) -> Result<bool, Error> {
         require_host()?;
         if hardware_id() != self.owner {
             return Err(Error::WrongCpu);
         }
-        if !(16..32).contains(&interrupt) {
-            return Err(Error::InvalidState);
-        }
-        let expired = self.timer_control & 3 == 1
-            && super::irq::now().wrapping_sub(self.timer_compare) <= i64::MAX as u64;
-        self.interrupts
-            .set_level(interrupt, 0x40, expired)
-            .map_err(Error::Interrupts)
+        Ok(self.timer_control & 3 == 1
+            && super::irq::now().wrapping_sub(self.timer_compare) <= i64::MAX as u64)
+    }
+
+    pub(super) fn interrupt_state(&mut self) -> &mut vgic::State {
+        &mut self.interrupts
     }
 
     /// Complete an intercepted AArch64 WFI/WFE after its owner selected when
@@ -305,6 +323,78 @@ impl Vcpu {
             .pc
             .checked_add(4)
             .ok_or(Error::InvalidState)?;
+        self.registers.esr = 0;
+        Ok(())
+    }
+
+    /// Decode only valid AArch64 scalar Stage-2 translation/permission faults.
+    /// Table walks, invalid FAR/ISS, cache operations and unaligned/cross-page
+    /// accesses must take their normal fault path, not device emulation.
+    pub fn mmio_access(&self) -> Option<MmioAccess> {
+        let esr = self.registers.esr;
+        if !self.valid
+            || self.registers.kind != ExitKind::Synchronous as u64
+            || esr >> 26 != 0x24
+            || esr & (3 << 24) != 3 << 24
+            || esr & ((1 << 10) | (1 << 9) | (1 << 8) | (1 << 7)) != 0
+            || !matches!((esr & 63) >> 2, 1 | 3)
+        {
+            return None;
+        }
+        const FIPA: u64 = 0x0000_00ff_ffff_fff0;
+        if self.registers.hpfar & !FIPA != 0 {
+            return None;
+        }
+        let address = ((self.registers.hpfar & FIPA) << 8) | (self.registers.far & 4095);
+        let size = 1u8 << ((esr >> 22) & 3);
+        if address & u64::from(size - 1) != 0 || size == 8 && esr & (1 << 15) == 0 {
+            return None;
+        }
+        let write = esr & (1 << 6) != 0;
+        if write && esr & (1 << 21) != 0 {
+            return None;
+        }
+        let register = ((esr >> 16) & 31) as usize;
+        let value = if register == 31 {
+            0
+        } else {
+            self.registers.x[register]
+        };
+        let mask = u64::MAX >> (64 - size * 8);
+        Some(MmioAccess {
+            address,
+            size,
+            write,
+            value: value & mask,
+        })
+    }
+
+    /// Complete a resource owner's emulation of the current decoded access.
+    /// Store completion does not change GPRs; load sign/zero extension follows
+    /// the hardware ISS. An unrelated or already completed trap is rejected.
+    pub fn complete_mmio(&mut self, value: u64) -> Result<(), Error> {
+        let access = self.mmio_access().ok_or(Error::InvalidState)?;
+        let next = self
+            .registers
+            .pc
+            .checked_add(4)
+            .ok_or(Error::InvalidState)?;
+        if !access.write {
+            let esr = self.registers.esr;
+            let register = ((esr >> 16) & 31) as usize;
+            let shift = 64 - access.size * 8;
+            let mut result = (value << shift) >> shift;
+            if esr & (1 << 21) != 0 {
+                result = (((result << shift) as i64) >> shift) as u64;
+            }
+            if esr & (1 << 15) == 0 {
+                result = u64::from(result as u32);
+            }
+            if register != 31 {
+                self.registers.x[register] = result;
+            }
+        }
+        self.registers.pc = next;
         self.registers.esr = 0;
         Ok(())
     }

@@ -5,6 +5,9 @@ use core::arch::asm;
 use core::marker::PhantomData;
 use core::ptr::{read_volatile, write_volatile};
 
+#[path = "vgic/distributor.rs"]
+pub mod distributor;
+
 const HCR: usize = 0;
 const VTR: usize = 4;
 const VMCR: usize = 8;
