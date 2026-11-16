@@ -33,6 +33,8 @@ def main():
     parser.add_argument("--out", type=Path, default=MBOOT / "out/mdp/stage2")
     parser.add_argument("--system-elf", type=Path,
                         help="also enter a real native System Domain ELF through its Ready HVC")
+    parser.add_argument("--boot-module", type=Path,
+                        help="continue the System Domain with a real selected boot module")
     parser.add_argument("--abi-rlib", type=Path,
                         help="matching AArch64 mnu-abi rlib for --system-elf without --production-library")
     parser.add_argument("--production-library", action="store_true",
@@ -52,6 +54,10 @@ def main():
              "-C", f"link-arg=-T{MBOOT / 'scripts/stage2-probe.ld'}",
              str(MBOOT / "scripts/stage2-probe.rs"), "-o", str(binary)]
         environment = dict(os.environ)
+        if args.boot_module:
+            if not args.system_elf or not args.production_library or args.cpu != "cortex-a53":
+                raise RuntimeError("--boot-module requires --system-elf, --production-library and cortex-a53")
+            environment["MBOOT_SYSTEM_MODULE"] = str(args.boot_module.resolve(strict=True))
         if args.system_elf:
             if not args.abi_rlib and not args.production_library:
                 raise RuntimeError("--system-elf requires --abi-rlib from the same toolchain")
@@ -69,6 +75,8 @@ def main():
                      "-C", f"link-arg=-T{MBOOT / 'scripts/stage2-probe.ld'}"]
             if args.system_elf:
                 build += ["--cfg", "system_domain_probe"]
+            if args.boot_module:
+                build += ["--cfg", "system_domain_boot"]
             environment.update(CARGO_INCREMENTAL="0", CARGO_PROFILE_DEV_DEBUG="0",
                                CARGO_PROFILE_DEV_OPT_LEVEL="2")
             environment.setdefault("CARGO_BUILD_JOBS", "2")
@@ -89,7 +97,7 @@ def main():
         run([str(objcopy), "-O", "binary", str(binary), str(image)],
             out / "image.log", 30, env=environment)
         run([str(Path(qemu).resolve()), "-machine", "virt-8.2,virtualization=on,gic-version=2",
-             "-cpu", args.cpu, "-accel", "tcg", "-m", "128M", "-smp", "1",
+             "-cpu", args.cpu, "-accel", "tcg", "-m", "512M" if args.boot_module else "128M", "-smp", "1",
              "-display", "none", "-monitor", "none", "-nic", "none", "-serial", "stdio",
              "-no-reboot", "-kernel", str(image), "-semihosting-config", "enable=on,target=native"],
             out / "run.log", 15, env=dict(os.environ, TMPDIR=str(out)), marker="STAGE2 PASS aarch64")

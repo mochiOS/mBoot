@@ -12,8 +12,13 @@ mod vcpu;
 #[cfg(not(feature = "arm-diagnostics"))]
 #[path = "../src/arch/aarch64/vgic.rs"]
 mod vgic;
+#[cfg(not(feature = "arm-diagnostics"))]
+#[path = "../src/arch/aarch64/irq.rs"]
+mod irq;
 #[cfg(feature = "arm-diagnostics")]
 use mboot::arch::aarch64::{firmware, memory as native_memory, stage2, vcpu, vgic};
+#[cfg(all(feature = "arm-diagnostics", system_domain_boot))]
+use mboot::arch::aarch64::irq;
 #[cfg(not(feature = "arm-diagnostics"))]
 #[path = "../src/arch/aarch64/memory.rs"]
 mod native_memory;
@@ -57,6 +62,8 @@ use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use stage2::{Access, Config, Error as Stage2Error, Mapper, MemoryType, PageTable, TableMemory, PAGE_SIZE};
 
 const CODE: u64 = 0x10000;
+const FIXTURE_RAM_END: u64 = 0x4000_0000
+    + if cfg!(system_domain_boot) { 512 } else { 128 } * 1024 * 1024;
 const STACK: u64 = 0x20000;
 const DATA: u64 = 0x30000;
 const READ_ONLY: Access = Access {
@@ -405,6 +412,18 @@ fn emit(message: &str) {
         }
     }
 }
+
+fn report(arguments: core::fmt::Arguments<'_>) {
+    use core::fmt::Write;
+    struct Output;
+    impl Write for Output {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            emit(text);
+            Ok(())
+        }
+    }
+    let _ = Output.write_fmt(arguments);
+}
 fn finish(code: u64) -> ! {
     let args = [0x20026u64, code];
     // SAFETY: Runner enables semihosting for this CPU fixture only.
@@ -426,11 +445,21 @@ fn check(ok: bool, message: &str) {
 #[unsafe(no_mangle)]
 extern "C" fn unexpected() -> ! {
     emit("STAGE2 FAIL: unexpected EL2 exception\n");
+    let esr: u64;
+    let pc: u64;
+    let address: u64;
+    // SAFETY: This diagnostic vector runs at EL2 with exceptions masked.
+    unsafe {
+        asm!("mrs {}, esr_el2", "mrs {}, elr_el2", "mrs {}, far_el2",
+            out(reg) esr, out(reg) pc, out(reg) address, options(nomem, nostack));
+    }
+    report(format_args!("ESR={:#x} PC={:#x} FAR={:#x}\n", esr, pc, address));
     finish(1)
 }
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
-    unexpected()
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    report(format_args!("STAGE2 FAIL: {info}\n"));
+    finish(1)
 }
 
 fn select<M: TableMemory>(mapper: &Mapper<'_, M>) {
@@ -512,12 +541,12 @@ extern "C" fn probe_main(dtb: u64) -> ! {
     emit("Linked production mBoot library\n");
     // QEMU's direct boot contract supplies the DTB in x0. Bound both reads in
     // this fixed machine's RAM before constructing the immutable borrowed view.
-    check(dtb & 7 == 0 && (0x4000_0000..=0x4800_0000 - 40).contains(&dtb),
+    check(dtb & 7 == 0 && (0x4000_0000..=FIXTURE_RAM_END - 40).contains(&dtb),
         "firmware DTB header outside fixture RAM");
     // SAFETY: This header lies in pinned firmware RAM and no guest maps it.
     let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 40) };
     let size = u32::from_be_bytes(header[4..8].try_into().unwrap()) as u64;
-    check(size >= 40 && size <= 0x4800_0000 - dtb, "firmware DTB outside fixture RAM");
+    check(size >= 40 && size <= FIXTURE_RAM_END - dtb, "firmware DTB outside fixture RAM");
     // SAFETY: The complete DTB range is bounded above, unchanged by the fixture
     // and disjoint from every guest's private RAM and table storage.
     let blob = unsafe { core::slice::from_raw_parts(dtb as *const u8, size as usize) };
@@ -775,7 +804,7 @@ extern "C" fn probe_main(dtb: u64) -> ! {
     #[cfg(feature = "arm-diagnostics")]
     owned_memory_probe::run(config, &owned_pages);
     #[cfg(system_domain_probe)]
-    system_domain_probe::run(config, &owned_pages);
+    system_domain_probe::run(config, &owned_pages, &tree, gic);
     emit("STAGE2 PASS aarch64\n");
     finish(0)
 }
