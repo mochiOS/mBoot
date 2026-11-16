@@ -249,48 +249,9 @@ fn string_list_contains(bytes: &[u8], needle: &[u8]) -> Result<bool, Error> {
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use super::super::tests::{blob, words};
+    use super::super::tests::Tree;
     use super::*;
     use std::vec::Vec;
-
-    struct Tree {
-        structure: Vec<u8>,
-        strings: Vec<u8>,
-    }
-    impl Tree {
-        fn new() -> Self {
-            Self {
-                structure: Vec::new(),
-                strings: Vec::new(),
-            }
-        }
-        fn begin(&mut self, name: &str) {
-            self.structure.extend(words(&[1]));
-            self.structure.extend(name.bytes());
-            self.structure.push(0);
-            while self.structure.len() % 4 != 0 {
-                self.structure.push(0);
-            }
-        }
-        fn end(&mut self) {
-            self.structure.extend(words(&[2]));
-        }
-        fn property(&mut self, name: &str, value: &[u8]) {
-            let offset = self.strings.len() as u32;
-            self.strings.extend(name.bytes());
-            self.strings.push(0);
-            self.structure
-                .extend(words(&[3, value.len() as u32, offset]));
-            self.structure.extend_from_slice(value);
-            while self.structure.len() % 4 != 0 {
-                self.structure.push(0);
-            }
-        }
-        fn finish(mut self) -> Vec<u8> {
-            self.structure.extend(words(&[9]));
-            blob(&self.structure, &self.strings)
-        }
-    }
 
     fn sample(ids: &[u64], cells: u32, conduit: &[u8], disabled_last: bool) -> Vec<u8> {
         let mut tree = Tree::new();

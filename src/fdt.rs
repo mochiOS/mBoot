@@ -4,6 +4,8 @@
 
 #[path = "fdt/arm64.rs"]
 pub mod arm64;
+#[path = "fdt/memory.rs"]
+pub mod memory;
 
 const HEADER_SIZE: usize = 40;
 const MAX_DEPTH: usize = 64;
@@ -308,6 +310,45 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
+
+    pub(super) struct Tree {
+        structure: Vec<u8>,
+        strings: Vec<u8>,
+    }
+    impl Tree {
+        pub(super) fn new() -> Self {
+            Self {
+                structure: Vec::new(),
+                strings: Vec::new(),
+            }
+        }
+        pub(super) fn begin(&mut self, name: &str) {
+            self.structure.extend(words(&[1]));
+            self.structure.extend(name.bytes());
+            self.structure.push(0);
+            while self.structure.len() % 4 != 0 {
+                self.structure.push(0);
+            }
+        }
+        pub(super) fn end(&mut self) {
+            self.structure.extend(words(&[2]));
+        }
+        pub(super) fn property(&mut self, name: &str, value: &[u8]) {
+            let offset = self.strings.len() as u32;
+            self.strings.extend(name.bytes());
+            self.strings.push(0);
+            self.structure
+                .extend(words(&[3, value.len() as u32, offset]));
+            self.structure.extend_from_slice(value);
+            while self.structure.len() % 4 != 0 {
+                self.structure.push(0);
+            }
+        }
+        pub(super) fn finish(mut self) -> Vec<u8> {
+            self.structure.extend(words(&[9]));
+            blob(&self.structure, &self.strings)
+        }
+    }
 
     fn put_word(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
