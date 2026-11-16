@@ -379,6 +379,8 @@ unsafe extern "C" {
     fn guest_execute();
     static __guest_start: u8;
     static __guest_end: u8;
+    static __image_start: u8;
+    static __stack_top: u8;
 }
 
 fn emit(message: &str) {
@@ -517,6 +519,27 @@ extern "C" fn probe_main(dtb: u64) -> ! {
         && topology.psci_conduit() == Some(fdt::arm64::Conduit::Smc),
         "actual firmware CPU / conduit does not match reference machine");
     emit("Real boot DTB / physical CPU affinity / SMC binding PASS\n");
+    let mut memory = fdt::memory::MemoryMap::from_fdt(&tree).expect("firmware RAM map");
+    let image_start = addr_of!(__image_start) as u64;
+    let image_end = addr_of!(__stack_top) as u64;
+    let image = fdt::memory::Region::new(image_start, image_end - image_start).unwrap();
+    let dtb_region = fdt::memory::Region::new(dtb, size).unwrap();
+    for region in [image, dtb_region] {
+        check(memory.ram().iter().any(|ram| ram.start() <= region.start()
+            && region.end() <= ram.end()), "live boot object outside declared RAM");
+        memory.reserve(region).expect("exclude live boot RAM");
+    }
+    let plan = memory.plan_reservations().expect("dynamic boot reservation plan");
+    let mut pages = 0;
+    for region in plan.usable_pages().expect("resolved firmware RAM") {
+        for occupied in [image, dtb_region] {
+            check(region.end() <= occupied.start() || region.start() >= occupied.end(),
+                "firmware RAM plan exposed live EL2 state");
+        }
+        pages += region.size() / 4096;
+    }
+    check(pages > 0, "firmware has no free pages after boot reservations");
+    emit("Real boot RAM / reservation-aware page plan PASS\n");
     // SAFETY: This trusted virt-8.2 reference boot supplies both the standard
     // firmware contract and the actual SMC binding verified above. A guest DTB
     // or topology description alone would not grant this firmware authority.

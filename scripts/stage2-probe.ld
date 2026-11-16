@@ -1,6 +1,7 @@
 ENTRY(_start)
 SECTIONS {
     . = 0x40080000;
+    __image_start = .;
     .text : { KEEP(*(.text.entry)) *(.text .text.*) }
     .guest : ALIGN(4096) {
         __guest_start = .;
