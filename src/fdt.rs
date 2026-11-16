@@ -10,6 +10,8 @@ pub mod gic;
 pub mod memory;
 #[path = "fdt/timer.rs"]
 pub mod timer;
+#[path = "fdt/writer.rs"]
+pub mod writer;
 
 const HEADER_SIZE: usize = 40;
 const MAX_DEPTH: usize = 64;
