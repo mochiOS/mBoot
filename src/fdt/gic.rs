@@ -27,7 +27,7 @@ pub enum Trigger {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MaintenanceInterrupt {
+pub struct Ppi {
     /// Architectural INTID, including the PPI base of 16.
     pub id: u16,
     pub trigger: Trigger,
@@ -47,7 +47,7 @@ pub struct GicV2 {
     pub distributor: Region,
     pub cpu: Region,
     pub virtualization: Option<Virtualization>,
-    pub maintenance: Option<MaintenanceInterrupt>,
+    pub maintenance: Option<Ppi>,
 }
 
 impl GicV2 {
@@ -151,7 +151,7 @@ impl GicV2 {
             }
             regions[index] = Some(region);
         }
-        let maintenance = node.interrupts.map(maintenance).transpose()?;
+        let maintenance = node.interrupts.map(decode_ppi).transpose()?;
         if count == 2 && maintenance.is_some() {
             return Err(Error::UnsupportedController);
         }
@@ -168,7 +168,7 @@ impl GicV2 {
     }
 }
 
-pub(super) fn maintenance(bytes: &[u8]) -> Result<MaintenanceInterrupt, Error> {
+pub(super) fn decode_ppi(bytes: &[u8]) -> Result<Ppi, Error> {
     if bytes.len() != 12 || cell(&bytes[..4])? != 1 {
         return Err(Error::InvalidProperty);
     }
@@ -182,7 +182,7 @@ pub(super) fn maintenance(bytes: &[u8]) -> Result<MaintenanceInterrupt, Error> {
         4 => Trigger::HighLevel,
         _ => return Err(Error::InvalidProperty),
     };
-    Ok(MaintenanceInterrupt {
+    Ok(Ppi {
         id: 16 + number as u16,
         trigger,
         cpu_mask: (flags >> 8) as u8,
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(virtualized.cpu.start(), 0x1_2000_8000);
         assert_eq!(
             gic.maintenance,
-            Some(MaintenanceInterrupt {
+            Some(Ppi {
                 id: 25,
                 trigger: Trigger::HighLevel,
                 cpu_mask: 15,

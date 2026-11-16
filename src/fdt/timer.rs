@@ -4,8 +4,8 @@ use super::{gic, Fdt, Token};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Timers {
-    pub virtual_timer: gic::MaintenanceInterrupt,
-    pub hypervisor: gic::MaintenanceInterrupt,
+    pub virtual_timer: gic::Ppi,
+    pub hypervisor: gic::Ppi,
 }
 
 impl Timers {
@@ -64,15 +64,15 @@ impl Timers {
                     // Validate every declared timer, not just the chosen pair.
                     let mut used = 0u32;
                     for bytes in interrupts.chunks_exact(12) {
-                        let ppi = gic::maintenance(bytes)?;
+                        let ppi = gic::decode_ppi(bytes)?;
                         if ppi.trigger != gic::Trigger::HighLevel || used & (1 << ppi.id) != 0 {
                             return Err(gic::Error::InvalidProperty);
                         }
                         used |= 1 << ppi.id;
                     }
                     result = Some(Self {
-                        virtual_timer: gic::maintenance(&interrupts[virt * 12..virt * 12 + 12])?,
-                        hypervisor: gic::maintenance(&interrupts[hyp * 12..hyp * 12 + 12])?,
+                        virtual_timer: gic::decode_ppi(&interrupts[virt * 12..virt * 12 + 12])?,
+                        hypervisor: gic::decode_ppi(&interrupts[hyp * 12..hyp * 12 + 12])?,
                     });
                 }
                 _ => {}
