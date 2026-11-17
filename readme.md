@@ -68,6 +68,22 @@ make device-io-test MNU_DIR=/path/to/mnu
 
 `config/intel-hardware.toml`はIntel実機向け、`config/qemu.toml`は通常のDomain起動試験向けです。`config/qemu-device-io.toml`はPCI、DMA、IOMMU、MSI-Xの試験に使います。
 
+### ARM64の参照環境
+
+ARMのCPU・Stage-2・Domain実装はライブラリとして利用できます。製品のUEFI起動プログラムは現在もx86_64向けです。ARMの結合診断には`scripts/check-stage2.py`を使い、実際にビルドしたSystem ELF、最小initfs、mDriverのLinux Imageとinitramfsを明示します。
+
+```sh
+python3 scripts/check-stage2.py --production-library --cpu cortex-a53 \
+  --system-elf /path/to/mochios-system --boot-module /path/to/initfs.img \
+  --hardware-image /path/to/Image --hardware-initrd /path/to/initramfs.cpio.gz \
+  --hardware-boot-disk --firmware-ramfb --qemu-firmware-dir /usr/share/seabios \
+  --timeout 1800 --out /path/to/diagnostics
+```
+
+この構成は単一Cortex-A53のQEMU `virt-8.2`を使用します。`--hardware-boot-disk`は、実データ入りのディスクをinitramfsへ収録した明示的な診断構成専用です。製品インストール媒体や永続ストレージの代わりではありません。RAMFBとRTCは参照frontendがEL2に保持し、デバイス制御レジスタをゲストへ公開しません。物理GPU、入力、DMA隔離、対象タブレットでの動作は別途確認が必要です。
+
+ビルドとシリアルログは出力先に保持します。RAMFB使用時は`monitor-path.txt`にQMPソケットの場所を記録します。長時間のGUI確認は`--timeout`で明示し、Ctrl-Cで中断できます。中断やタイムアウト、Domain単体のReadyをOS起動成功とは判定しません。
+
 ## 起動時の表示
 
 mBootは画面とシリアルへ進行状況を出します。Intelでは`INTEL VMX`、AMDでは`AMD SVM`と表示します。mochiOS System Domainまで起動すると`MOCHIOS OK`、Hardware Domainの準備が終わると`Hardware OK`になります。

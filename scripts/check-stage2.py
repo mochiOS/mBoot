@@ -138,6 +138,8 @@ def main():
             command += ["-L", str(args.qemu_firmware_dir.resolve()), "-device", "ramfb",
                         "-qmp", f"unix:{monitor},server=on,wait=off"]
         run(command, out / "run.log", args.timeout, env=dict(os.environ, TMPDIR=str(out)), marker="STAGE2 PASS aarch64")
+    except KeyboardInterrupt:
+        parser.exit(130, f"ARM diagnostic interrupted; existing logs remain in {out}\n")
     except (OSError, RuntimeError) as error:
         parser.exit(1, f"Stage-2 check failed: {error}\n")
     print(f"aarch64 Stage-2 ({args.cpu}): PASS ({out / 'run.log'})")
