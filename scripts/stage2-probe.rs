@@ -17,7 +17,7 @@ mod vgic;
 mod irq;
 #[cfg(feature = "arm-diagnostics")]
 use mboot::arch::aarch64::{firmware, memory as native_memory, stage2, vcpu, vgic};
-#[cfg(all(feature = "arm-diagnostics", system_domain_boot))]
+#[cfg(all(feature = "arm-diagnostics", any(system_domain_boot, hardware_domain_probe)))]
 use mboot::arch::aarch64::irq;
 #[cfg(not(feature = "arm-diagnostics"))]
 #[path = "../src/arch/aarch64/memory.rs"]
@@ -56,6 +56,12 @@ mod owned_memory_probe;
 #[cfg(system_domain_probe)]
 #[path = "system-domain-probe.rs"]
 mod system_domain_probe;
+#[cfg(hardware_domain_probe)]
+#[path = "hardware-domain-probe.rs"]
+mod hardware_domain_probe;
+#[cfg(paired_domains)]
+#[path = "paired-domain-probe.rs"]
+mod paired_domain_probe;
 
 use core::arch::{asm, global_asm};
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
@@ -63,7 +69,7 @@ use stage2::{Access, Config, Error as Stage2Error, Mapper, MemoryType, PageTable
 
 const CODE: u64 = 0x10000;
 const FIXTURE_RAM_END: u64 = 0x4000_0000
-    + if cfg!(system_domain_boot) { 512 } else { 128 } * 1024 * 1024;
+    + if cfg!(any(system_domain_boot, hardware_domain_probe)) { 512 } else { 128 } * 1024 * 1024;
 const STACK: u64 = 0x20000;
 const DATA: u64 = 0x30000;
 const READ_ONLY: Access = Access {
@@ -650,6 +656,18 @@ extern "C" fn probe_main(dtb: u64) -> ! {
     select(&a);
     map_basics(&mut a, addr_of!(PAGE_A) as u64);
     read(DATA, 0xa11);
+    // SAFETY: Both fixture pages are retained and all guests are stopped.
+    check(unsafe { a.remap_page(DATA, addr_of!(PAGE_B) as u64 + 1, READ_WRITE) }
+        == Err(Stage2Error::InvalidAddress), "invalid replacement accepted");
+    read(DATA, 0xa11);
+    check(unsafe { a.remap_page(DATA, addr_of!(PAGE_B) as u64, READ_ONLY) }
+        == Ok(addr_of!(PAGE_A) as u64), "replacement lost old backing");
+    read(DATA, 0xb22);
+    abort(run(guest_write as *const () as u64, DATA), DATA, false, true, true);
+    check(unsafe { a.remap_page(DATA, addr_of!(PAGE_A) as u64, READ_WRITE) }
+        == Ok(addr_of!(PAGE_B) as u64), "owned backing restore failed");
+    read(DATA, 0xa11);
+    emit("Stage-2 backing replacement / invalid input / permission coherence PASS\n");
     // SAFETY: Same quiescent, selected and exclusively owned address space.
     unsafe {
         a.map_page(1 << 39, addr_of!(PAGE_B) as u64, READ_ONLY)
@@ -803,8 +821,12 @@ extern "C" fn probe_main(dtb: u64) -> ! {
     unsafe { vgic_probe::run(config, gic) };
     #[cfg(feature = "arm-diagnostics")]
     owned_memory_probe::run(config, &owned_pages);
-    #[cfg(system_domain_probe)]
+    #[cfg(all(hardware_domain_probe, not(paired_domains)))]
+    hardware_domain_probe::run(config, &owned_pages, &tree, gic);
+    #[cfg(all(system_domain_probe, not(paired_domains)))]
     system_domain_probe::run(config, &owned_pages, &tree, gic);
+    #[cfg(paired_domains)]
+    paired_domain_probe::run(config, &owned_pages, &tree, gic);
     emit("STAGE2 PASS aarch64\n");
     finish(0)
 }

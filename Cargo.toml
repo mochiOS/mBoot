@@ -40,7 +40,7 @@ sha2 = "0.10"
 
 [lints.rust]
 unused = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_domain_probe)", "cfg(system_domain_boot)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_domain_probe)", "cfg(system_domain_boot)", "cfg(hardware_domain_probe)", "cfg(paired_domains)"] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

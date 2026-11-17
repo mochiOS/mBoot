@@ -3,10 +3,20 @@
 //! execution. A diagnostic budget expiry is a failure, never OS boot success.
 use super::*;
 use image::ImageMemory;
-use mnu_abi::hypervisor::{self, DomainBootInfo, HypercallNumber};
+use mnu_abi::hypervisor::{self, DomainBootInfo};
+#[cfg(not(paired_domains))]
+use mnu_abi::hypervisor::HypercallNumber;
 
 const RAM_BYTES: usize = if cfg!(system_domain_boot) { 128 } else { 16 } * 1024 * 1024;
+const fn grant_bytes() -> u64 {
+    if cfg!(paired_domains) {
+        16 * 1024 * 1024
+    } else {
+        0x40000
+    }
+}
 const BOOT_INFO: u64 = 0x3000;
+#[cfg(not(paired_domains))]
 const UPPER: u64 = 0xffff_8000_0000_0000;
 static ELF: &[u8] = include_bytes!(env!("MBOOT_SYSTEM_ELF"));
 #[cfg(system_domain_boot)]
@@ -22,14 +32,20 @@ fn u16_at(bytes: &[u8], index: usize) -> usize {
     u16::from_le_bytes(bytes[index..index + 2].try_into().expect("ELF u16")) as usize
 }
 
-pub(super) fn run(
+pub(super) struct Prepared<'pool> {
+    pub ram: pages::Pages<'pool>,
+    pub tables: native_memory::Tables<'pool, 128>,
+    pub info: DomainBootInfo,
+    pub entry: u64,
+    pub loaded_end: u64,
+}
+
+pub(super) fn prepare<'pool>(
     config: Config,
-    pool: &pages::PagePool,
+    pool: &'pool pages::PagePool,
     tree: &fdt::Fdt<'_>,
     binding: fdt::gic::GicV2,
-) {
-    #[cfg(not(system_domain_boot))]
-    let _ = binding;
+) -> Prepared<'pool> {
     emit("System Domain real ELF bootstrap entered\n");
     let ram = pool
         .allocate(RAM_BYTES as u64 / PAGE_SIZE, PAGE_SIZE)
@@ -38,7 +54,7 @@ pub(super) fn run(
     // SAFETY: Only this stopped guest's private RAM is writable by the loader.
     let loaded = unsafe { image::load_elf(ELF, &ram) }.expect("native System ELF");
     check(
-        loaded.entry() == 0x10000 && loaded.loaded_end() < RAM_BYTES as u64 - 0x41000,
+        loaded.entry() == 0x10000 && loaded.loaded_end() < RAM_BYTES as u64 - grant_bytes() - 4096,
         "System image layout does not fit fixture RAM",
     );
     let mut info = DomainBootInfo::new(
@@ -47,10 +63,10 @@ pub(super) fn run(
         hypervisor::HYPERVISOR_BACKEND_ARM_EL2,
         hypervisor::DOMAIN_ROLE_SYSTEM,
         RAM_BYTES as u64,
-        RAM_BYTES as u64 - 0x41000,
+        RAM_BYTES as u64 - grant_bytes() - 4096,
         4096,
-        RAM_BYTES as u64 - 0x40000,
-        0x40000,
+        RAM_BYTES as u64 - grant_bytes(),
+        grant_bytes(),
         0x2000_0000,
         0x10000,
         0,
@@ -90,6 +106,13 @@ pub(super) fn run(
             | hypervisor::DOMAIN_FEATURE_EVENT_IRQ
             | hypervisor::DOMAIN_FEATURE_EVENT_POLL
             | hypervisor::DOMAIN_FEATURE_VIRTUAL_GIC;
+    }
+    #[cfg(paired_domains)]
+    {
+        info.feature_flags |= hypervisor::DOMAIN_FEATURE_WAIT
+            | hypervisor::DOMAIN_FEATURE_GRANT_TABLE
+            | hypervisor::DOMAIN_FEATURE_SHARED_RING
+            | hypervisor::DOMAIN_FEATURE_GRANT_QUERY;
     }
     check(info.validate().is_ok(), "native bootstrap metadata");
     // The declared module range is intentionally not a runnable boot module;
@@ -185,7 +208,36 @@ pub(super) fn run(
     // EL2's fixture has caching off; finish image publication and instruction
     // visibility before this memory is ever executed by EL1.
     unsafe { asm!("dsb sy", "ic iallu", "dsb sy", "isb", options(nostack)) };
-    match vcpu::Vcpu::new(&mapper, loaded.entry(), BOOT_INFO, 0) {
+    drop(mapper);
+    Prepared {
+        ram,
+        tables,
+        info,
+        entry: loaded.entry(),
+        loaded_end: loaded.loaded_end(),
+    }
+}
+
+#[cfg(not(paired_domains))]
+pub(super) fn run(
+    config: Config,
+    pool: &pages::PagePool,
+    tree: &fdt::Fdt<'_>,
+    binding: fdt::gic::GicV2,
+) {
+    let Prepared {
+        ram,
+        mut tables,
+        info,
+        entry,
+        loaded_end,
+    } = prepare(config, pool, tree, binding);
+    #[cfg(not(system_domain_boot))]
+    let _ = info;
+    let root = tables.root();
+    let mapper = unsafe { Mapper::new(&mut tables, root, config, 3).unwrap() };
+    select(&mapper);
+    match vcpu::Vcpu::new(&mapper, entry, BOOT_INFO, 0) {
         Ok(mut guest) => {
             #[cfg(system_domain_boot)]
             let mut runtime = {
@@ -286,7 +338,7 @@ pub(super) fn run(
         Err(vcpu::Error::UnsupportedCpu) => {
             // Still exercise bootstrap on CPUs whose extended bank the new
             // continuation does not support yet, using the original one-shot.
-            unsafe { enter_guest(loaded.entry(), 0, BOOT_INFO) };
+            unsafe { enter_guest(entry, 0, BOOT_INFO) };
             let exit = unsafe { read_volatile(addr_of!(LAST_EXIT)) };
             check(
                 exit.esr >> 26 == 0x16 && exit.value == HypercallNumber::Ready as u64,
@@ -306,11 +358,11 @@ pub(super) fn run(
         asm!("mrs {}, ttbr1_el1", out(reg) upper_root, options(nomem, nostack));
     }
     check(
-        pc >= UPPER + 0x200000 && pc < UPPER + loaded.loaded_end(),
+        pc >= UPPER + 0x200000 && pc < UPPER + loaded_end,
         "System PC is not retained in TTBR1",
     );
     check(
-        stack >= UPPER && stack < UPPER + loaded.loaded_end() && stack & 15 == 0,
+        stack >= UPPER && stack < UPPER + loaded_end && stack & 15 == 0,
         "System stack is not retained/aligned",
     );
     check(
@@ -318,13 +370,13 @@ pub(super) fn run(
         "System MMU/WXN is disabled",
     );
     check(
-        upper_root & !4095 < loaded.loaded_end(),
+        upper_root & !4095 < loaded_end,
         "System upper root is outside owned RAM",
     );
     emit("Real System ELF / Stage-2 / upper EL1 Ready PASS\n");
 }
 
-#[cfg(system_domain_boot)]
+#[cfg(all(system_domain_boot, not(paired_domains)))]
 struct BootRuntime {
     gic: vgic::Controller,
     physical: irq::Controller,
@@ -335,7 +387,7 @@ struct BootRuntime {
     physical_irqs: u64,
 }
 
-#[cfg(system_domain_boot)]
+#[cfg(all(system_domain_boot, not(paired_domains)))]
 impl BootRuntime {
     unsafe fn new(gic: fdt::gic::GicV2, timers: fdt::timer::Timers) -> Self {
         for ppi in [timers.virtual_timer, timers.hypervisor] {

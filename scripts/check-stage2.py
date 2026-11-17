@@ -35,6 +35,8 @@ def main():
                         help="also enter a real native System Domain ELF through its Ready HVC")
     parser.add_argument("--boot-module", type=Path,
                         help="continue the System Domain with a real selected boot module")
+    parser.add_argument("--hardware-image", type=Path, help="enter the actual ARM64 mDriver Linux Image")
+    parser.add_argument("--hardware-initrd", type=Path, help="actual mDriver initramfs for --hardware-image")
     parser.add_argument("--abi-rlib", type=Path,
                         help="matching AArch64 mnu-abi rlib for --system-elf without --production-library")
     parser.add_argument("--production-library", action="store_true",
@@ -54,6 +56,15 @@ def main():
              "-C", f"link-arg=-T{MBOOT / 'scripts/stage2-probe.ld'}",
              str(MBOOT / "scripts/stage2-probe.rs"), "-o", str(binary)]
         environment = dict(os.environ)
+        if args.hardware_image:
+            if not args.production_library or args.cpu != "cortex-a53" or not args.hardware_initrd:
+                raise RuntimeError("--hardware-image requires production-library, cortex-a53 and hardware-initrd")
+            if args.system_elf and not args.boot_module:
+                raise RuntimeError("paired Domains require a real boot-module")
+            environment["MBOOT_HARDWARE_IMAGE"] = str(args.hardware_image.resolve(strict=True))
+            environment["MBOOT_HARDWARE_INITRD"] = str(args.hardware_initrd.resolve(strict=True))
+        elif args.hardware_initrd:
+            raise RuntimeError("--hardware-initrd requires --hardware-image")
         if args.boot_module:
             if not args.system_elf or not args.production_library or args.cpu != "cortex-a53":
                 raise RuntimeError("--boot-module requires --system-elf, --production-library and cortex-a53")
@@ -77,6 +88,10 @@ def main():
                 build += ["--cfg", "system_domain_probe"]
             if args.boot_module:
                 build += ["--cfg", "system_domain_boot"]
+            if args.hardware_image:
+                build += ["--cfg", "hardware_domain_probe"]
+                if args.system_elf:
+                    build += ["--cfg", "paired_domains"]
             environment.update(CARGO_INCREMENTAL="0", CARGO_PROFILE_DEV_DEBUG="0",
                                CARGO_PROFILE_DEV_OPT_LEVEL="2")
             environment.setdefault("CARGO_BUILD_JOBS", "2")
@@ -97,7 +112,7 @@ def main():
         run([str(objcopy), "-O", "binary", str(binary), str(image)],
             out / "image.log", 30, env=environment)
         run([str(Path(qemu).resolve()), "-machine", "virt-8.2,virtualization=on,gic-version=2",
-             "-cpu", args.cpu, "-accel", "tcg", "-m", "512M" if args.boot_module else "128M", "-smp", "1",
+             "-cpu", args.cpu, "-accel", "tcg", "-m", "512M" if args.boot_module or args.hardware_image else "128M", "-smp", "1",
              "-display", "none", "-monitor", "none", "-nic", "none", "-serial", "stdio",
              "-no-reboot", "-kernel", str(image), "-semihosting-config", "enable=on,target=native"],
             out / "run.log", 15, env=dict(os.environ, TMPDIR=str(out)), marker="STAGE2 PASS aarch64")
