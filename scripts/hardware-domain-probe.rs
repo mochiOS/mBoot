@@ -5,7 +5,7 @@ use image::ImageMemory;
 #[cfg(not(paired_domains))]
 use mnu_abi::hypervisor::{self, HypercallNumber};
 
-pub(super) const RAM: u64 = 128 * 1024 * 1024;
+pub(super) const RAM: u64 = if cfg!(hardware_boot_disk) { 768 } else { 128 } * 1024 * 1024;
 const DTB: u64 = 0x10000;
 const INITRD: u64 = 32 * 1024 * 1024;
 pub(super) const GICD: u64 = 0x3000_0000;
@@ -39,10 +39,16 @@ fn description(bytes: &mut [u8], seed: [u8; 32]) -> usize {
     tree.begin("chosen").unwrap();
     tree.property(
         "bootargs",
-        b"mboot.text_console=1 loglevel=8 keep_bootcon panic=-1 pci=off nosmp rdinit=/init\0",
+        if cfg!(hardware_boot_disk) { b"mboot.text_console=1 loglevel=8 keep_bootcon panic=-1 nosmp rdinit=/init mboot.boot_ramdisk=1 ramdisk_size=262144\0" } else { b"mboot.text_console=1 loglevel=8 keep_bootcon panic=-1 nosmp rdinit=/init\0" },
     )
     .unwrap();
     tree.property("rng-seed", &seed).unwrap();
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"mBoot guest KASLR seed v1\0");
+    hash.update(seed);
+    let kaslr = hash.finalize();
+    tree.property("kaslr-seed", &kaslr[..8]).unwrap();
     prop!("linux,initrd-start", 0, INITRD as u32);
     prop!("linux,initrd-end", 0, (INITRD + INIT.len() as u64) as u32);
     tree.end().unwrap();
@@ -184,7 +190,7 @@ pub(super) fn registers(guest: &mut vcpu::Vcpu) -> bool {
 
 pub(super) struct Prepared<'pool> {
     pub ram: pages::Pages<'pool>,
-    pub tables: native_memory::Tables<'pool, 128>,
+    pub tables: native_memory::Tables<'pool, 512>,
     pub guest: vcpu::Vcpu,
     pub distributor: vgic::distributor::Distributor,
 }
@@ -197,7 +203,7 @@ pub(super) fn prepare<'pool>(
 ) -> Prepared<'pool> {
     emit("Hardware Domain actual Linux Image entered\n");
     let ram = pool.allocate(RAM / PAGE_SIZE, PAGE_SIZE).unwrap();
-    let mut tables = native_memory::Tables::<128>::new(pool, config).unwrap();
+    let mut tables = native_memory::Tables::<512>::new(pool, config).unwrap();
     // SAFETY: Disjoint immutable Image, stopped exclusively retained guest RAM.
     let image = unsafe { image::load_arm64_linux(IMAGE, 0x200000, &ram) }.unwrap();
     check(

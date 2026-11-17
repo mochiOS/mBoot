@@ -16,7 +16,7 @@ SECTIONS {
         *(.bss .bss.*) *(COMMON)
         . = ALIGN(16);
         __bss_end = .;
-        . += 65536;
+        . += 262144;
         __stack_top = .;
     }
     __image_size = __stack_top - 0x40080000;

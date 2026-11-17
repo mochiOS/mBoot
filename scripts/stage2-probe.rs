@@ -48,7 +48,10 @@ pub use native_error::Error;
 #[cfg(not(feature = "arm-diagnostics"))]
 #[path = "../src/image.rs"]
 mod image;
-#[cfg(feature = "arm-diagnostics")]
+#[cfg(all(
+    feature = "arm-diagnostics",
+    any(system_domain_probe, hardware_domain_probe)
+))]
 use mboot::image;
 #[cfg(feature = "arm-diagnostics")]
 #[path = "owned-memory-probe.rs"]
@@ -69,7 +72,7 @@ use stage2::{Access, Config, Error as Stage2Error, Mapper, MemoryType, PageTable
 
 const CODE: u64 = 0x10000;
 const FIXTURE_RAM_END: u64 = 0x4000_0000
-    + if cfg!(any(system_domain_boot, hardware_domain_probe)) { 512 } else { 128 } * 1024 * 1024;
+    + if cfg!(hardware_boot_disk) { 2048 } else if cfg!(any(system_domain_boot, hardware_domain_probe)) { 512 } else { 128 } * 1024 * 1024;
 const STACK: u64 = 0x20000;
 const DATA: u64 = 0x30000;
 const READ_ONLY: Access = Access {

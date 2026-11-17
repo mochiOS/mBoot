@@ -83,7 +83,14 @@ pub(super) fn run(
     let mut event_irq = [false; 2];
     let mut shared_maps = 0;
     emit("Actual System / Hardware Domains retained; entering shared dispatcher\n");
-    for _ in 0..1_000_000 {
+    // The real filesystem and authenticated built-in images require more work
+    // than the control-only fixture. Both profiles remain explicitly bounded.
+    let dispatch_budget = if cfg!(hardware_boot_disk) {
+        10_000_000
+    } else {
+        1_000_000
+    };
+    for _ in 0..dispatch_budget {
         for index in 0..2 {
             if event_wait[index] {
                 if let Some(port) = events.receive(DomainId::new(index as u32 + 1)) {

@@ -3,11 +3,18 @@
 //! execution. A diagnostic budget expiry is a failure, never OS boot success.
 use super::*;
 use image::ImageMemory;
-use mnu_abi::hypervisor::{self, DomainBootInfo};
 #[cfg(not(paired_domains))]
 use mnu_abi::hypervisor::HypercallNumber;
+use mnu_abi::hypervisor::{self, DomainBootInfo};
 
-const RAM_BYTES: usize = if cfg!(system_domain_boot) { 128 } else { 16 } * 1024 * 1024;
+const RAM_BYTES: usize = if cfg!(hardware_boot_disk) {
+    512
+} else if cfg!(system_domain_boot) {
+    128
+} else {
+    16
+} * 1024
+    * 1024;
 const fn grant_bytes() -> u64 {
     if cfg!(paired_domains) {
         16 * 1024 * 1024
@@ -34,7 +41,7 @@ fn u16_at(bytes: &[u8], index: usize) -> usize {
 
 pub(super) struct Prepared<'pool> {
     pub ram: pages::Pages<'pool>,
-    pub tables: native_memory::Tables<'pool, 128>,
+    pub tables: native_memory::Tables<'pool, 512>,
     pub info: DomainBootInfo,
     pub entry: u64,
     pub loaded_end: u64,
@@ -50,7 +57,7 @@ pub(super) fn prepare<'pool>(
     let ram = pool
         .allocate(RAM_BYTES as u64 / PAGE_SIZE, PAGE_SIZE)
         .expect("System RAM");
-    let mut tables = native_memory::Tables::<128>::new(pool, config).expect("System tables");
+    let mut tables = native_memory::Tables::<512>::new(pool, config).expect("System tables");
     // SAFETY: Only this stopped guest's private RAM is writable by the loader.
     let loaded = unsafe { image::load_elf(ELF, &ram) }.expect("native System ELF");
     check(
