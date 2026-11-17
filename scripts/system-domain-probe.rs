@@ -45,6 +45,8 @@ pub(super) struct Prepared<'pool> {
     pub info: DomainBootInfo,
     pub entry: u64,
     pub loaded_end: u64,
+    #[cfg(hardware_boot_disk)]
+    pub realtime: Option<qemu_rtc::Realtime>,
     #[cfg(firmware_ramfb)]
     pub framebuffer: qemu_ramfb::Framebuffer<'pool>,
 }
@@ -137,6 +139,10 @@ pub(super) fn prepare<'pool>(
         );
         framebuffer
     };
+    #[cfg(hardware_boot_disk)]
+    let realtime = qemu_rtc::Realtime::prepare(tree);
+    #[cfg(hardware_boot_disk)]
+    if realtime.is_some() { info.feature_flags |= hypervisor::DOMAIN_FEATURE_REALTIME; }
     check(info.validate().is_ok(), "native bootstrap metadata");
     // The declared module range is intentionally not a runnable boot module;
     // this probe stops at Ready, before mnu can try to consume module bytes.
@@ -256,6 +262,8 @@ pub(super) fn prepare<'pool>(
         info,
         entry: loaded.entry(),
         loaded_end: loaded.loaded_end(),
+        #[cfg(hardware_boot_disk)]
+        realtime,
         #[cfg(firmware_ramfb)]
         framebuffer,
     }
@@ -274,6 +282,8 @@ pub(super) fn run(
         info,
         entry,
         loaded_end,
+        #[cfg(hardware_boot_disk)]
+        realtime: _,
         #[cfg(firmware_ramfb)]
             framebuffer: _,
     } = prepare(config, pool, tree, binding);

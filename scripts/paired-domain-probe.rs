@@ -37,6 +37,8 @@ pub(super) fn run(
         info,
         entry,
         loaded_end,
+        #[cfg(hardware_boot_disk)]
+        realtime,
         #[cfg(firmware_ramfb)]
         mut framebuffer,
     } = system;
@@ -206,6 +208,10 @@ pub(super) fn run(
         let caller = DomainId::new(index as u32 + 1);
         let no_args = a == 0 && b == 0 && c == 0;
         let result = match call {
+            #[cfg(hardware_boot_disk)]
+            x if x == HypercallNumber::FirmwareRealtimeSeconds as u64 && index == 0 && no_args => {
+                realtime.as_ref().map_or(HYPERCALL_UNSUPPORTED, qemu_rtc::Realtime::seconds)
+            }
             #[cfg(firmware_ramfb)]
             x if x == HypercallNumber::FirmwareFramebufferPresent as u64 && index == 0 => {
                 // SAFETY: The only CPU's System vCPU is suspended at this

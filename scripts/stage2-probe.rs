@@ -59,6 +59,9 @@ mod owned_memory_probe;
 #[cfg(firmware_ramfb)]
 #[path = "qemu-ramfb.rs"]
 mod qemu_ramfb;
+#[cfg(hardware_boot_disk)]
+#[path = "qemu-rtc.rs"]
+mod qemu_rtc;
 #[cfg(system_domain_probe)]
 #[path = "system-domain-probe.rs"]
 mod system_domain_probe;
