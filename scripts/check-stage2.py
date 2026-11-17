@@ -42,7 +42,7 @@ def main():
     parser.add_argument("--hardware-boot-disk", action="store_true", help="explicit RAM-disk payload profile (initrd must contain the real disk)")
     parser.add_argument("--firmware-ramfb", action="store_true", help="explicit QEMU reference firmware framebuffer (no GPU/DMA assignment)")
     parser.add_argument("--qemu-firmware-dir", type=Path, help="directory containing the real vgabios-ramfb.bin")
-    parser.add_argument("--timeout", type=int, default=15, help="bounded QEMU run in seconds")
+    parser.add_argument("--timeout", type=int, default=15, help="bounded QEMU run in seconds (1..1800; long native OS diagnostics are explicit)")
     parser.add_argument("--abi-rlib", type=Path,
                         help="matching AArch64 mnu-abi rlib for --system-elf without --production-library")
     parser.add_argument("--production-library", action="store_true",
@@ -62,8 +62,8 @@ def main():
              "-C", f"link-arg=-T{MBOOT / 'scripts/stage2-probe.ld'}",
              str(MBOOT / "scripts/stage2-probe.rs"), "-o", str(binary)]
         environment = dict(os.environ)
-        if args.timeout < 1 or args.timeout > 600:
-            raise RuntimeError("--timeout must be between 1 and 600 seconds")
+        if args.timeout < 1 or args.timeout > 1800:
+            raise RuntimeError("--timeout must be between 1 and 1800 seconds")
         if args.firmware_ramfb and (not args.hardware_boot_disk or not args.qemu_firmware_dir
                                      or not (args.qemu_firmware_dir / "vgabios-ramfb.bin").is_file()):
             raise RuntimeError("--firmware-ramfb requires --hardware-boot-disk and a real --qemu-firmware-dir")
