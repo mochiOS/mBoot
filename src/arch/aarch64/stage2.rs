@@ -535,6 +535,39 @@ impl<'a, M: TableMemory> Mapper<'a, M> {
         Ok(())
     }
 
+    /// Replace an existing assigned page, returning its former backing only
+    /// after break-before-make and combined translation invalidation complete.
+    /// Invalid input leaves the old mapping intact; no allocation is required.
+    ///
+    /// # Safety
+    /// Same ownership, stopped-vCPU, EL2 and DMA requirements as map_page().
+    /// The caller must retain the old page and the newly authorized backing;
+    /// a Stage-2 replacement does not itself revoke any device DMA mapping.
+    pub unsafe fn remap_page(
+        &mut self,
+        ipa: u64,
+        frame: u64,
+        access: Access,
+    ) -> Result<u64, Error> {
+        self.config.frame(frame)?;
+        let new = access.descriptor(frame)?;
+        self.editing_context()?;
+        let (table, index, old) = self.leaf(ipa)?;
+        if old != new {
+            self.write(table, index, 0);
+            // SAFETY: Quiescent selected address space, as required above.
+            unsafe {
+                self.invalidate();
+            }
+            self.write(table, index, new);
+            // SAFETY: Publish the new backing before any guest resumes.
+            unsafe {
+                self.invalidate();
+            }
+        }
+        Ok(old & ADDRESS_MASK)
+    }
+
     /// Return the frame only after its Stage-2/combined translations are gone.
     /// The caller retains frame ownership and decides when it can be freed.
     ///
