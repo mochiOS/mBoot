@@ -56,6 +56,9 @@ use mboot::image;
 #[cfg(feature = "arm-diagnostics")]
 #[path = "owned-memory-probe.rs"]
 mod owned_memory_probe;
+#[cfg(firmware_ramfb)]
+#[path = "qemu-ramfb.rs"]
+mod qemu_ramfb;
 #[cfg(system_domain_probe)]
 #[path = "system-domain-probe.rs"]
 mod system_domain_probe;

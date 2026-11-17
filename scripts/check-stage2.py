@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import uuid
 
 MBOOT = Path(__file__).resolve().parents[1]
 
@@ -39,6 +40,8 @@ def main():
     parser.add_argument("--hardware-image", type=Path, help="enter the actual ARM64 mDriver Linux Image")
     parser.add_argument("--hardware-initrd", type=Path, help="actual mDriver initramfs for --hardware-image")
     parser.add_argument("--hardware-boot-disk", action="store_true", help="explicit RAM-disk payload profile (initrd must contain the real disk)")
+    parser.add_argument("--firmware-ramfb", action="store_true", help="explicit QEMU reference firmware framebuffer (no GPU/DMA assignment)")
+    parser.add_argument("--qemu-firmware-dir", type=Path, help="directory containing the real vgabios-ramfb.bin")
     parser.add_argument("--timeout", type=int, default=15, help="bounded QEMU run in seconds")
     parser.add_argument("--abi-rlib", type=Path,
                         help="matching AArch64 mnu-abi rlib for --system-elf without --production-library")
@@ -61,6 +64,9 @@ def main():
         environment = dict(os.environ)
         if args.timeout < 1 or args.timeout > 600:
             raise RuntimeError("--timeout must be between 1 and 600 seconds")
+        if args.firmware_ramfb and (not args.hardware_boot_disk or not args.qemu_firmware_dir
+                                     or not (args.qemu_firmware_dir / "vgabios-ramfb.bin").is_file()):
+            raise RuntimeError("--firmware-ramfb requires --hardware-boot-disk and a real --qemu-firmware-dir")
         if args.hardware_boot_disk and not (args.hardware_image and args.system_elf and args.boot_module):
             raise RuntimeError("--hardware-boot-disk requires both actual Domain images and boot-module")
         if args.hardware_image:
@@ -101,6 +107,8 @@ def main():
                     build += ["--cfg", "paired_domains"]
                 if args.hardware_boot_disk:
                     build += ["--cfg", "hardware_boot_disk"]
+                if args.firmware_ramfb:
+                    build += ["--cfg", "firmware_ramfb"]
             environment.update(CARGO_INCREMENTAL="0", CARGO_PROFILE_DEV_DEBUG="0",
                                CARGO_PROFILE_DEV_OPT_LEVEL="2")
             environment.setdefault("CARGO_BUILD_JOBS", "2")
@@ -120,11 +128,16 @@ def main():
         image = out / "stage2.Image"
         run([str(objcopy), "-O", "binary", str(binary), str(image)],
             out / "image.log", 30, env=environment)
-        run([str(Path(qemu).resolve()), "-machine", "virt-8.2,virtualization=on,gic-version=2",
+        command = [str(Path(qemu).resolve()), "-machine", "virt-8.2,virtualization=on,gic-version=2",
              "-cpu", args.cpu, "-accel", "tcg", "-m", "2G" if args.hardware_boot_disk else "512M" if args.boot_module or args.hardware_image else "128M", "-smp", "1",
              "-display", "none", "-monitor", "none", "-nic", "none", "-serial", "stdio",
-             "-no-reboot", "-kernel", str(image), "-semihosting-config", "enable=on,target=native"],
-            out / "run.log", args.timeout, env=dict(os.environ, TMPDIR=str(out)), marker="STAGE2 PASS aarch64")
+             "-no-reboot", "-kernel", str(image), "-semihosting-config", "enable=on,target=native"]
+        if args.firmware_ramfb:
+            monitor = out / f"monitor-{uuid.uuid4().hex[:12]}.qmp"
+            (out / "monitor-path.txt").write_text(str(monitor) + "\n")
+            command += ["-L", str(args.qemu_firmware_dir.resolve()), "-device", "ramfb",
+                        "-qmp", f"unix:{monitor},server=on,wait=off"]
+        run(command, out / "run.log", args.timeout, env=dict(os.environ, TMPDIR=str(out)), marker="STAGE2 PASS aarch64")
     except (OSError, RuntimeError) as error:
         parser.exit(1, f"Stage-2 check failed: {error}\n")
     print(f"aarch64 Stage-2 ({args.cpu}): PASS ({out / 'run.log'})")

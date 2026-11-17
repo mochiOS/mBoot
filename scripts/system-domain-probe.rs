@@ -45,6 +45,8 @@ pub(super) struct Prepared<'pool> {
     pub info: DomainBootInfo,
     pub entry: u64,
     pub loaded_end: u64,
+    #[cfg(firmware_ramfb)]
+    pub framebuffer: qemu_ramfb::Framebuffer<'pool>,
 }
 
 pub(super) fn prepare<'pool>(
@@ -121,6 +123,20 @@ pub(super) fn prepare<'pool>(
             | hypervisor::DOMAIN_FEATURE_SHARED_RING
             | hypervisor::DOMAIN_FEATURE_GRANT_QUERY;
     }
+    #[cfg(firmware_ramfb)]
+    let framebuffer = {
+        let framebuffer = qemu_ramfb::Framebuffer::prepare(pool, tree);
+        info.device_window_size = 16 * 1024 * 1024;
+        info = info.with_framebuffer(
+            info.device_window_start + 0x10000,
+            qemu_ramfb::BYTES,
+            qemu_ramfb::WIDTH,
+            qemu_ramfb::HEIGHT,
+            qemu_ramfb::WIDTH,
+            hypervisor::FRAMEBUFFER_FORMAT_BGR,
+        );
+        framebuffer
+    };
     check(info.validate().is_ok(), "native bootstrap metadata");
     // The declared module range is intentionally not a runnable boot module;
     // this probe stops at Ready, before mnu can try to consume module bytes.
@@ -156,6 +172,24 @@ pub(super) fn prepare<'pool>(
                     )
                     .unwrap()
             };
+        }
+    }
+    #[cfg(firmware_ramfb)]
+    for offset in (0..qemu_ramfb::BYTES).step_by(4096) {
+        // SAFETY: Retained scanout RAM, disjoint from both Domains and EL2
+        // tables/firmware control. Only the System receives this device range.
+        unsafe {
+            mapper
+                .map_page(
+                    info.framebuffer_addr + offset,
+                    framebuffer.pixels.physical_address(offset, 4096).unwrap(),
+                    Access {
+                        writable: true,
+                        executable: false,
+                        memory: MemoryType::Device,
+                    },
+                )
+                .unwrap();
         }
     }
     for address in (0..RAM_BYTES as u64).step_by(4096) {
@@ -222,6 +256,8 @@ pub(super) fn prepare<'pool>(
         info,
         entry: loaded.entry(),
         loaded_end: loaded.loaded_end(),
+        #[cfg(firmware_ramfb)]
+        framebuffer,
     }
 }
 
@@ -238,6 +274,8 @@ pub(super) fn run(
         info,
         entry,
         loaded_end,
+        #[cfg(firmware_ramfb)]
+            framebuffer: _,
     } = prepare(config, pool, tree, binding);
     #[cfg(not(system_domain_boot))]
     let _ = info;

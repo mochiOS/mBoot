@@ -37,6 +37,8 @@ pub(super) fn run(
         info,
         entry,
         loaded_end,
+        #[cfg(firmware_ramfb)]
+        mut framebuffer,
     } = system;
     check(entry < loaded_end, "System entry outside loaded image");
     let hardware_domain_probe::Prepared {
@@ -204,6 +206,16 @@ pub(super) fn run(
         let caller = DomainId::new(index as u32 + 1);
         let no_args = a == 0 && b == 0 && c == 0;
         let result = match call {
+            #[cfg(firmware_ramfb)]
+            x if x == HypercallNumber::FirmwareFramebufferPresent as u64 && index == 0 => {
+                // SAFETY: The only CPU's System vCPU is suspended at this
+                // EL1 HVC. Scanout and source own disjoint retained allocations.
+                if unsafe { framebuffer.present(&ram[0], a, b, c) } {
+                    HYPERCALL_SUCCESS
+                } else {
+                    HYPERCALL_INVALID_ARGUMENT
+                }
+            }
             x if x == HypercallNumber::ConsoleWrite as u64 => {
                 if let Some(host) = ram[index]
                     .host_address(a, b)
