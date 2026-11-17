@@ -417,12 +417,31 @@ impl Vcpu {
 
     /// Decode a trapped AArch64 MRS, without implementing register policy.
     pub fn system_register_read(&self) -> Option<SystemRegister> {
+        self.system_register_access(true)
+    }
+
+    /// Decode an MSR/SYS without executing it on the host. The resource owner
+    /// must implement its effect before completing; decoding grants no access.
+    pub fn system_register_write(&self) -> Option<(SystemRegister, u64)> {
+        let register = self.system_register_access(false)?;
+        let source = ((self.registers.esr >> 5) & 31) as usize;
+        Some((
+            register,
+            if source == 31 {
+                0
+            } else {
+                self.registers.x[source]
+            },
+        ))
+    }
+
+    fn system_register_access(&self, read: bool) -> Option<SystemRegister> {
         let esr = self.registers.esr;
         if !self.valid
             || self.registers.kind != ExitKind::Synchronous as u64
             || esr >> 26 != 0x18
             || esr & (1 << 25) == 0
-            || esr & 1 == 0
+            || (esr & 1 != 0) != read
         {
             return None;
         }
@@ -449,6 +468,19 @@ impl Vcpu {
             self.registers.x[target] = value;
         }
         self.registers.pc = next;
+        self.registers.esr = 0;
+        Ok(())
+    }
+
+    /// Complete only the current owner-emulated MSR/SYS. Unknown operations
+    /// must be rejected by that owner; this never performs physical register IO.
+    pub fn complete_system_register_write(&mut self) -> Result<(), Error> {
+        self.system_register_write().ok_or(Error::InvalidState)?;
+        self.registers.pc = self
+            .registers
+            .pc
+            .checked_add(4)
+            .ok_or(Error::InvalidState)?;
         self.registers.esr = 0;
         Ok(())
     }
