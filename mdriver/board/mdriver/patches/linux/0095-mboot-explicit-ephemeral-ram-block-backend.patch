@@ -1,0 +1,344 @@
+From: mochiOS maintainers
+Subject: [PATCH] mboot: publish an explicitly prepared ephemeral RAM block backend
+
+Reuse Linux brd and the existing GPT, grant and block-control mechanisms.
+Publish only after the explicit boot profile has copied its actual image and
+validated both GPT copies. No PCI requester, DMA or persistent storage claim.
+
+--- a/drivers/virt/mboot/core.c
++++ b/drivers/virt/mboot/core.c
+@@ -2357,17 +2357,16 @@
+ 	mboot_block_sector_count = 0;
+ }
+ 
++#include "mboot_ramdisk.h"
++
+ static int mboot_block_open_grant(u32 device_id, unsigned long grant_ref)
+ {
+-	const struct mboot_pci_frontend *device;
+ 	unsigned long result;
+ 	u64 address;
+ 
+-	if (!device_id || device_id > mboot_pci_device_count ||
+-	    mboot_block_file || mboot_block_buffer || mboot_block_grant_ref)
++	if (mboot_block_file || mboot_block_buffer || mboot_block_grant_ref)
+ 		return -EINVAL;
+-	device = &mboot_pci_devices[device_id - 1];
+-	if (mboot_control_device_kind(&device->info) != MBOOT_DEVICE_KIND_BLOCK)
++	if (mboot_catalog_kind(device_id) != MBOOT_DEVICE_KIND_BLOCK)
+ 		return -ENODEV;
+ 	address = mboot_grant_window_start + MBOOT_BLOCK_DATA_PAGE * PAGE_SIZE;
+ 	result = mboot_hypercall(MBOOT_HYPERCALL_GRANT_MAP, grant_ref, address, 0);
+@@ -2377,7 +2376,7 @@
+ 	mboot_block_buffer = memremap(address, PAGE_SIZE, MEMREMAP_WB);
+ 	if (!mboot_block_buffer)
+ 		goto fail;
+-	mboot_block_file = mboot_block_open(&device->info);
++	mboot_block_file = mboot_catalog_block(device_id, &mboot_block_first_sector, &mboot_block_sector_count);
+ 	if (IS_ERR(mboot_block_file)) {
+ 		mboot_block_file = NULL;
+ 		goto fail;
+@@ -2956,23 +2955,20 @@
+ static void mboot_control_inspect_storage(const struct mboot_control_request *request,
+ 					  struct mboot_control_response *response)
+ {
+-	const struct mboot_pci_frontend *device;
+ 	struct file *file;
+ 	int result;
+     u64 first, count;
+ 
+-	if (!request->device_id || request->device_id > mboot_pci_device_count ||
+-	    request->arguments[0] > 3 ||
++	if (request->arguments[0] > 3 ||
+ 	    request->arguments[1] > U32_MAX || request->arguments[2] ||
+ 	    request->arguments[3])
+ 		return;
+-	device = &mboot_pci_devices[request->device_id - 1];
+-	if (mboot_control_device_kind(&device->info) != MBOOT_DEVICE_KIND_BLOCK ||
+-	    device->info.flags & MBOOT_PCI_FLAG_PARTITIONED) {
++	if (mboot_catalog_kind(request->device_id) != MBOOT_DEVICE_KIND_BLOCK ||
++	    mboot_catalog_features(request->device_id) & MBOOT_DEVICE_FEATURE_PARTITIONED) {
+ 		response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
+ 		return;
+ 	}
+-	file = mboot_block_lookup(&device->info, &first, &count);
++	file = mboot_catalog_block(request->device_id, &first, &count);
+ 	if (IS_ERR(file)) {
+ 		response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
+ 		return;
+@@ -3308,7 +3304,7 @@
+ 		response->status = MBOOT_CONTROL_STATUS_OK;
+ 		response->values[0] = MBOOT_CONTROL_VERSION;
+ 		response->values[1] = MBOOT_CONTROL_CAPABILITIES;
+-		response->values[2] = mboot_pci_device_count;
++		response->values[2] = mboot_catalog_count();
+ 		response->values[3] = mboot_control_ring->header.generation;
+ 		return;
+ 	}
+@@ -3343,6 +3339,15 @@
+ 		    request->arguments[0] > U32_MAX)
+ 			return;
+ 		index = request->arguments[0];
++		if (index == mboot_pci_device_count && mboot_ramdisk_available()) {
++			response->status = MBOOT_CONTROL_STATUS_OK;
++			response->device_id = MBOOT_RAMDISK_ID;
++			response->values[0] = index + 1; /* Enumeration cursor, not device ID. */
++			response->values[1] = MBOOT_DEVICE_KIND_BLOCK;
++			response->values[2] = MBOOT_DEVICE_STATE_ONLINE;
++			response->values[3] = mboot_catalog_features(MBOOT_RAMDISK_ID);
++			return;
++		}
+ 		if (index >= mboot_pci_device_count) {
+ 			response->status = MBOOT_CONTROL_STATUS_END;
+ 			return;
+@@ -3356,6 +3361,16 @@
+ 		response->values[3] = mboot_control_device_features(&device->info);
+ 		return;
+ 	case MBOOT_CONTROL_DESCRIBE:
++		if (request->device_id == MBOOT_RAMDISK_ID && mboot_ramdisk_available()) {
++			if (!mboot_control_zero_arguments(request->arguments))
++				return;
++			response->status = MBOOT_CONTROL_STATUS_OK;
++			response->values[0] = MBOOT_DEVICE_KIND_BLOCK;
++			response->values[1] = MBOOT_DEVICE_STATE_ONLINE;
++			response->values[2] = mboot_catalog_features(MBOOT_RAMDISK_ID);
++			/* No PHYSICAL flag: values[3] is not a PCI identity. */
++			return;
++		}
+ 		if (!mboot_control_zero_arguments(request->arguments))
+ 			return;
+ 		if (!request->device_id ||
+@@ -3403,13 +3418,12 @@
+ 			response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
+ 			return;
+ 		}
+-		device = &mboot_pci_devices[request->device_id - 1];
+ 		response->status = MBOOT_CONTROL_STATUS_OK;
+ 		response->values[0] = mboot_block_sector_count;
+ 		response->values[1] =
+ 			bdev_logical_block_size(file_bdev(mboot_block_file));
+ 		response->values[2] = MBOOT_BLOCK_MAX_TRANSFER;
+-		response->values[3] = mboot_control_device_features(&device->info);
++		response->values[3] = mboot_catalog_features(request->device_id);
+ 		return;
+ 	case MBOOT_CONTROL_OPEN_PARTITION:
+ 		if (!mboot_control_active || !request->device_id ||
+@@ -3424,13 +3438,12 @@
+ 			response->status = MBOOT_CONTROL_STATUS_IO_ERROR;
+ 			return;
+ 		}
+-		device = &mboot_pci_devices[request->device_id - 1];
+ 		response->status = MBOOT_CONTROL_STATUS_OK;
+ 		response->values[0] = mboot_block_sector_count;
+ 		response->values[1] =
+ 			bdev_logical_block_size(file_bdev(mboot_block_file));
+ 		response->values[2] = MBOOT_BLOCK_MAX_TRANSFER;
+-		response->values[3] = mboot_control_device_features(&device->info);
++		response->values[3] = mboot_catalog_features(request->device_id);
+ 		return;
+ 	case MBOOT_CONTROL_CLOSE_DEVICE:
+ 		if (!mboot_control_active ||
+@@ -3463,8 +3476,8 @@
+ 			return;
+ 		}
+ 		if (request->operation == MBOOT_CONTROL_BLOCK_WRITE &&
+-		    mboot_pci_devices[request->device_id - 1].info.flags &
+-			MBOOT_PCI_FLAG_READ_ONLY) {
++		    mboot_catalog_features(request->device_id) &
++			MBOOT_DEVICE_FEATURE_READ_ONLY) {
+ 			response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
+ 			return;
+ 		}
+@@ -3497,8 +3510,8 @@
+ 			response->status = MBOOT_CONTROL_STATUS_BAD_STATE;
+ 			return;
+ 		}
+-		if (mboot_pci_devices[request->device_id - 1].info.flags &
+-		    MBOOT_PCI_FLAG_READ_ONLY) {
++		if (mboot_catalog_features(request->device_id) &
++		    MBOOT_DEVICE_FEATURE_READ_ONLY) {
+ 			response->status = MBOOT_CONTROL_STATUS_UNSUPPORTED_OPERATION;
+ 			return;
+ 		}
+@@ -3742,8 +3755,8 @@
+ 		    request->buffer_id || request->sector || request->length ||
+ 		    request->buffer_offset)
+ 			return;
+-		if (mboot_pci_devices[request->device_id - 1].info.flags &
+-		    MBOOT_PCI_FLAG_READ_ONLY) {
++		if (mboot_catalog_features(request->device_id) &
++		    MBOOT_DEVICE_FEATURE_READ_ONLY) {
+ 			response->status = MBOOT_BLOCK_STATUS_READ_ONLY;
+ 			return;
+ 		}
+@@ -3763,8 +3776,8 @@
+ 		return;
+ 	}
+ 	if (request->operation == MBOOT_BLOCK_WRITE &&
+-	    mboot_pci_devices[request->device_id - 1].info.flags &
+-		MBOOT_PCI_FLAG_READ_ONLY) {
++	    mboot_catalog_features(request->device_id) &
++		MBOOT_DEVICE_FEATURE_READ_ONLY) {
+ 		response->status = MBOOT_BLOCK_STATUS_READ_ONLY;
+ 		return;
+ 	}
+@@ -4060,7 +4073,8 @@
+ 	if (atomic_read(&mboot_gpu_probe_gate) == 1)
+ 		return;
+ 	mboot_reprobe_display();
+-	if (!mboot_display_backend_ready()) {
++	if ((mboot_ramdisk_expected && !mboot_ramdisk_available()) ||
++	    !mboot_display_backend_ready()) {
+ 		/* Do not reset the deadline on each 100 ms readiness retry. */
+ 		if (!mboot_text_console && !READ_ONCE(mboot_gpu_open))
+ 			schedule_delayed_work(&mboot_gpu_watchdog_work,
+--- /dev/null
++++ b/drivers/virt/mboot/mboot_ramdisk.h
+@@ -0,0 +1,147 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Explicit, ephemeral RAM storage for an admitted boot image. This is a real
++ * Linux block device, never a fabricated PCI requester or a DMA assignment.
++ */
++#include <linux/major.h>
++
++#define MBOOT_RAMDISK_ID 0x40000001U
++#define MBOOT_DEVICE_FEATURE_SOFTWARE BIT_ULL(32)
++
++static bool mboot_ramdisk_expected;
++static bool mboot_ramdisk_ready;
++
++static int __init mboot_boot_ramdisk_param(char *value)
++{
++	return value ? kstrtobool(value, &mboot_ramdisk_expected) : -EINVAL;
++}
++early_param("mboot.boot_ramdisk", mboot_boot_ramdisk_param);
++
++static bool mboot_ramdisk_available(void)
++{
++	return smp_load_acquire(&mboot_ramdisk_ready);
++}
++
++static unsigned int mboot_catalog_count(void)
++{
++	return mboot_pci_device_count + mboot_ramdisk_available();
++}
++
++static u64 mboot_catalog_kind(u32 id)
++{
++	if (id == MBOOT_RAMDISK_ID && mboot_ramdisk_available())
++		return MBOOT_DEVICE_KIND_BLOCK;
++	if (!id || id > mboot_pci_device_count)
++		return MBOOT_DEVICE_KIND_OTHER;
++	return mboot_control_device_kind(&mboot_pci_devices[id - 1].info);
++}
++
++static u64 mboot_catalog_features(u32 id)
++{
++	if (id == MBOOT_RAMDISK_ID && mboot_ramdisk_available())
++		return MBOOT_DEVICE_FEATURE_SOFTWARE | MBOOT_DEVICE_FEATURE_EPHEMERAL |
++			MBOOT_DEVICE_FEATURE_BLOCK_READ | MBOOT_DEVICE_FEATURE_BLOCK_WRITE |
++			MBOOT_DEVICE_FEATURE_BLOCK_FLUSH;
++	if (!id || id > mboot_pci_device_count)
++		return 0;
++	return mboot_control_device_features(&mboot_pci_devices[id - 1].info);
++}
++
++static struct file *mboot_catalog_block(u32 id, u64 *first, u64 *count)
++{
++	struct file *file;
++
++	if (id != MBOOT_RAMDISK_ID) {
++		if (!id || id > mboot_pci_device_count ||
++		    mboot_catalog_kind(id) != MBOOT_DEVICE_KIND_BLOCK)
++			return ERR_PTR(-ENODEV);
++		return mboot_block_lookup(&mboot_pci_devices[id - 1].info, first, count);
++	}
++	if (!mboot_ramdisk_available())
++		return ERR_PTR(-ENODEV);
++	file = bdev_file_open_by_dev(MKDEV(RAMDISK_MAJOR, 0),
++				    BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL);
++	if (IS_ERR(file))
++		return file;
++	if (mboot_scope_conflicts(file)) {
++		fput(file);
++		return ERR_PTR(-EBUSY);
++	}
++	*first = 0;
++	*count = bdev_nr_sectors(file_bdev(file));
++	return file;
++}
++
++static int mboot_ramdisk_validate(struct file *file)
++{
++	struct block_device *bdev = file_bdev(file);
++	struct mboot_gpt_copy primary, backup;
++	const u8 *entry;
++	u32 slot, block = bdev_logical_block_size(bdev);
++	u64 sectors;
++	int result;
++
++	if (block != 512 || !disk_live(bdev->bd_disk))
++		return -EINVAL;
++	sectors = bdev_nr_sectors(bdev);
++	if (sectors < 6)
++		return -EINVAL;
++	result = mboot_gpt_validate_pmbr(file, sectors, block);
++	if (result)
++		return result;
++	result = mboot_gpt_read_copy(file, 1, sectors - 1, sectors, block,
++				     NULL, &primary);
++	if (result)
++		return result;
++	result = mboot_gpt_read_copy(file, sectors - 1, 1, sectors, block,
++				     NULL, &backup);
++	if (result)
++		goto out_primary;
++	if (!mboot_gpt_copies_match(&primary, &backup))
++		result = -EINVAL;
++	else
++		/* Also checks every entry, unique GUIDs, bounds and overlap. */
++		result = mboot_gpt_partition_at(&primary, 0, &entry, &slot);
++	mboot_gpt_copy_free(&backup);
++out_primary:
++	mboot_gpt_copy_free(&primary);
++	return result;
++}
++
++static ssize_t mboot_boot_disk_ready_store(struct kobject *kobject,
++					 struct kobj_attribute *attribute,
++					 const char *buffer, size_t count)
++{
++	struct file *file;
++	int result;
++
++	if (!mboot_ramdisk_expected || !sysfs_streq(buffer, "1"))
++		return -EINVAL;
++	if (mboot_ramdisk_available())
++		return -EALREADY;
++	file = bdev_file_open_by_dev(MKDEV(RAMDISK_MAJOR, 0),
++				    BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL);
++	if (IS_ERR(file))
++		return PTR_ERR(file);
++	result = vfs_fsync(file, 0);
++	if (!result)
++		result = mboot_ramdisk_validate(file);
++	fput(file);
++	if (result)
++		return result;
++	smp_store_release(&mboot_ramdisk_ready, true);
++	pr_info("mDriver: validated ephemeral RAM block device available\n");
++	return count;
++}
++
++static struct kobj_attribute mboot_boot_disk_ready_attr =
++	__ATTR_WO(mboot_boot_disk_ready);
++
++static int __init mboot_ramdisk_init(void)
++{
++	if (!mboot_arch_present() || !mboot_ramdisk_expected)
++		return 0;
++	if (!IS_ENABLED(CONFIG_BLK_DEV_RAM))
++		return -EOPNOTSUPP;
++	return sysfs_create_file(kernel_kobj, &mboot_boot_disk_ready_attr.attr);
++}
++device_initcall(mboot_ramdisk_init);

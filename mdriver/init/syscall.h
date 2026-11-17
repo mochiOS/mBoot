@@ -4,6 +4,9 @@
 
 #if defined(__x86_64__)
 #define SYS_WRITE 1
+#define SYS_READ 0
+#define SYS_CLOSE 3
+#define SYS_FSYNC 74
 #define SYS_OPEN 2
 #define SYS_DUP2 33
 #define SYS_NANOSLEEP 35
@@ -29,6 +32,8 @@ static inline long syscall5(long number, long arg0, long arg1, long arg2,
 }
 static inline long open_output(const char *path)
 { return syscall5(SYS_OPEN, (long)path, 1, 0, 0, 0); }
+static inline long open_input(const char *path)
+{ return syscall5(SYS_OPEN, (long)path, 0, 0, 0, 0); }
 static inline long fork_process(void)
 { return syscall5(SYS_FORK, 0, 0, 0, 0, 0); }
 static inline long duplicate_output(long descriptor, long target)
@@ -36,6 +41,9 @@ static inline long duplicate_output(long descriptor, long target)
 
 #elif defined(__aarch64__)
 #define SYS_WRITE 64
+#define SYS_READ 63
+#define SYS_CLOSE 57
+#define SYS_FSYNC 82
 #define SYS_NANOSLEEP 101
 #define SYS_PAUSE 73 /* ppoll(NULL, 0, NULL, NULL, 0), no timeout/mask. */
 #define SYS_EXECVE 221
@@ -59,6 +67,8 @@ static inline long syscall5(long number, long arg0, long arg1, long arg2,
 }
 static inline long open_output(const char *path)
 { return syscall5(56, -100, (long)path, 1, 0, 0); } /* openat(AT_FDCWD). */
+static inline long open_input(const char *path)
+{ return syscall5(56, -100, (long)path, 0, 0, 0); }
 static inline long fork_process(void)
 { return syscall5(220, 17, 0, 0, 0, 0); } /* clone(SIGCHLD), private address space. */
 static inline long duplicate_output(long descriptor, long target)
