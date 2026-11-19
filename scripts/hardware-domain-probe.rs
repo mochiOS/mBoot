@@ -283,6 +283,7 @@ pub(super) fn run(
 ) {
     let virtualized = binding.virtualization.unwrap();
     let timers = fdt::timer::Timers::from_fdt(tree, &binding).unwrap();
+    let mut timer = unsafe { irq::Timer::new(1000, timers.counter_frequency).unwrap() };
     let mut physical = unsafe {
         irq::Controller::new(
             binding.distributor.start(),
@@ -293,7 +294,6 @@ pub(super) fn run(
         )
         .unwrap()
     };
-    let mut timer = unsafe { irq::Timer::new(1000).unwrap() };
     timer.rearm().unwrap();
     let mut gic = unsafe {
         vgic::Controller::new(virtualized.control.start(), virtualized.control.size()).unwrap()

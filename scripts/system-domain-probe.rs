@@ -451,6 +451,9 @@ impl BootRuntime {
                 "timer not wired to admitted CPU",
             );
         }
+        let mut timer = unsafe {
+            irq::Timer::new(1000, timers.counter_frequency).expect("EL2 timer owner")
+        };
         // SAFETY: Caller exclusively owns these Device mappings and CPU banks.
         let physical = unsafe {
             irq::Controller::new(
@@ -466,7 +469,6 @@ impl BootRuntime {
         let gic = unsafe {
             vgic::Controller::new(virtualized.control.start(), virtualized.control.size()).unwrap()
         };
-        let mut timer = unsafe { irq::Timer::new(1000).expect("EL2 timer owner") };
         timer.rearm().unwrap();
         Self {
             gic,

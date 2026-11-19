@@ -24,6 +24,7 @@ pub enum Error {
 pub enum Trigger {
     RisingEdge,
     HighLevel,
+    LowLevel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +153,9 @@ impl GicV2 {
             regions[index] = Some(region);
         }
         let maintenance = node.interrupts.map(decode_ppi).transpose()?;
+        if maintenance.is_some_and(|ppi| ppi.trigger == Trigger::LowLevel) {
+            return Err(Error::InvalidProperty);
+        }
         if count == 2 && maintenance.is_some() {
             return Err(Error::UnsupportedController);
         }
@@ -180,6 +184,7 @@ pub(super) fn decode_ppi(bytes: &[u8]) -> Result<Ppi, Error> {
     let trigger = match flags & 15 {
         1 => Trigger::RisingEdge,
         4 => Trigger::HighLevel,
+        8 => Trigger::LowLevel,
         _ => return Err(Error::InvalidProperty),
     };
     Ok(Ppi {
@@ -302,7 +307,7 @@ impl<'a> Properties<'a> {
     }
 }
 
-fn cell(bytes: &[u8]) -> Result<u32, Error> {
+pub(super) fn cell(bytes: &[u8]) -> Result<u32, Error> {
     Ok(u32::from_be_bytes(
         bytes.try_into().map_err(|_| Error::InvalidProperty)?,
     ))

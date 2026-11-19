@@ -61,6 +61,7 @@ pub(super) fn run(
     };
     let mut guests = [system_guest, hardware_guest];
     let timers = fdt::timer::Timers::from_fdt(tree, &binding).unwrap();
+    let mut timer = unsafe { irq::Timer::new(1000, timers.counter_frequency).unwrap() };
     let mut physical = unsafe {
         irq::Controller::new(
             binding.distributor.start(),
@@ -71,7 +72,6 @@ pub(super) fn run(
         )
         .unwrap()
     };
-    let mut timer = unsafe { irq::Timer::new(1000).unwrap() };
     timer.rearm().unwrap();
     let mut events = EventChannelTable::new();
     for port in 1..=4 {

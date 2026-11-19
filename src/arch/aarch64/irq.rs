@@ -157,10 +157,13 @@ pub struct Timer {
     _local: PhantomData<*mut ()>,
 }
 impl Timer {
+    /// Check any firmware frequency declaration against the architectural
+    /// counter frequency before taking ownership of the timer.
+    ///
     /// # Safety
     /// Exclusively retain this CPU's EL2 physical timer. No firmware, host
     /// scheduler or other owner may program its control/deadline concurrently.
-    pub unsafe fn new(rate: u64) -> Result<Self, Error> {
+    pub unsafe fn new(rate: u64, declared_frequency: Option<u32>) -> Result<Self, Error> {
         let owner = context()?;
         let frequency: u64;
         let control: u64;
@@ -171,7 +174,11 @@ impl Timer {
         if control & 1 != 0 {
             return Err(Error::Busy);
         }
-        if rate == 0 || frequency < rate || frequency > u64::from(u32::MAX) {
+        if rate == 0
+            || frequency < rate
+            || frequency > u64::from(u32::MAX)
+            || declared_frequency.is_some_and(|declared| u64::from(declared) != frequency)
+        {
             return Err(Error::Unsupported);
         }
         Ok(Self {
